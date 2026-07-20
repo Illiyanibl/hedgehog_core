@@ -1,0 +1,96 @@
+# Ёжик — стек развёртывания.
+#
+#   cd deploy && docker compose up -d --build
+#
+# Сервисы:
+#   socket-proxy — прослойка к /var/run/docker.sock с whitelist'ом Docker API.
+#                  Агент рулит контейнерами ТОЛЬКО через него.
+#   hedgehog     — сам Ёжик (WS :8765, файлы :8767). Ходит в docker через прокси.
+#   caddy        — ingress :80/:443 с on-demand TLS. Простаивает, пока у сервера
+#                  нет домена (приложения доступны по IP:port). Есть домен —
+#                  агент регистрирует маршруты через admin API Caddy.
+#
+# Порты хоста параметризуются через deploy/.env (bootstrap.sh их выставляет).
+
+name: hedgehog
+
+services:
+  socket-proxy:
+    image: tecnativa/docker-socket-proxy:0.3.0
+    restart: unless-stopped
+    environment:
+      # --- чтение ---
+      INFO: 1
+      VERSION: 1
+      EVENTS: 1
+      PING: 1
+      CONTAINERS: 1
+      IMAGES: 1
+      NETWORKS: 1
+      VOLUMES: 1
+      # --- запись: агент поднимает/останавливает приложения ---
+      # POST=1 включает create/start/stop/build/exec для разрешённых ресурсов.
+      # ВНИМАНИЕ: позволяет создать контейнер с произвольным bind-mount
+      # (-v /:/host) → выход на хост-root. Осознанный риск ради «делать сайты»;
+      # сузить до собственного deploy-API — следующий виток (см. README).
+      POST: 1
+      BUILD: 1
+      EXEC: 1
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks: [internal]
+
+  hedgehog:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: hedgehog:local
+    restart: unless-stopped
+    depends_on: [socket-proxy]
+    environment:
+      DOCKER_HOST: tcp://socket-proxy:2375
+      HEDGEHOG_HOST: 0.0.0.0
+      HEDGEHOG_DEFAULT_CWD: /apps
+      # Bearer-токен и TLS файл-сервера задаёт bootstrap через .env (пусто →
+      # Ёжик сам сгенерит токен, TLS выключен). config.load_token игнорирует
+      # пустую строку, поэтому дефолт безопасен.
+      HEDGEHOG_TOKEN: ${HEDGEHOG_TOKEN:-}
+      HEDGEHOG_TLS: ${HEDGEHOG_TLS:-}
+      # Диапазон портов приложений (для агента; firewall открывает его в bootstrap).
+      APP_PORT_MIN: 8000
+      APP_PORT_MAX: 8099
+      # Публичный адрес сервера — чтобы Ёжик сообщал «открой http://SERVER_IP:PORT».
+      SERVER_IP: ${SERVER_IP:-127.0.0.1}
+      APPS_VOLUME: hedgehog-apps
+    ports:
+      - "${HEDGEHOG_WS_PORT:-8765}:8765"
+      - "${HEDGEHOG_FILE_PORT:-8767}:8767"
+    volumes:
+      - hedgehog-data:/data
+      - hedgehog-apps:/apps
+    networks: [internal, edge]
+
+  caddy:
+    image: caddy:2.8
+    restart: unless-stopped
+    ports:
+      - "${CADDY_HTTP_PORT:-80}:80"
+      - "${CADDY_HTTPS_PORT:-443}:443"
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    networks: [internal, edge]
+
+networks:
+  internal:
+    internal: true
+  edge:
+
+volumes:
+  hedgehog-data:
+    name: hedgehog-data
+  hedgehog-apps:
+    name: hedgehog-apps
+  caddy-data:
+  caddy-config:

@@ -326,13 +326,19 @@ class HedgehogServer:
             # Вложения (§7.3): эхо несёт их для чипов в ленте; агенту в промпт
             # дописываем абсолютные пути (Claude читает их Read'ом). Без
             # вложений поведение идентично прежнему.
+            session = await self._ensure_session(meta)
+            # /btw: очередь не пуста (сессия занята) → сообщение вольётся в
+            # текущий ход, а не встанет новым. Помечаем эхо флагом btw, чтобы
+            # все клиенты показали реплику как «дослано».
+            is_btw = (isinstance(session, ClaudeSession)
+                      and session.status == "busy")
             await self.hub.publish(frame.chatId, "user_msg_echo", {
                 "content": p.content,
                 "sender": p.sender,
                 "related": frame.id,
                 "attachments": [a.model_dump() for a in p.attachments],
+                "btw": is_btw,
             })
-            session = await self._ensure_session(meta)
             resolved = fileserver.resolve_attachment_paths(
                 self.config.chats_dir, frame.chatId, p.attachments)
             prompt = fileserver.compose_prompt(p.content, resolved)

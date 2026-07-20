@@ -116,6 +116,10 @@ class ClaudeSession:
         self._worker: asyncio.Task | None = None
         # True, пока агент обрабатывает user_msg (для get_status, §3.7c).
         self._busy = False
+        # Число незакрытых запросов текущего хода: первичный prompt + каждый
+        # досланный /btw. Ход завершается (agent_done), только когда счётчик
+        # обнуляется — все запросы получили свой ResultMessage. См. _turn.
+        self._outstanding = 0
         # related frame id → (future решения, контекст для маппинга ответа)
         self._pending: dict[str, tuple[asyncio.Future, dict]] = {}
         # Ответы, пришедшие раньше регистрации future: publish() уже отдал
@@ -154,10 +158,31 @@ class ClaudeSession:
 
     # ---------- входящие фреймы ----------
 
-    async def handle_user_msg(self, content: str):
+    async def handle_user_msg(self, content: str) -> bool:
+        """Обработать входящее сообщение. Возврат: True — сообщение влито в
+        текущий ход (/btw-досыл), False — поставлено обычным ходом.
+
+        Правило (очередь пуста → напрямую, не пуста → /btw): если агент занят
+        и клиент подключён — вливаем реплику в идущий ход через client.query()
+        (stdin CLI), агент подхватывает её по ходу. Иначе — обычная очередь.
+        """
         await self.start()
+        if self._busy and self._client is not None:
+            await self._inject(content)
+            await self._emit_status()
+            return True
         await self._queue.put(content)
         await self._emit_status()  # idle→busy при первом сообщении
+        return False
+
+    async def _inject(self, content: str):
+        """Досыл реплики в идущий ход (/btw): +1 к счётчику незакрытых
+        запросов и запись в stdin CLI. Ход не завершится, пока не придёт
+        ResultMessage на каждый query (см. _turn)."""
+        self._outstanding += 1
+        log.info("agent.btw_inject", chat=self.meta.chatId,
+                 outstanding=self._outstanding)
+        await self._client.query(content)
 
     def resolve_permission(self, related: str, decision: str) -> bool:
         return self._resolve(related, decision)
@@ -184,6 +209,7 @@ class ClaudeSession:
         while True:
             prompt = await self._queue.get()
             self._busy = True
+            self._outstanding = 1          # первичный запрос хода
             try:
                 await self._one_turn(prompt)
             except asyncio.CancelledError:
@@ -207,6 +233,7 @@ class ClaudeSession:
                 await self._disconnect()
             finally:
                 self._busy = False
+                self._outstanding = 0
                 await self._emit_status()  # busy→idle, когда очередь пуста
 
     @property
@@ -282,6 +309,9 @@ class ClaudeSession:
                             session=self._resumed_from, err=err_text[-300:])
                 self._set_session_id(None)
                 await self._disconnect()
+                # Свежий клиент: досланные в упавший ход /btw ушли вместе со
+                # старым коннектом — считаем один незакрытый запрос (ретрай).
+                self._outstanding = 1
                 await self._turn(prompt)
             else:
                 raise
@@ -302,7 +332,12 @@ class ClaudeSession:
         # результатом «Not logged in · Please run /login» (e2e 2026-07-12).
         auth_needed = False
 
-        async for msg in client.receive_response():
+        # receive_messages() — непрерывный поток (не останавливается на
+        # ResultMessage). Останавливаемся сами, когда закрыты ВСЕ запросы хода
+        # (_outstanding == 0): первичный prompt + все досланные /btw. Досыл
+        # (_inject) увеличивает счётчик и пишет ещё один query в тот же stdin,
+        # его ответ идёт в этот же ход — agent_done эмитим один раз, в конце.
+        async for msg in client.receive_messages():
             if isinstance(msg, SystemMessage):
                 # init-сообщение несёт session_id — сохраняем сразу, чтобы
                 # даже оборванный ход можно было резюмить.
@@ -333,18 +368,25 @@ class ClaudeSession:
                             "is_error": bool(block.is_error),
                         })
             elif isinstance(msg, ResultMessage):
-                usage = msg.usage or {}
-                await self._publish("agent_done", {
-                    "result": msg.result or "",
-                    "usage": {
-                        "input_tokens": usage.get("input_tokens", 0),
-                        "output_tokens": usage.get("output_tokens", 0),
-                    },
-                })
                 if is_auth_error(msg.result or ""):
                     auth_needed = True
                 if msg.session_id:
                     self._set_session_id(msg.session_id)
+                self._outstanding -= 1
+                if self._outstanding <= 0:
+                    usage = msg.usage or {}
+                    await self._publish("agent_done", {
+                        "result": msg.result or "",
+                        "usage": {
+                            "input_tokens": usage.get("input_tokens", 0),
+                            "output_tokens": usage.get("output_tokens", 0),
+                        },
+                    })
+                    # Перепроверка после await: если во время публикации влетел
+                    # досыл (_inject увеличил счётчик) — не выходим, дочитываем
+                    # его ответ в этот же ход.
+                    if self._outstanding <= 0:
+                        break
 
         if auth_needed:
             log.warning("agent.auth_required_result", chat=self.meta.chatId)

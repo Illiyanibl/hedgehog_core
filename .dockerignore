@@ -1,0 +1,11 @@
+# Контекст сборки — корень репо. Не тащим тяжёлое/секретное в образ.
+**/.venv
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+**/data
+**/*.log
+.git
+.gitignore
+deploy/.env
+deploy/**/data
