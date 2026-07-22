@@ -15,8 +15,7 @@ set -euo pipefail
 [ "$(id -u)" = 0 ] || { echo "нужен root (sudo)"; exit 1; }
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_DIR="$(dirname "$SCRIPT_DIR")"
-[ -f "$SCRIPT_DIR/Dockerfile" ] || { echo "не найден Dockerfile рядом со скриптом"; exit 1; }
+[ -f "$SCRIPT_DIR/caddy/Caddyfile" ] || { echo "не найден caddy/Caddyfile рядом со скриптом"; exit 1; }
 
 WS_PORT="${HEDGEHOG_WS_PORT:-8765}"
 FILE_PORT="${HEDGEHOG_FILE_PORT:-8767}"
@@ -26,7 +25,9 @@ APP_MIN="${APP_PORT_MIN:-8000}"
 APP_MAX="${APP_PORT_MAX:-8099}"
 
 NET=hedgehog-net
-IMAGE=hedgehog:local
+# Готовый образ из реестра (собирается в GitHub Actions) — на сервере не
+# билдим, только pull. Переопределяется env HEDGEHOG_IMAGE (напр. для форка).
+IMAGE="${HEDGEHOG_IMAGE:-ghcr.io/illiyanibl/hedgehog:latest}"
 
 log(){ echo "[bootstrap] $*"; }
 
@@ -73,9 +74,9 @@ for v in hedgehog-data hedgehog-apps hedgehog-caddy-data hedgehog-caddy-config; 
   docker volume create "$v" >/dev/null 2>&1 || true
 done
 
-# 6) сборка образа Ёжика ----------------------------------------------------
-log "сборка образа (Debian 12 + Ёжик из репо)…"
-docker build -f "$SCRIPT_DIR/Dockerfile" -t "$IMAGE" "$REPO_DIR"
+# 6) получение образа Ёжика (готовый из реестра, без сборки) ----------------
+log "получение образа: $IMAGE"
+docker pull "$IMAGE"
 
 # 7) контейнеры (пересоздаём идемпотентно) ----------------------------------
 log "запуск контейнеров"
