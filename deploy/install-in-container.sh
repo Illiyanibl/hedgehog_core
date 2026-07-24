@@ -75,10 +75,11 @@ sleep 4
 FP=""
 for _ in $(seq 1 30); do
   if [ -f "$DATA_DIR/tls/cert.pem" ]; then
-    FP="$(HEDGEHOG_DATA_DIR="$DATA_DIR" "$SRC_DIR/.venv/bin/python" -c \
+    # cd в репо — иначе `import hedgehog` не найдётся (пакет в $SRC_DIR).
+    FP="$(cd "$SRC_DIR" && HEDGEHOG_DATA_DIR="$DATA_DIR" .venv/bin/python -c \
           'from hedgehog import tls; from hedgehog.config import Config; print(tls.fingerprint(Config().tls_cert_file))' \
           2>/dev/null | tr -d '\r\n')"
-    [ -n "$FP" ] && break
+    if [ -n "$FP" ]; then break; fi
   fi
   sleep 2
 done
