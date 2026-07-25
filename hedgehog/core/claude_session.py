@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import mimetypes
+import re
 import shutil
 from collections import deque
 from pathlib import Path
@@ -286,7 +287,10 @@ class ClaudeSession:
         files_dir = self._config.chats_dir / self.meta.chatId / "files"
         files_dir.mkdir(parents=True, exist_ok=True)
         file_id = new_ulid()
-        safe = _safe_name(p.name)
+        # Если путь указывает на файл из хранилища чата (<ulid>__имя), отрезаем
+        # служебный ulid-префикс — пользователю показываем чистое имя.
+        display = re.sub(r"^[0-9A-HJKMNP-TV-Z]{26}__", "", p.name)
+        safe = _safe_name(display)
         dest = files_dir / f"{file_id}__{safe}"
         try:
             shutil.copy2(p, dest)

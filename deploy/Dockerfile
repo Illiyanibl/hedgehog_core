@@ -36,14 +36,17 @@ RUN curl -fsSL https://claude.ai/install.sh | bash \
     && ln -sf /root/.local/bin/claude /usr/local/bin/claude \
     && claude --version
 
-# venv + зависимости Ёжика. Пакет hedgehog кладём в /app и запускаем как модуль
-# (python -m hedgehog.main) — не устанавливаем как dist, чтобы правки видны сразу.
+# venv + Ёжик из git-КЛОНА в /app. Клон (а не COPY) нужен, чтобы Ёжик умел
+# обновлять сам себя: git pull + перезапуск на месте (§15 update_self) — без
+# SSH, важно для серверов, добавленных только по порту. Запуск как модуль
+# (python -m hedgehog.main). В CI push→main образ собирается после пуша, значит
+# клон main совпадает с контекстом сборки.
 RUN python3 -m venv /opt/venv
 WORKDIR /app
-COPY requirements.txt ./requirements.txt
+ARG HEDGEHOG_REPO=https://github.com/Illiyanibl/hedgehog_core
+ARG HEDGEHOG_REF=main
+RUN git clone --depth 1 --branch "$HEDGEHOG_REF" "$HEDGEHOG_REPO" /app
 RUN pip install -r requirements.txt
-COPY hedgehog/ ./hedgehog/
-COPY pyproject.toml ./pyproject.toml
 
 ENV HEDGEHOG_HOST=0.0.0.0 \
     HEDGEHOG_PORT=8765 \
