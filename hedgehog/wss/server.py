@@ -163,6 +163,28 @@ class HedgehogServer:
         if ftype == "client_log":
             self._append_client_log(p.text)
             return
+        if ftype == "update_self":
+            # §15: git pull своего исходника + перезапуск. Авторизация — тем же
+            # токеном, что и WS (SSH не нужен). Работает для серверов,
+            # добавленных только по порту Ёжика.
+            from .. import updater
+            result = await asyncio.to_thread(updater.pull_latest)
+            await self.hub.send_global(conn_id, make_frame("update_result", {
+                "ok": result.ok,
+                "changed": result.changed,
+                "old": result.old,
+                "new": result.new,
+                "message": result.message,
+            }))
+            log.info("update.self", ok=result.ok, changed=result.changed,
+                     old=result.old, new=result.new)
+            if result.ok and result.changed:
+                async def _restart():
+                    await asyncio.sleep(1.0)  # дать update_result долететь
+                    log.info("update.restart", to=result.new)
+                    updater.restart_in_place()
+                asyncio.create_task(_restart())
+            return
         if ftype == "install_skill":
             # Установка скиллов из git-репо (§skills v2). Сетевой I/O —
             # в отдельном потоке, чтобы не блокировать event loop. Клиент

@@ -179,6 +179,8 @@ CLIENT_FRAME_TYPES: dict[str, tuple[type[_Payload], bool]] = {
     "logout": (EmptyPayload, False),
     # §14: лог приложения-клиента (глобальный, без chatId)
     "client_log": (ClientLogPayload, False),
+    # §15: самообновление Ёжика (git pull + рестарт; глобальный, без chatId)
+    "update_self": (EmptyPayload, False),
 }
 
 
