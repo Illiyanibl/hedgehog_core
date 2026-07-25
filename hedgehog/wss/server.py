@@ -147,6 +147,19 @@ class HedgehogServer:
                     "auth_result",
                     {"ok": False, "error": "no auth flow in progress"}))
             return
+        if ftype == "logout":
+            # §13: разлогин. /logout в SDK не работает (интерактивная
+            # команда), поэтому удаляем сохранённый OAuth-токен и пересоздаём
+            # claude-сессии. Следующий user_msg → AUTH_REQUIRED → auth-флоу.
+            try:
+                self.config.oauth_token_file.unlink(missing_ok=True)
+            except OSError as e:
+                log.warning("auth.logout_unlink_failed", err=str(e))
+            for chat_id, session in list(self.sessions.items()):
+                if isinstance(session, ClaudeSession):
+                    await self._stop_session(chat_id)
+            log.info("auth.logout")
+            return
         if ftype == "client_log":
             self._append_client_log(p.text)
             return

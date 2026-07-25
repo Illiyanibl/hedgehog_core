@@ -24,7 +24,10 @@ PermissionResultAllow с updated_input, где в каждый question допи
 from __future__ import annotations
 
 import asyncio
+import mimetypes
+import shutil
 from collections import deque
+from pathlib import Path
 from typing import Any
 
 import structlog
@@ -41,9 +44,12 @@ from claude_agent_sdk import (
     ToolResultBlock,
     ToolUseBlock,
     UserMessage,
+    create_sdk_mcp_server,
+    tool,
 )
 
 from ..config import Config
+from ..fileserver import _safe_name
 from ..ids import new_ulid
 from ..protocol import Err, make_error
 from ..store.chats import ChatMeta
@@ -83,6 +89,10 @@ def is_resume_error(err_text: str) -> bool:
 
 
 class ClaudeSession:
+    # Сколько ждать тишины после ResultMessage, прежде чем закрыть ход:
+    # окно, в которое ещё может прилететь turn от /btw-досыла (см. _turn).
+    _IDLE_GRACE = 1.5
+
     def __init__(self, meta: ChatMeta, publish: PublishFn,
                  send_chat_error, config: Config,
                  mcp_servers: dict[str, dict] | None = None,
@@ -116,10 +126,6 @@ class ClaudeSession:
         self._worker: asyncio.Task | None = None
         # True, пока агент обрабатывает user_msg (для get_status, §3.7c).
         self._busy = False
-        # Число незакрытых запросов текущего хода: первичный prompt + каждый
-        # досланный /btw. Ход завершается (agent_done), только когда счётчик
-        # обнуляется — все запросы получили свой ResultMessage. См. _turn.
-        self._outstanding = 0
         # related frame id → (future решения, контекст для маппинга ответа)
         self._pending: dict[str, tuple[asyncio.Future, dict]] = {}
         # Ответы, пришедшие раньше регистрации future: publish() уже отдал
@@ -176,12 +182,10 @@ class ClaudeSession:
         return False
 
     async def _inject(self, content: str):
-        """Досыл реплики в идущий ход (/btw): +1 к счётчику незакрытых
-        запросов и запись в stdin CLI. Ход не завершится, пока не придёт
-        ResultMessage на каждый query (см. _turn)."""
-        self._outstanding += 1
-        log.info("agent.btw_inject", chat=self.meta.chatId,
-                 outstanding=self._outstanding)
+        """Досыл реплики в идущий ход (/btw): пишем ещё один query в тот же
+        stdin CLI. Его ответ идёт в этот же ход; ход закрывается по тишине
+        после ResultMessage (idle-grace, см. _turn) — счётчик больше не нужен."""
+        log.info("agent.btw_inject", chat=self.meta.chatId)
         await self._client.query(content)
 
     def resolve_permission(self, related: str, decision: str) -> bool:
@@ -209,7 +213,6 @@ class ClaudeSession:
         while True:
             prompt = await self._queue.get()
             self._busy = True
-            self._outstanding = 1          # первичный запрос хода
             try:
                 await self._one_turn(prompt)
             except asyncio.CancelledError:
@@ -233,7 +236,6 @@ class ClaudeSession:
                 await self._disconnect()
             finally:
                 self._busy = False
-                self._outstanding = 0
                 await self._emit_status()  # busy→idle, когда очередь пуста
 
     @property
@@ -254,6 +256,51 @@ class ClaudeSession:
         except Exception as e:  # noqa: BLE001 — broadcast не должен ронять воркер
             log.warning("status.emit_failed", chat=self.meta.chatId, err=repr(e))
 
+    # ---------- отправка файлов агентом в чат (§7, обратное направление) ----------
+
+    def _make_hedgehog_mcp(self):
+        """In-process MCP-сервер: инструмент attach_file — агент отправляет
+        файл ПОЛЬЗОВАТЕЛЮ в текущий чат (карточка в ленте)."""
+        session = self
+
+        @tool(
+            "attach_file",
+            "Отправить файл ПОЛЬЗОВАТЕЛЮ в текущий чат — он появится карточкой, "
+            "которую можно открыть/сохранить. Вызывай после генерации файла "
+            "(PDF, изображение, документ и т.п.). path — абсолютный путь или "
+            "относительно рабочей папки.",
+            {"path": str},
+        )
+        async def attach_file(args: dict[str, Any]) -> dict[str, Any]:
+            text = await session._attach_file_to_chat(str(args.get("path", "")))
+            return {"content": [{"type": "text", "text": text}]}
+
+        return create_sdk_mcp_server(name="hedgehog", tools=[attach_file])
+
+    async def _attach_file_to_chat(self, path: str) -> str:
+        p = Path(path)
+        if not p.is_absolute():
+            p = Path(self.meta.cwd) / path
+        if not p.is_file():
+            return f"файл не найден: {path}"
+        files_dir = self._config.chats_dir / self.meta.chatId / "files"
+        files_dir.mkdir(parents=True, exist_ok=True)
+        file_id = new_ulid()
+        safe = _safe_name(p.name)
+        dest = files_dir / f"{file_id}__{safe}"
+        try:
+            shutil.copy2(p, dest)
+        except OSError as e:
+            return f"не удалось скопировать файл: {e}"
+        size = dest.stat().st_size
+        mime = mimetypes.guess_type(safe)[0] or "application/octet-stream"
+        await self._publish("agent_file", {
+            "fileId": file_id, "name": safe, "mime": mime, "size": size,
+        })
+        log.info("agent.file_sent", chat=self.meta.chatId, file=file_id,
+                 name=safe, size=size)
+        return f"файл «{safe}» отправлен пользователю в чат"
+
     async def _ensure_client(self) -> ClaudeSDKClient:
         if self._client is None:
             opts: dict = {
@@ -267,8 +314,11 @@ class ClaudeSession:
             # --dangerously-skip-permissions, который запрещён под root (наш
             # контейнер — root). Свой callback работает при любом uid и даёт
             # полный контроль (см. _can_use_tool).
-            if self._mcp_servers:
-                opts["mcp_servers"] = self._mcp_servers
+            # MCP: пользовательские серверы (§12) + встроенный hedgehog
+            # (инструмент attach_file — агент шлёт файлы в чат).
+            mcp = dict(self._mcp_servers)
+            mcp["hedgehog"] = self._make_hedgehog_mcp()
+            opts["mcp_servers"] = mcp
             # Гейт скиллов (§skills): непустой allowlist → включаем эти
             # скиллы и открываем CLI источники user/project, иначе он не
             # найдёт папки .claude/skills. Пусто/None → ничего не трогаем
@@ -310,8 +360,7 @@ class ClaudeSession:
                 self._set_session_id(None)
                 await self._disconnect()
                 # Свежий клиент: досланные в упавший ход /btw ушли вместе со
-                # старым коннектом — считаем один незакрытый запрос (ретрай).
-                self._outstanding = 1
+                # старым коннектом — ретраим только первичный prompt.
                 await self._turn(prompt)
             else:
                 raise
@@ -333,19 +382,31 @@ class ClaudeSession:
         auth_needed = False
 
         # receive_messages() — непрерывный поток (не останавливается на
-        # ResultMessage). Останавливаемся сами, когда закрыты ВСЕ запросы хода
-        # (_outstanding == 0): первичный prompt + все досланные /btw. Досыл
-        # (_inject) увеличивает счётчик и пишет ещё один query в тот же stdin,
-        # его ответ идёт в этот же ход — agent_done эмитим один раз, в конце.
-        async for msg in client.receive_messages():
+        # ResultMessage). Ход завершаем ПО ФАКТУ ТИШИНЫ после ResultMessage, а
+        # НЕ по счётчику query: claude группирует подряд идущие /btw-досылы в
+        # один ответ, поэтому число ResultMessage ≠ числу query — счётчик
+        # застревал >0, ход не закрывался, статус висел busy навсегда.
+        # Пока ход активен (последнего result ещё нет) — ждём бесконечно; как
+        # только пришёл result — ждём ещё _IDLE_GRACE: прилетит контент (turn
+        # от досыла) → last_result сбросится, продолжаем; тишина → ход закрыт.
+        stream = client.receive_messages().__aiter__()
+        last_result: ResultMessage | None = None
+        while True:
+            timeout = self._IDLE_GRACE if last_result is not None else None
+            try:
+                msg = await asyncio.wait_for(stream.__anext__(), timeout)
+            except asyncio.TimeoutError:
+                break                # тишина после result → ход завершён
+            except StopAsyncIteration:
+                break
+
             if isinstance(msg, SystemMessage):
-                # init-сообщение несёт session_id — сохраняем сразу, чтобы
-                # даже оборванный ход можно было резюмить.
                 if msg.subtype == "init":
                     sid = (msg.data or {}).get("session_id")
                     if sid:
                         self._set_session_id(sid)
             elif isinstance(msg, AssistantMessage):
+                last_result = None   # пошёл новый контент (возможно turn досыла)
                 for block in msg.content:
                     if isinstance(block, TextBlock):
                         await self._publish("text_delta", {
@@ -372,21 +433,18 @@ class ClaudeSession:
                     auth_needed = True
                 if msg.session_id:
                     self._set_session_id(msg.session_id)
-                self._outstanding -= 1
-                if self._outstanding <= 0:
-                    usage = msg.usage or {}
-                    await self._publish("agent_done", {
-                        "result": msg.result or "",
-                        "usage": {
-                            "input_tokens": usage.get("input_tokens", 0),
-                            "output_tokens": usage.get("output_tokens", 0),
-                        },
-                    })
-                    # Перепроверка после await: если во время публикации влетел
-                    # досыл (_inject увеличил счётчик) — не выходим, дочитываем
-                    # его ответ в этот же ход.
-                    if self._outstanding <= 0:
-                        break
+                last_result = msg    # запоминаем; agent_done — один раз, в конце
+
+        # Один agent_done с последним результатом хода (первичный + все досылы).
+        if last_result is not None:
+            usage = last_result.usage or {}
+            await self._publish("agent_done", {
+                "result": last_result.result or "",
+                "usage": {
+                    "input_tokens": usage.get("input_tokens", 0),
+                    "output_tokens": usage.get("output_tokens", 0),
+                },
+            })
 
         if auth_needed:
             log.warning("agent.auth_required_result", chat=self.meta.chatId)
@@ -417,6 +475,10 @@ class ClaudeSession:
             # не видит вариантов (баг «пропадают варианты ответа»).
             if tool_name == "AskUserQuestion":
                 return await self._ask_via_picker(tool_input)
+            # Наш встроенный инструмент отправки файла в чат — безопасен
+            # (копирует файл в files-папку чата), разрешаем без спроса.
+            if tool_name == "mcp__hedgehog__attach_file":
+                return PermissionResultAllow()
             if mode == "bypassPermissions":
                 return PermissionResultAllow()      # автономный чат: всё без спроса
             if mode == "acceptEdits" and tool_name in self._EDIT_TOOLS:

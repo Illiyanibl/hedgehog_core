@@ -176,6 +176,7 @@ CLIENT_FRAME_TYPES: dict[str, tuple[type[_Payload], bool]] = {
     # §13: авторизация Claude на сервере (глобальные, без chatId)
     "auth_start": (EmptyPayload, False),
     "auth_code": (AuthCodePayload, False),
+    "logout": (EmptyPayload, False),
     # §14: лог приложения-клиента (глобальный, без chatId)
     "client_log": (ClientLogPayload, False),
 }
