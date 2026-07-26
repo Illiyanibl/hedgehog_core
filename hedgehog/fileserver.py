@@ -22,14 +22,17 @@ percent-encoded UTF-8 (заголовки HTTP латиница) → серве�
   POST   /v1/copy    (X-From,X-To,X-Overwrite) — скопировать
   DELETE /v1/rm      (X-Path)                 — удалить файл/папку (рекурсивно)
   POST   /v1/attach  (X-Chat-Id,X-Path)       — копия файла во вложения чата
+  POST   /v1/zip     (JSON {paths:[...]})     — один zip из нескольких путей
 """
 from __future__ import annotations
 
+import io
 import mimetypes
 import os
 import re
 import shutil
 import urllib.parse
+import zipfile
 from pathlib import Path
 
 from aiohttp import web
@@ -394,6 +397,60 @@ async def _attach(request: web.Request) -> web.Response:
     })
 
 
+MAX_ZIP_BYTES = 512 * 1024 * 1024  # суммарный лимит на архив (защита памяти)
+
+
+def _zip_items(p: Path) -> list[tuple[Path, str]]:
+    """Развернуть путь в список (файл, arcname). Папка → рекурсивно (arcname
+    с префиксом её имени). Симлинки пропускаем (не выходим наружу архивом)."""
+    if p.is_symlink():
+        return []
+    if p.is_file():
+        return [(p, p.name)]
+    if p.is_dir():
+        out: list[tuple[Path, str]] = []
+        for f in p.rglob("*"):
+            if f.is_file() and not f.is_symlink():
+                out.append((f, f"{p.name}/{f.relative_to(p).as_posix()}"))
+        return out
+    return []
+
+
+async def _zip(request: web.Request) -> web.Response:
+    """Собрать один zip из нескольких путей (множественное скачивание, §16 v2)."""
+    config: Config = request.app[CONFIG_KEY]
+    try:
+        payload = await request.json()
+        raw_paths = payload.get("paths", [])
+    except Exception:
+        raise web.HTTPBadRequest(text="bad json")
+    if not isinstance(raw_paths, list) or not raw_paths:
+        raise web.HTTPBadRequest(text="no paths")
+
+    # каждый путь — через предохранитель (потолок/traversal), затем разворот.
+    items: list[tuple[Path, str]] = []
+    for rp in raw_paths[:1000]:
+        p = _resolve(config, rp, must_exist=True)
+        items += _zip_items(p)
+    if not items:
+        raise web.HTTPBadRequest(text="nothing to zip")
+
+    total = sum(f.stat().st_size for f, _ in items)
+    if total > MAX_ZIP_BYTES:
+        return web.json_response({"error": "archive too large"}, status=413)
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for f, arc in items:
+            zf.write(f, arc)
+    data = buf.getvalue()
+    log.info("file.zip", count=len(items), bytes=len(data))
+    return web.Response(body=data, headers={
+        "Content-Type": "application/zip",
+        "Content-Disposition": 'attachment; filename="files.zip"',
+    })
+
+
 def make_app(config: Config, token: str) -> web.Application:
     app = web.Application(
         middlewares=[_auth_mw],
@@ -414,6 +471,7 @@ def make_app(config: Config, token: str) -> web.Application:
         web.post("/v1/copy", _copy),
         web.delete("/v1/rm", _rm),
         web.post("/v1/attach", _attach),
+        web.post("/v1/zip", _zip),
     ])
     return app
 
