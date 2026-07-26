@@ -34,6 +34,13 @@ class Config:
     # (напр. /root/projects) — все чаты работают там, видят реальные проекты.
     default_cwd: str | None = field(default_factory=lambda: os.environ.get(
         "HEDGEHOG_DEFAULT_CWD") or None)
+    # §16 Files: потолок обзора файл-браузера. По умолчанию "/" — корень
+    # контейнера (проект изолирован в Docker, вся его ФС доступна владельцу).
+    # На голом сервере можно ужать (напр. /root/projects). Пути выше потолка
+    # сервер отдаёт 403. Родитель проектов (projects_root) клиент красит
+    # красным как «вышел из своих проектов» — но обзор не блокирует.
+    browse_root: str = field(default_factory=lambda: os.environ.get(
+        "HEDGEHOG_BROWSE_ROOT", "/"))
 
     server_version: str = "0.1.0"
     protocol_versions: tuple[int, ...] = (1,)
@@ -52,6 +59,15 @@ class Config:
     @property
     def chats_dir(self) -> Path:
         return self.data_dir / "chats"
+
+    @property
+    def projects_root(self) -> Path:
+        """«Домашняя» зона файл-браузера — родитель рабочих папок проектов.
+        Если задан HEDGEHOG_DEFAULT_CWD (все чаты работают там) — это он;
+        иначе изоляция: /data/chats. Внутри — «свои проекты», снаружи (но
+        в пределах browse_root) клиент красит путь красным."""
+        base = self.default_cwd or self.chats_dir
+        return Path(base).resolve()
 
     @property
     def client_log_file(self) -> Path:

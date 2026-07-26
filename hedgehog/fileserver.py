@@ -5,14 +5,31 @@ WS-слой (`websockets`) не трогается: файлы живут на �
 self-signed TLS-серт (пиннинг на клиенте). Агент читает файлы с локальной
 ФС (`Read`) — HTTP/токен его не касаются.
 
-Роуты:
+Роуты (вложения чата, §7):
   GET  /v1/health                    — liveness (под токеном)
-  POST /v1/upload                    — загрузка (headers: chatId/name/mime)
-  GET  /v1/file/{chatId}/{fileId}    — скачивание (Range поддержан)
+  POST /v1/upload                    — загрузка вложения (headers: chatId/name/mime)
+  GET  /v1/file/{chatId}/{fileId}    — скачивание вложения (Range поддержан)
+
+Роуты файл-браузера (§16, вкладка Files). Пути — в заголовках, значения
+percent-encoded UTF-8 (заголовки HTTP латиница) → сервер делает unquote.
+Все пути проходят через _resolve() — потолок config.browse_root, наружу 403.
+  GET    /v1/tree    (X-Path)                 — листинг каталога
+  GET    /v1/fetch   (X-Path)                 — скачать/предпросмотр (Range)
+  POST   /v1/put     (X-Dir,X-Name,X-Overwrite) — загрузка в папку (реальное имя)
+  PUT    /v1/write   (X-Path)                 — сохранить текст (body=байты)
+  POST   /v1/mkdir   (X-Path)                 — создать папку
+  POST   /v1/move    (X-From,X-To,X-Overwrite) — переименовать/переместить
+  POST   /v1/copy    (X-From,X-To,X-Overwrite) — скопировать
+  DELETE /v1/rm      (X-Path)                 — удалить файл/папку (рекурсивно)
+  POST   /v1/attach  (X-Chat-Id,X-Path)       — копия файла во вложения чата
 """
 from __future__ import annotations
 
+import mimetypes
+import os
 import re
+import shutil
+import urllib.parse
 from pathlib import Path
 
 from aiohttp import web
@@ -33,6 +50,15 @@ _SAFE = re.compile(r"[^A-Za-z0-9._-]+")
 def _safe_name(name: str) -> str:
     base = _SAFE.sub("_", name.strip()) or "file"
     return base[:120]
+
+
+def _safe_component(name: str) -> str:
+    """Имя файла/папки для файл-браузера (§16): сохраняем Unicode (кириллица
+    и пр.), но режем разделители путей и NUL — без слэшей и `..` нет traversal."""
+    base = name.strip().replace("\x00", "").replace("/", "_").replace("\\", "_")
+    if base in ("", ".", ".."):
+        return "file"
+    return base[:255]
 
 
 # ---------- вложения → промпт агенту (§7.3) ----------
@@ -130,6 +156,244 @@ async def _download(request: web.Request) -> web.StreamResponse:
     return web.FileResponse(matches[0])  # aiohttp сам обрабатывает Range
 
 
+# ---------- файл-браузер (§16, вкладка Files) ----------
+
+MAX_ENTRIES = 2000  # лимит записей на листинг (node_modules/.git и т.п.)
+
+
+def _dec(request: web.Request, key: str) -> str:
+    """Значение заголовка → percent-decoded UTF-8 путь."""
+    return urllib.parse.unquote(request.headers.get(key, ""))
+
+
+def _browse_root(config: Config) -> Path:
+    return Path(config.browse_root).resolve()
+
+
+def _resolve(config: Config, raw: str, *, must_exist: bool = False) -> Path:
+    """Абсолютный путь в пределах browse_root. Наружу → 403, пусто → 400.
+
+    resolve() снимает `..` и симлинки ДО проверки префикса — симлинк наружу
+    не даёт сбежать. Несуществующий путь допустим (mkdir/put/write создают)."""
+    if not raw:
+        raise web.HTTPBadRequest(text="path required")
+    root = _browse_root(config)
+    p = Path(raw)
+    if not p.is_absolute():
+        p = root / raw
+    try:
+        p = p.resolve()
+    except (OSError, RuntimeError):
+        raise web.HTTPBadRequest(text="bad path")
+    if p != root and root not in p.parents:
+        raise web.HTTPForbidden(text="outside browse root")
+    if must_exist and not p.exists():
+        raise web.HTTPNotFound(text="not found")
+    return p
+
+
+async def _tree(request: web.Request) -> web.Response:
+    config: Config = request.app[CONFIG_KEY]
+    p = _resolve(config, _dec(request, "X-Path"), must_exist=True)
+    if not p.is_dir():
+        raise web.HTTPBadRequest(text="not a directory")
+    root = _browse_root(config)
+    entries: list[dict] = []
+    truncated = False
+    try:
+        with os.scandir(p) as it:
+            for de in it:
+                if len(entries) >= MAX_ENTRIES:
+                    truncated = True
+                    break
+                try:
+                    st = de.stat(follow_symlinks=False)
+                    is_link = de.is_symlink()
+                    is_dir = de.is_dir(follow_symlinks=True)
+                except OSError:
+                    continue
+                entries.append({
+                    "name": de.name,
+                    "type": "dir" if is_dir else "file",
+                    "size": st.st_size,
+                    "mtime": st.st_mtime,
+                    "symlink": is_link,
+                })
+    except OSError as e:
+        raise web.HTTPForbidden(text=str(e))
+    # Папки выше файлов, затем по имени без регистра.
+    entries.sort(key=lambda e: (e["type"] != "dir", e["name"].lower()))
+    return web.json_response({
+        "path": str(p),
+        "parent": None if p == root else str(p.parent),
+        "projectsRoot": str(config.projects_root),
+        "browseRoot": str(root),
+        "truncated": truncated,
+        "entries": entries,
+    })
+
+
+async def _fetch(request: web.Request) -> web.StreamResponse:
+    config: Config = request.app[CONFIG_KEY]
+    p = _resolve(config, _dec(request, "X-Path"), must_exist=True)
+    if not p.is_file():
+        raise web.HTTPBadRequest(text="not a file")
+    return web.FileResponse(p)  # Range обрабатывает aiohttp
+
+
+async def _put(request: web.Request) -> web.Response:
+    config: Config = request.app[CONFIG_KEY]
+    d = _resolve(config, _dec(request, "X-Dir"), must_exist=True)
+    if not d.is_dir():
+        raise web.HTTPBadRequest(text="not a directory")
+    name = _safe_component(_dec(request, "X-Name") or "file")  # без слэшей → без traversal
+    overwrite = request.headers.get("X-Overwrite", "") == "1"
+    dest = d / name
+    if dest.exists() and not overwrite:
+        return web.json_response({"error": "exists"}, status=409)
+
+    size = 0
+    limit = config.max_upload_bytes
+    tmp = d / (name + ".part")
+    try:
+        with open(tmp, "wb") as f:
+            async for chunk in request.content.iter_chunked(1 << 16):
+                size += len(chunk)
+                if size > limit:
+                    f.close()
+                    tmp.unlink(missing_ok=True)
+                    return web.json_response({"error": "file too large"}, status=413)
+                f.write(chunk)
+        tmp.replace(dest)  # атомарная подмена
+    except OSError as e:
+        tmp.unlink(missing_ok=True)
+        raise web.HTTPBadRequest(text=str(e))
+    log.info("file.put", dir=str(d), name=name, size=size)
+    return web.json_response({"name": name, "path": str(dest), "size": size})
+
+
+async def _write(request: web.Request) -> web.Response:
+    config: Config = request.app[CONFIG_KEY]
+    p = _resolve(config, _dec(request, "X-Path"))
+    if p.exists() and p.is_dir():
+        raise web.HTTPBadRequest(text="is a directory")
+    data = await request.read()  # ограничен client_max_size
+    tmp = p.with_name(p.name + ".part")
+    try:
+        tmp.write_bytes(data)
+        tmp.replace(p)
+    except OSError as e:
+        tmp.unlink(missing_ok=True)
+        raise web.HTTPBadRequest(text=str(e))
+    log.info("file.write", path=str(p), size=len(data))
+    return web.json_response({"path": str(p), "size": len(data)})
+
+
+async def _mkdir(request: web.Request) -> web.Response:
+    config: Config = request.app[CONFIG_KEY]
+    p = _resolve(config, _dec(request, "X-Path"))
+    if p.exists():
+        return web.json_response({"error": "exists"}, status=409)
+    try:
+        p.mkdir(parents=True)
+    except OSError as e:
+        raise web.HTTPBadRequest(text=str(e))
+    return web.json_response({"path": str(p)})
+
+
+def _prepare_dst(dst: Path, overwrite: bool) -> web.Response | None:
+    """Общая проверка приёмника для move/copy. None → можно писать."""
+    if dst.exists():
+        if not overwrite:
+            return web.json_response({"error": "exists"}, status=409)
+        if dst.is_dir() and not dst.is_symlink():
+            shutil.rmtree(dst)
+        else:
+            dst.unlink()
+    return None
+
+
+async def _move(request: web.Request) -> web.Response:
+    config: Config = request.app[CONFIG_KEY]
+    src = _resolve(config, _dec(request, "X-From"), must_exist=True)
+    dst = _resolve(config, _dec(request, "X-To"))
+    if src == _browse_root(config):
+        raise web.HTTPForbidden(text="refuse to move root")
+    if (resp := _prepare_dst(dst, request.headers.get("X-Overwrite", "") == "1")):
+        return resp
+    try:
+        shutil.move(str(src), str(dst))
+    except OSError as e:
+        raise web.HTTPBadRequest(text=str(e))
+    log.info("file.move", **{"from": str(src), "to": str(dst)})
+    return web.json_response({"path": str(dst)})
+
+
+async def _copy(request: web.Request) -> web.Response:
+    config: Config = request.app[CONFIG_KEY]
+    src = _resolve(config, _dec(request, "X-From"), must_exist=True)
+    dst = _resolve(config, _dec(request, "X-To"))
+    if (resp := _prepare_dst(dst, request.headers.get("X-Overwrite", "") == "1")):
+        return resp
+    try:
+        if src.is_dir() and not src.is_symlink():
+            shutil.copytree(src, dst)
+        else:
+            shutil.copy2(src, dst)
+    except OSError as e:
+        raise web.HTTPBadRequest(text=str(e))
+    log.info("file.copy", **{"from": str(src), "to": str(dst)})
+    return web.json_response({"path": str(dst)})
+
+
+async def _rm(request: web.Request) -> web.Response:
+    config: Config = request.app[CONFIG_KEY]
+    p = _resolve(config, _dec(request, "X-Path"), must_exist=True)
+    # Запрет на снос потолка обзора и «домашнего» корня проектов.
+    if p == _browse_root(config) or p == config.projects_root:
+        raise web.HTTPForbidden(text="refuse to delete root")
+    try:
+        if p.is_dir() and not p.is_symlink():
+            shutil.rmtree(p)
+        else:
+            p.unlink()
+    except OSError as e:
+        raise web.HTTPBadRequest(text=str(e))
+    log.info("file.rm", path=str(p))
+    return web.json_response({"ok": True})
+
+
+async def _attach(request: web.Request) -> web.Response:
+    """Скопировать произвольный файл сервера во вложения чата → Attachment.
+    Клиент дальше шлёт обычный user_msg с этим fileId (агент читает Read'ом)."""
+    config: Config = request.app[CONFIG_KEY]
+    chat_id = request.headers.get("X-Chat-Id", "")
+    if not chat_id.isalnum():
+        return web.json_response({"error": "bad chatId"}, status=400)
+    chat_dir = config.chats_dir / chat_id
+    if not chat_dir.exists():
+        return web.json_response({"error": "chat not found"}, status=404)
+    src = _resolve(config, _dec(request, "X-Path"), must_exist=True)
+    if not src.is_file():
+        raise web.HTTPBadRequest(text="not a file")
+
+    files_dir = chat_dir / "files"
+    files_dir.mkdir(parents=True, exist_ok=True)
+    file_id = new_ulid()
+    safe = _safe_name(src.name)
+    dest = files_dir / f"{file_id}__{safe}"
+    try:
+        shutil.copy2(src, dest)
+    except OSError as e:
+        raise web.HTTPBadRequest(text=str(e))
+    mime = mimetypes.guess_type(src.name)[0] or "application/octet-stream"
+    log.info("file.attach", chat=chat_id, file=file_id, name=safe)
+    return web.json_response({
+        "fileId": file_id, "name": safe, "path": str(dest),
+        "size": dest.stat().st_size, "mime": mime,
+    })
+
+
 def make_app(config: Config, token: str) -> web.Application:
     app = web.Application(
         middlewares=[_auth_mw],
@@ -140,6 +404,16 @@ def make_app(config: Config, token: str) -> web.Application:
         web.get("/v1/health", _health),
         web.post("/v1/upload", _upload),
         web.get("/v1/file/{chatId}/{fileId}", _download),
+        # файл-браузер (§16)
+        web.get("/v1/tree", _tree),
+        web.get("/v1/fetch", _fetch),
+        web.post("/v1/put", _put),
+        web.put("/v1/write", _write),
+        web.post("/v1/mkdir", _mkdir),
+        web.post("/v1/move", _move),
+        web.post("/v1/copy", _copy),
+        web.delete("/v1/rm", _rm),
+        web.post("/v1/attach", _attach),
     ])
     return app
 
