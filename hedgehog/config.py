@@ -42,6 +42,26 @@ class Config:
     browse_root: str = field(default_factory=lambda: os.environ.get(
         "HEDGEHOG_BROWSE_ROOT", "/"))
 
+    # §17 Neko-браузер — общий Chromium в контейнере, стрим по WebRTC, доступ
+    # по TLS-пиннингу (тем же сертом, что файл-сервер), без SSH. Ставится Ёжиком
+    # через docker CLI + socket-proxy. Один общий инстанс на сервер, opt-in.
+    neko_image: str = field(default_factory=lambda: os.environ.get(
+        "HEDGEHOG_NEKO_IMAGE", "ghcr.io/illiyanibl/devolution-neko:latest"))
+    # Порт HTTPS/WSS-сигналинга neko (TLS терминирует сам neko нашим сертом).
+    neko_https_port: int = field(default_factory=lambda: int(
+        os.environ.get("HEDGEHOG_NEKO_PORT", "8766")))
+    # WebRTC одним портом: udp-mux (медиа) + tcp-mux (fallback на строгих сетях).
+    neko_udpmux_port: int = field(default_factory=lambda: int(
+        os.environ.get("HEDGEHOG_NEKO_UDPMUX", "59000")))
+    neko_tcpmux_port: int = field(default_factory=lambda: int(
+        os.environ.get("HEDGEHOG_NEKO_TCPMUX", "59000")))
+    neko_screen: str = field(default_factory=lambda: os.environ.get(
+        "HEDGEHOG_NEKO_SCREEN", "1280x800@30"))
+    # Публичный IP сервера — для NEKO_NAT1TO1 (ICE-кандидат WebRTC). В контейнере
+    # bootstrap выставляет SERVER_IP; иначе neko сам заберёт через ipfetch.
+    server_ip: str | None = field(default_factory=lambda: os.environ.get(
+        "SERVER_IP") or None)
+
     server_version: str = "0.1.0"
     protocol_versions: tuple[int, ...] = (1,)
     capabilities: tuple[str, ...] = ("claude", "broker_shell", "picker")

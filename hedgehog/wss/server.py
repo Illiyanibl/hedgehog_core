@@ -185,6 +185,26 @@ class HedgehogServer:
                     updater.restart_in_place()
                 asyncio.create_task(_restart())
             return
+        if ftype in ("install_neko", "get_neko", "remove_neko"):
+            # §17: Neko-браузер. Провижининг/снос — блокирующий docker I/O в
+            # отдельном потоке. Авторизация — тем же токеном, что WS (без SSH).
+            from .. import neko
+            if ftype == "install_neko":
+                result = await asyncio.to_thread(neko.provision, self.config)
+            elif ftype == "remove_neko":
+                result = await asyncio.to_thread(neko.teardown, self.config)
+            else:
+                result = await asyncio.to_thread(neko.status, self.config)
+            await self.hub.send_global(conn_id, make_frame("neko_result", {
+                "ok": result.ok,
+                "status": result.status,
+                "message": result.message,
+                "https_port": result.https_port,
+                "user_password": result.user_password,
+                "server_ip": result.server_ip,
+            }))
+            log.info("neko." + ftype, ok=result.ok, status=result.status)
+            return
         if ftype == "install_skill":
             # Установка скиллов из git-репо (§skills v2). Сетевой I/O —
             # в отдельном потоке, чтобы не блокировать event loop. Клиент

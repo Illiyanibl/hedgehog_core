@@ -181,6 +181,10 @@ CLIENT_FRAME_TYPES: dict[str, tuple[type[_Payload], bool]] = {
     "client_log": (ClientLogPayload, False),
     # §15: самообновление Ёжика (git pull + рестарт; глобальный, без chatId)
     "update_self": (EmptyPayload, False),
+    # §17: Neko-браузер (провижининг/статус/снос; глобальные, без chatId)
+    "install_neko": (EmptyPayload, False),
+    "get_neko": (EmptyPayload, False),
+    "remove_neko": (EmptyPayload, False),
 }
 
 
