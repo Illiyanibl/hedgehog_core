@@ -172,10 +172,12 @@ def status(config: Config) -> NekoResult:
                           message="docker недоступен (нет socket-proxy?)")
     st = _container_status(CONTAINER)
     if st == "running":
-        user, _ = _passwords(config)
+        # Клиент логинится как ADMIN (host + контроль экрана через REST), как
+        # devolution. Пароль отдаётся по аутентифицированному WS.
+        _, admin = _passwords(config)
         return NekoResult(ok=True, status="running",
                           https_port=config.neko_https_port,
-                          user_password=user, server_ip=config.server_ip or "")
+                          user_password=admin, server_ip=config.server_ip or "")
     return NekoResult(ok=True, status="absent" if st == "absent" else "error",
                       message="" if st == "absent" else "контейнер остановлен")
 
@@ -226,9 +228,10 @@ def provision(config: Config) -> NekoResult:
 
     log.info("neko.provisioned", port=config.neko_https_port, network=network,
              nat=nat_ip or "ipfetch")
+    # Клиент логинится как admin (host + контроль экрана), как devolution.
     return NekoResult(ok=True, status="running",
                       https_port=config.neko_https_port,
-                      user_password=user_pw, server_ip=config.server_ip or "")
+                      user_password=admin_pw, server_ip=config.server_ip or "")
 
 
 def teardown(config: Config) -> NekoResult:
