@@ -90,10 +90,6 @@ def is_resume_error(err_text: str) -> bool:
 
 
 class ClaudeSession:
-    # Сколько ждать тишины после ResultMessage, прежде чем закрыть ход:
-    # окно, в которое ещё может прилететь turn от /btw-досыла (см. _turn).
-    _IDLE_GRACE = 1.5
-
     def __init__(self, meta: ChatMeta, publish: PublishFn,
                  send_chat_error, config: Config,
                  mcp_servers: dict[str, dict] | None = None,
@@ -166,28 +162,22 @@ class ClaudeSession:
     # ---------- входящие фреймы ----------
 
     async def handle_user_msg(self, content: str) -> bool:
-        """Обработать входящее сообщение. Возврат: True — сообщение влито в
-        текущий ход (/btw-досыл), False — поставлено обычным ходом.
+        """Поставить сообщение в очередь. Всегда возвращает False.
 
-        Правило (очередь пуста → напрямую, не пуста → /btw): если агент занят
-        и клиент подключён — вливаем реплику в идущий ход через client.query()
-        (stdin CLI), агент подхватывает её по ходу. Иначе — обычная очередь.
+        §fix (рассинхрон ответов): раньше при занятом агенте сообщение
+        «досылалось» в текущий ход через client.query() (/btw). Это ломало
+        порядок: idle-grace ждал ответ на досыл всего 1.5с, а с MCP ответ
+        приходит ~6с — grace истекал, ход закрывался, ответ на досыл терялся
+        и «доезжал» уже на следующем ходе (ответ N под сообщением N+1).
+
+        Теперь КАЖДОЕ сообщение — отдельный ход строго по очереди: воркер
+        читает ответ полностью (receive_response до ResultMessage), затем
+        берёт следующее из очереди. Порядок «сообщение→ответ» гарантирован.
         """
         await self.start()
-        if self._busy and self._client is not None:
-            await self._inject(content)
-            await self._emit_status()
-            return True
         await self._queue.put(content)
         await self._emit_status()  # idle→busy при первом сообщении
         return False
-
-    async def _inject(self, content: str):
-        """Досыл реплики в идущий ход (/btw): пишем ещё один query в тот же
-        stdin CLI. Его ответ идёт в этот же ход; ход закрывается по тишине
-        после ResultMessage (idle-grace, см. _turn) — счётчик больше не нужен."""
-        log.info("agent.btw_inject", chat=self.meta.chatId)
-        await self._client.query(content)
 
     def resolve_permission(self, related: str, decision: str) -> bool:
         return self._resolve(related, decision)
@@ -385,32 +375,18 @@ class ClaudeSession:
         # результатом «Not logged in · Please run /login» (e2e 2026-07-12).
         auth_needed = False
 
-        # receive_messages() — непрерывный поток (не останавливается на
-        # ResultMessage). Ход завершаем ПО ФАКТУ ТИШИНЫ после ResultMessage, а
-        # НЕ по счётчику query: claude группирует подряд идущие /btw-досылы в
-        # один ответ, поэтому число ResultMessage ≠ числу query — счётчик
-        # застревал >0, ход не закрывался, статус висел busy навсегда.
-        # Пока ход активен (последнего result ещё нет) — ждём бесконечно; как
-        # только пришёл result — ждём ещё _IDLE_GRACE: прилетит контент (turn
-        # от досыла) → last_result сбросится, продолжаем; тишина → ход закрыт.
-        stream = client.receive_messages().__aiter__()
+        # §fix: receive_response() отдаёт сообщения ДО ResultMessage включительно
+        # и завершается — ход читается ПОЛНОСТЬЮ, без гонки idle-grace. Каждое
+        # сообщение = свой ход (очередь, см. handle_user_msg), поэтому ответ
+        # больше не теряется и не «сползает» под следующее сообщение.
         last_result: ResultMessage | None = None
-        while True:
-            timeout = self._IDLE_GRACE if last_result is not None else None
-            try:
-                msg = await asyncio.wait_for(stream.__anext__(), timeout)
-            except asyncio.TimeoutError:
-                break                # тишина после result → ход завершён
-            except StopAsyncIteration:
-                break
-
+        async for msg in client.receive_response():
             if isinstance(msg, SystemMessage):
                 if msg.subtype == "init":
                     sid = (msg.data or {}).get("session_id")
                     if sid:
                         self._set_session_id(sid)
             elif isinstance(msg, AssistantMessage):
-                last_result = None   # пошёл новый контент (возможно turn досыла)
                 for block in msg.content:
                     if isinstance(block, TextBlock):
                         await self._publish("text_delta", {
@@ -437,9 +413,9 @@ class ClaudeSession:
                     auth_needed = True
                 if msg.session_id:
                     self._set_session_id(msg.session_id)
-                last_result = msg    # запоминаем; agent_done — один раз, в конце
+                last_result = msg
 
-        # Один agent_done с последним результатом хода (первичный + все досылы).
+        # Один agent_done с итоговым результатом хода.
         if last_result is not None:
             usage = last_result.usage or {}
             await self._publish("agent_done", {
