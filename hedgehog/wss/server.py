@@ -329,6 +329,68 @@ class HedgehogServer:
                 make_frame("chat_updated", vars(updated)))
             return
 
+        # ---------- §mcp: перезапуск агента + управление MCP ----------
+
+        if ftype == "restart_agent":
+            # Контекст жив (resume по claude_session_id) — стоп-сессия лишь
+            # роняет коннект; новый MCP-набор подхватится на первом user_msg.
+            await self._stop_session(frame.chatId)
+            log.info("chat.agent_restarted", chat=frame.chatId)
+            await self.hub.send_global(conn_id, make_frame(
+                "mcp_response", self._mcp_tree(meta), frame.chatId))
+            return
+
+        if ftype == "list_mcp":
+            await self.hub.send_global(conn_id, make_frame(
+                "mcp_response", self._mcp_tree(meta), frame.chatId))
+            return
+
+        if ftype == "add_mcp":
+            self.mcp.add(p.name, self._mcp_config(p))
+            enabled = list(dict.fromkeys(list(meta.mcp or []) + [p.name]))
+            updated = self.store.update_meta(frame.chatId, mcp=enabled)
+            await self._stop_session(frame.chatId)  # применить новый MCP
+            log.info("chat.mcp_added", chat=frame.chatId, name=p.name,
+                     transport=p.transport)
+            await self.hub.broadcast_global(make_frame("chat_updated", vars(updated)))
+            await self.hub.send_global(conn_id, make_frame(
+                "mcp_response", self._mcp_tree(updated), frame.chatId))
+            return
+
+        if ftype == "set_mcp_enabled":
+            current = list(meta.mcp or [])
+            if p.enabled:
+                current = list(dict.fromkeys(current + [p.name]))
+            else:
+                current = [n for n in current if n != p.name]
+            updated = self.store.update_meta(frame.chatId, mcp=current)
+            await self._stop_session(frame.chatId)  # рестарт агента
+            log.info("chat.mcp_enabled", chat=frame.chatId, name=p.name,
+                     enabled=p.enabled)
+            await self.hub.broadcast_global(make_frame("chat_updated", vars(updated)))
+            await self.hub.send_global(conn_id, make_frame(
+                "mcp_response", self._mcp_tree(updated), frame.chatId))
+            return
+
+        if ftype == "remove_mcp":
+            self.mcp.remove(p.name)
+            current = [n for n in (meta.mcp or []) if n != p.name]
+            updated = self.store.update_meta(frame.chatId, mcp=current)
+            await self._stop_session(frame.chatId)
+            log.info("chat.mcp_removed", chat=frame.chatId, name=p.name)
+            await self.hub.broadcast_global(make_frame("chat_updated", vars(updated)))
+            await self.hub.send_global(conn_id, make_frame(
+                "mcp_response", self._mcp_tree(updated), frame.chatId))
+            return
+
+        if ftype == "get_limits":
+            # §limits: лимиты подписки из заголовков /v1/messages (usage.py).
+            from .. import usage
+            data = await usage.fetch_limits(self.config)
+            await self.hub.send_global(conn_id, make_frame(
+                "limits_result", data, frame.chatId))
+            return
+
         if ftype == "subscribe_chat":
             self.hub.subscribe(conn_id, frame.chatId)
             # Для shell-чата поднимаем bash сразу — клиент увидит prompt.
@@ -477,6 +539,33 @@ class HedgehogServer:
     # Хвост транскрипта, в котором ищем последний agent_done для last_result.
     _STATUS_SCAN_TAIL = 200
     _RESULT_MAX_CHARS = 1000
+
+    @staticmethod
+    def _mcp_config(p) -> dict:
+        """AddMcpPayload → конфиг в схеме Claude Agent SDK (mcp_servers)."""
+        cfg: dict[str, Any] = {"type": p.transport}
+        if p.transport in ("http", "sse"):
+            cfg["url"] = p.url or ""
+            if p.header_name and p.header_value:
+                cfg["headers"] = {p.header_name: p.header_value}
+        else:  # stdio
+            cfg["command"] = p.command or ""
+            if p.args:
+                cfg["args"] = list(p.args)
+        return cfg
+
+    def _mcp_tree(self, meta: ChatMeta) -> dict[str, Any]:
+        """Список MCP-серверов реестра + флаг «включён в этом чате» (meta.mcp).
+        Секреты (значения заголовков/токены) наружу НЕ отдаём — только имя+тип."""
+        enabled = set(meta.mcp or [])
+        servers = [{**m, "enabled": m["name"] in enabled}
+                   for m in self.mcp.list_meta()]
+        # Имена, включённые в чате, но отсутствующие в реестре (битые/удалённые
+        # руками) — показываем, чтобы их можно было выключить.
+        known = {m["name"] for m in servers}
+        for name in sorted(enabled - known):
+            servers.append({"name": name, "type": None, "enabled": True})
+        return {"servers": servers}
 
     def _skills_tree(self, meta: ChatMeta) -> dict[str, Any]:
         """Дерево источник→скиллы для skills_response (§skills v2).

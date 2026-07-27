@@ -150,6 +150,31 @@ class ResumePayload(_Payload):
     last_seen_id: str | None = None
 
 
+# §mcp: управление MCP-серверами чата. Реестр (data/mcp.json) хранит секреты
+# и в протокол НЕ отдаётся — клиент видит только имя+тип (list_mcp).
+class AddMcpPayload(_Payload):
+    # Добавить MCP-сервер в реестр и включить его в ТЕКУЩЕМ чате.
+    name: str = Field(min_length=1, max_length=64)
+    transport: Literal["http", "sse", "stdio"] = "http"
+    url: str | None = None            # http/sse
+    command: str | None = None        # stdio
+    args: list[str] = Field(default_factory=list)
+    # Опциональный заголовок авторизации (http/sse), напр. Authorization: Bearer …
+    header_name: str | None = None
+    header_value: str | None = None
+
+
+class SetMcpEnabledPayload(_Payload):
+    # Вкл/выкл MCP-сервер в ТЕКУЩЕМ чате (правит meta.mcp + рестарт агента).
+    name: str = Field(min_length=1)
+    enabled: bool
+
+
+class RemoveMcpPayload(_Payload):
+    # Удалить MCP-сервер из реестра (и из meta.mcp текущего чата).
+    name: str = Field(min_length=1)
+
+
 # type → (payload-модель, нужен ли chatId в обёртке)
 CLIENT_FRAME_TYPES: dict[str, tuple[type[_Payload], bool]] = {
     "user_msg": (UserMsgPayload, True),
@@ -185,6 +210,15 @@ CLIENT_FRAME_TYPES: dict[str, tuple[type[_Payload], bool]] = {
     "install_neko": (EmptyPayload, False),
     "get_neko": (EmptyPayload, False),
     "remove_neko": (EmptyPayload, False),
+    # §mcp: перезапуск агента чата + управление MCP-серверами (per-chat)
+    "restart_agent": (EmptyPayload, True),
+    "list_mcp": (EmptyPayload, True),
+    "add_mcp": (AddMcpPayload, True),
+    "set_mcp_enabled": (SetMcpEnabledPayload, True),
+    "remove_mcp": (RemoveMcpPayload, True),
+    # §limits: лимиты подписки (5ч/недельное окна). per-chat — ответ приходит
+    # в активный чат карточкой.
+    "get_limits": (EmptyPayload, True),
 }
 
 

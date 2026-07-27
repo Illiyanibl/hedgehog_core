@@ -61,3 +61,37 @@ class McpRegistry:
 
     def known_names(self) -> list[str]:
         return sorted(self._load().keys())
+
+    # ---------- запись (§mcp: управление из клиента) ----------
+
+    def _save(self, data: dict[str, dict]) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1))
+        tmp.replace(self.path)  # атомарная замена — файл не бьётся на полузаписи
+
+    def add(self, name: str, config: dict) -> None:
+        """Добавить/заменить MCP-сервер в реестре. config — схема Claude Agent
+        SDK (type + url/command/headers). Секреты остаются только на сервере."""
+        data = self._load()
+        data[name] = config
+        self._save(data)
+        log.info("mcp.added", name=name, type=config.get("type"))
+
+    def remove(self, name: str) -> bool:
+        data = self._load()
+        if name not in data:
+            return False
+        del data[name]
+        self._save(data)
+        log.info("mcp.removed", name=name)
+        return True
+
+    def list_meta(self) -> list[dict]:
+        """Список серверов БЕЗ секретов (имя + тип) — безопасно для клиента.
+        Заголовки/токены (значения) наружу не отдаём."""
+        out: list[dict] = []
+        for name, cfg in sorted(self._load().items()):
+            t = cfg.get("type") if isinstance(cfg, dict) else None
+            out.append({"name": name, "type": t})
+        return out
