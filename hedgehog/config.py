@@ -110,6 +110,12 @@ class Config:
     def token_file(self) -> Path:
         return self.data_dir / "auth_token"
 
+    @property
+    def auth_log_file(self) -> Path:
+        """Стабильный лог неудачных авторизаций для fail2ban (§security).
+        В контейнере виден с хоста через том /data."""
+        return self.data_dir / "auth_failures.log"
+
     # §7 TLS: self-signed серт/ключ Ёжика (Ёжик — единый авторитет). Клиент
     # пинит SHA-256 отпечаток, провижининг — по bootstrap-SSH.
     @property

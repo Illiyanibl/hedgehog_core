@@ -101,6 +101,10 @@ def compose_prompt(content: str, resolved: list[dict]) -> str:
 @web.middleware
 async def _auth_mw(request: web.Request, handler):
     if request.headers.get("Authorization", "") != f"Bearer {request.app[TOKEN_KEY]}":
+        # IP атакующего из TCP-пира → auth_failures.log для fail2ban (§security).
+        from . import authlog
+        authlog.record_failure(request.app[CONFIG_KEY], request.remote,
+                               "file", request.path)
         return web.json_response({"error": "auth failed"}, status=401)
     return await handler(request)
 

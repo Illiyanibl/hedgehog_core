@@ -39,6 +39,7 @@ from ..store.mcp_registry import McpRegistry
 from ..store import skills_registry
 from ..store.skill_sources import SkillSources, SkillInstallError
 from .. import fileserver
+from .. import authlog
 
 log = structlog.get_logger("wss")
 
@@ -85,7 +86,11 @@ class HedgehogServer:
             return connection.respond(http.HTTPStatus.NOT_FOUND, "not found\n")
         auth = request.headers.get("Authorization", "")
         if auth != f"Bearer {self.token}":
-            log.warning("auth.failed", path=path)
+            # IP атакующего — из TCP-пира (не из X-Forwarded-For: порт торчит
+            # напрямую). Пишем в auth_failures.log для fail2ban (§security).
+            peer = connection.remote_address
+            ip = peer[0] if peer else None
+            authlog.record_failure(self.config, ip, "ws", path)
             return connection.respond(http.HTTPStatus.UNAUTHORIZED, "auth failed\n")
         return None  # продолжить upgrade
 
