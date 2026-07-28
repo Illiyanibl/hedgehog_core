@@ -399,6 +399,18 @@ class ClaudeSession:
                             "tool": block.name,
                             "input": block.input,
                         })
+                        # §grep-audit: Grep-инструмент запускает ugrep, который
+                        # изредка падает (2.2 ГБ core). Логируем его аргументы в
+                        # hedgehog.log (не ротируется) — при краше/подвисании
+                        # последняя запись покажет виновный запрос.
+                        if block.name == "Grep":
+                            inp = block.input or {}
+                            log.info("agent.grep", chat=self.meta.chatId,
+                                     pattern=inp.get("pattern"),
+                                     path=inp.get("path"),
+                                     glob=inp.get("glob"),
+                                     type=inp.get("type"),
+                                     output_mode=inp.get("output_mode"))
             elif isinstance(msg, UserMessage):
                 content = msg.content if isinstance(msg.content, list) else []
                 for block in content:
