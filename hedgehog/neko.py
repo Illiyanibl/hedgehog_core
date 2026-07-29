@@ -43,13 +43,37 @@ NETWORK = "hedgehog-neko-net"
 @dataclass
 class NekoResult:
     ok: bool
-    status: str = "absent"        # running | absent | error
+    status: str = "absent"        # running | installing | absent | error
     message: str = ""
     https_port: int = 0
     user_password: str = ""       # для авто-логина клиента (?pwd=)
     server_ip: str = ""           # публичный адрес для WKWebView
     mcp_port: int = 0             # §AI-control: порт MCP-плейна (внутри docker-сети)
     ai_control: bool = False      # §AI-control: доступно ли управление браузером ИИ
+    stage: str = ""               # §stages: idle|pulling|deploying|ready|error
+
+
+# §stages: стадии установки neko — чтобы Ёжик знал текущий шаг, а клиент мог
+# опросить get_neko/status и показать прогресс (скачка образа → развёртывание →
+# готово). Обновляется из provision (в отдельном потоке через to_thread),
+# читается из status. Присваивание строки атомарно под GIL — блокировки не нужно.
+STAGE_IDLE = "idle"
+STAGE_PULLING = "pulling"        # docker pull — скачка образа
+STAGE_DEPLOYING = "deploying"    # docker run — развёртывание контейнера
+STAGE_READY = "ready"            # поднят и готов
+STAGE_ERROR = "error"
+_stage: str = STAGE_IDLE
+
+
+def _set_stage(s: str) -> None:
+    global _stage
+    _stage = s
+    log.info("neko.stage", stage=s)
+
+
+def install_stage() -> str:
+    """Текущая стадия установки — для опроса клиентом (get_neko)."""
+    return _stage
 
 
 # ---------- docker helpers ----------
@@ -192,44 +216,57 @@ def is_running() -> bool:
 
 def status(config: Config) -> NekoResult:
     if not _docker_ok():
-        return NekoResult(ok=False, status="error",
+        return NekoResult(ok=False, status="error", stage=STAGE_ERROR,
                           message="docker недоступен (нет socket-proxy?)")
+    # Идёт установка — контейнер в промежуточном состоянии (rename→run), поэтому
+    # отдаём ЖИВУЮ стадию из provision, а не «absent». Клиент опросом get_neko
+    # видит: pulling (скачка образа) → deploying (развёртывание).
+    if _stage in (STAGE_PULLING, STAGE_DEPLOYING):
+        return NekoResult(ok=True, status="installing", stage=_stage,
+                          mcp_port=config.neko_mcp_port)
     st = _container_status(CONTAINER)
     if st == "running":
         # Клиент логинится как ADMIN (host + контроль экрана через REST), как
         # devolution. Пароль отдаётся по аутентифицированному WS.
         _, admin = _passwords(config)
-        return NekoResult(ok=True, status="running",
+        return NekoResult(ok=True, status="running", stage=STAGE_READY,
                           https_port=config.neko_https_port,
                           user_password=admin, server_ip=config.server_ip or "",
                           mcp_port=config.neko_mcp_port, ai_control=True)
     return NekoResult(ok=True, status="absent" if st == "absent" else "error",
+                      stage=STAGE_IDLE if st == "absent" else STAGE_ERROR,
                       message="" if st == "absent" else "контейнер остановлен")
 
 
 def provision(config: Config) -> NekoResult:
     """Идемпотентно поднять neko. Блокирующая — звать через asyncio.to_thread."""
     if not _docker_ok():
-        return NekoResult(ok=False, status="error",
+        _set_stage(STAGE_ERROR)
+        return NekoResult(ok=False, status="error", stage=STAGE_ERROR,
                           message="docker недоступен (нужен socket-proxy)")
     user_pw, admin_pw = _passwords(config)
     if not _seed_tls_volume(config):
-        return NekoResult(ok=False, status="error",
+        _set_stage(STAGE_ERROR)
+        return NekoResult(ok=False, status="error", stage=STAGE_ERROR,
                           message="не удалось подготовить TLS-серт для neko")
 
     network = _ensure_network()
     nat_ip = config.server_ip
 
-    # pull образа (не критично при offline, если локально есть)
+    # Стадия «скачка образа»: pull может тянуться минуты при первом разе.
+    _set_stage(STAGE_PULLING)
     _run(["docker", "pull", config.neko_image], timeout=600)
 
+    # Стадия «развёртывание»: пересоздание (rename→singleton→run).
+    _set_stage(STAGE_DEPLOYING)
     existing = _container_status(CONTAINER)
     recreate = existing != "absent"
     if recreate:
         _run(["docker", "rm", "-f", f"{CONTAINER}-old"], timeout=60)
         code, out = _run(["docker", "rename", CONTAINER, f"{CONTAINER}-old"], timeout=60)
         if code != 0:
-            return NekoResult(ok=False, status="error",
+            _set_stage(STAGE_ERROR)
+            return NekoResult(ok=False, status="error", stage=STAGE_ERROR,
                               message=f"docker rename: {out[-200:]}")
         _run(["docker", "stop", "-t", "5", f"{CONTAINER}-old"], timeout=30)
 
@@ -240,21 +277,24 @@ def provision(config: Config) -> NekoResult:
     cmd = build_run_cmd(config, user_pw, admin_pw, network, nat_ip)
     code, out = _run(cmd, timeout=120)
     if code != 0:
+        _set_stage(STAGE_ERROR)
         if recreate:
             # откат на рабочий старый
             _run(["docker", "rename", f"{CONTAINER}-old", CONTAINER], timeout=60)
             _run(["docker", "start", CONTAINER], timeout=60)
-            return NekoResult(ok=False, status="error",
+            return NekoResult(ok=False, status="error", stage=STAGE_ERROR,
                               message=f"docker run упал, откат на старый: {out[-200:]}")
-        return NekoResult(ok=False, status="error", message=f"docker run: {out[-200:]}")
+        return NekoResult(ok=False, status="error", stage=STAGE_ERROR,
+                          message=f"docker run: {out[-200:]}")
 
     if recreate:
         _run(["docker", "rm", "-f", f"{CONTAINER}-old"], timeout=60)
 
+    _set_stage(STAGE_READY)
     log.info("neko.provisioned", port=config.neko_https_port, network=network,
              nat=nat_ip or "ipfetch")
     # Клиент логинится как admin (host + контроль экрана), как devolution.
-    return NekoResult(ok=True, status="running",
+    return NekoResult(ok=True, status="running", stage=STAGE_READY,
                       https_port=config.neko_https_port,
                       user_password=admin_pw, server_ip=config.server_ip or "",
                       mcp_port=config.neko_mcp_port, ai_control=True)
@@ -262,4 +302,6 @@ def provision(config: Config) -> NekoResult:
 
 def teardown(config: Config) -> NekoResult:
     _run(["docker", "rm", "-f", CONTAINER], timeout=60)
-    return NekoResult(ok=True, status="absent", message="neko удалён")
+    _set_stage(STAGE_IDLE)
+    return NekoResult(ok=True, status="absent", stage=STAGE_IDLE,
+                      message="neko удалён")

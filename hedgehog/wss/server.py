@@ -209,6 +209,7 @@ class HedgehogServer:
                 "server_ip": result.server_ip,
                 "mcp_port": result.mcp_port,
                 "ai_control": result.ai_control,
+                "stage": result.stage,
             }))
             log.info("neko." + ftype, ok=result.ok, status=result.status)
             return
