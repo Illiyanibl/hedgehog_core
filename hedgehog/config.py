@@ -55,6 +55,12 @@ class Config:
         os.environ.get("HEDGEHOG_NEKO_UDPMUX", "59000")))
     neko_tcpmux_port: int = field(default_factory=lambda: int(
         os.environ.get("HEDGEHOG_NEKO_TCPMUX", "59000")))
+    # §AI-control: порт MCP-плейна @playwright/mcp внутри контейнера neko. НЕ
+    # публикуется наружу (-p) — доступен только агенту по ВЫДЕЛЕННОЙ docker-сети
+    # hedgehog↔neko (см. neko._ensure_network). Агент ходит на
+    # http://hedgehog-neko:<port>/mcp.
+    neko_mcp_port: int = field(default_factory=lambda: int(
+        os.environ.get("HEDGEHOG_NEKO_MCP_PORT", "9250")))
     neko_screen: str = field(default_factory=lambda: os.environ.get(
         "HEDGEHOG_NEKO_SCREEN", "1280x800@30"))
     # Публичный IP сервера — для NEKO_NAT1TO1 (ICE-кандидат WebRTC). В контейнере

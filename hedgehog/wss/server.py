@@ -207,6 +207,8 @@ class HedgehogServer:
                 "https_port": result.https_port,
                 "user_password": result.user_password,
                 "server_ip": result.server_ip,
+                "mcp_port": result.mcp_port,
+                "ai_control": result.ai_control,
             }))
             log.info("neko." + ftype, ok=result.ok, status=result.status)
             return
@@ -659,6 +661,17 @@ class HedgehogServer:
                 await self.hub.publish(meta.chatId, "error",
                                        {"code": code, "message": message})
             mcp_servers = self.mcp.resolve(meta.mcp)
+            # §AI-control: если общий браузер neko поднят — АВТО-выдаём агенту
+            # браузерные инструменты (@playwright/mcp по ВЫДЕЛЕННОЙ docker-сети
+            # hedgehog↔neko). Реестр и meta.mcp не трогаем: доступно всем чатам,
+            # пока neko жив; применяется при (пере)старте сессии. Порт наружу не
+            # публикуется — достижим только отсюда.
+            from .. import neko
+            if await asyncio.to_thread(neko.is_running):
+                mcp_servers = {**mcp_servers, "neko_browser": {
+                    "type": "http",
+                    "url": f"http://{neko.CONTAINER}:{self.config.neko_mcp_port}/mcp",
+                }}
 
             def save_session_id(sid: str | None, chat_id=meta.chatId):
                 self.store.update_meta(chat_id, claude_session_id=sid)
