@@ -61,6 +61,11 @@ class Config:
     # http://hedgehog-neko:<port>/mcp.
     neko_mcp_port: int = field(default_factory=lambda: int(
         os.environ.get("HEDGEHOG_NEKO_MCP_PORT", "9250")))
+    # §AI-control: swap на ХОСТЕ под neko (браузер память-тяжёлый; без swap на
+    # слабых серверах OOM убивает chrome). Ставится Ёжиком через привилегированный
+    # one-shot контейнер (host-ресурс — контейнер сам не создаст). 0 = выключить.
+    neko_swap_mb: int = field(default_factory=lambda: int(
+        os.environ.get("HEDGEHOG_NEKO_SWAP_MB", "1024")))
     neko_screen: str = field(default_factory=lambda: os.environ.get(
         "HEDGEHOG_NEKO_SCREEN", "1280x800@30"))
     # Публичный IP сервера — для NEKO_NAT1TO1 (ICE-кандидат WebRTC). В контейнере

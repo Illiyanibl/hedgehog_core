@@ -206,6 +206,44 @@ def build_run_cmd(config: Config, user_pw: str, admin_pw: str,
     return args
 
 
+def _ensure_swap(config: Config) -> None:
+    """§AI-control: гарантировать swap на ХОСТЕ под neko (браузер память-тяжёлый;
+    без swap на слабых серверах OOM убивает chrome).
+
+    Контейнер host-swap сам не создаст — запускаем one-shot ПРИВИЛЕГИРОВАННЫЙ
+    контейнер и через nsenter в namespace хоста (PID 1) создаём /swapfile +
+    swapon + запись в fstab. Свойства (снижают риск «сломать»):
+      • идемпотентно: swap уже есть → выходим (не стекуем);
+      • guard по месту: нет (size+400) МБ свободно на / → не создаём;
+      • dd (не fallocate) → без sparse-«дыр», mkswap не отвалится;
+      • best-effort: любой сбой ЛОГИРУЕТСЯ, провижининг НЕ роняем.
+    """
+    mb = config.neko_swap_mb
+    if mb <= 0:
+        return
+    # Исполняется в namespace ХОСТА (nsenter -t 1) → пути/swapon относятся к хосту.
+    script = (
+        "set -e; "
+        "swapon --show 2>/dev/null | grep -q . && exit 0; "
+        "avail=$(df -Pm / | awk 'NR==2{print $4}'); "
+        f"[ \"${{avail:-0}}\" -lt {mb + 400} ] && exit 0; "
+        f"dd if=/dev/zero of=/swapfile bs=1M count={mb} status=none; "
+        "chmod 600 /swapfile; mkswap /swapfile >/dev/null; swapon /swapfile; "
+        "grep -q '^/swapfile ' /etc/fstab || "
+        "echo '/swapfile none swap sw 0 0' >> /etc/fstab"
+    )
+    code, out = _run([
+        "docker", "run", "--rm", "--privileged", "--pid=host",
+        config.neko_image,
+        "nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--",
+        "sh", "-c", script,
+    ], timeout=120)
+    if code != 0:
+        log.warning("neko.swap.ensure_failed", out=out[-200:])
+    else:
+        log.info("neko.swap.ensured", mb=mb)
+
+
 # ---------- публичное API ----------
 
 def is_running() -> bool:
@@ -251,6 +289,7 @@ def provision(config: Config) -> NekoResult:
                           message="не удалось подготовить TLS-серт для neko")
 
     network = _ensure_network()
+    _ensure_swap(config)      # §AI-control: host-swap под память браузера (best-effort)
     nat_ip = config.server_ip
 
     # Стадия «скачка образа»: pull может тянуться минуты при первом разе.
