@@ -74,7 +74,12 @@ class Hub:
                 log.warning("journal.append_failed", chat_id=chat_id, err=str(e))
             if ftype not in self._TRANSCRIPT_SKIP:
                 self._store.append_transcript(chat_id, frame)
-        await self._fanout(chat_id, frame)
+        delivered = await self._fanout(chat_id, frame)
+        # §obs: кадр сгенерён, но подписчиков нет → лёг только в журнал (уедет
+        # на resume). Рост таких строк = очередь копится (клиент отвалился/в фоне).
+        if journal and delivered == 0 and ftype not in self._TRANSCRIPT_SKIP:
+            log.info("publish.journaled_only", chat_id=chat_id, type=ftype,
+                     id=frame.get("id", "")[-6:])
         return frame
 
     async def send_global(self, conn_id: int, frame: dict):
@@ -88,10 +93,13 @@ class Hub:
         for conn_id, (send, _) in list(self._conns.items()):
             await self._safe_send(conn_id, send, frame)
 
-    async def _fanout(self, chat_id: str, frame: dict):
+    async def _fanout(self, chat_id: str, frame: dict) -> int:
+        delivered = 0
         for conn_id, (send, subs) in list(self._conns.items()):
             if chat_id in subs:
                 await self._safe_send(conn_id, send, frame)
+                delivered += 1
+        return delivered
 
     async def _safe_send(self, conn_id: int, send: SendFn, frame: dict):
         try:

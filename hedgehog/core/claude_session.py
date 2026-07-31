@@ -164,20 +164,38 @@ class ClaudeSession:
     async def handle_user_msg(self, content: str) -> bool:
         """Поставить сообщение в очередь. Всегда возвращает False.
 
-        §fix (рассинхрон ответов): раньше при занятом агенте сообщение
-        «досылалось» в текущий ход через client.query() (/btw). Это ломало
-        порядок: idle-grace ждал ответ на досыл всего 1.5с, а с MCP ответ
-        приходит ~6с — grace истекал, ход закрывался, ответ на досыл терялся
-        и «доезжал» уже на следующем ходе (ответ N под сообщением N+1).
+        Каждое сообщение — отдельный ход строго по очереди: воркер читает ответ
+        ПОЛНОСТЬЮ (receive_response до ResultMessage), затем берёт следующее.
+        Порядок «сообщение→ответ» гарантирован (без гонки idle-grace, которая
+        ломала старый досыл через query() в тот же ход).
 
-        Теперь КАЖДОЕ сообщение — отдельный ход строго по очереди: воркер
-        читает ответ полностью (receive_response до ResultMessage), затем
-        берёт следующее из очереди. Порядок «сообщение→ответ» гарантирован.
+        §btw-interrupt (A1): если агент СЕЙЧАС занят ходом — ПРЕРЫВАЕМ текущий
+        ход (client.interrupt()), чтобы досланное сообщение поехало СЛЕДУЮЩИМ
+        ходом с полным контекстом (та же сессия). Так «стой»/уточнение доходят
+        сразу, а не ждут конца длинного хода. Ходы остаются раздельными:
+        прерванный отдаёт свой ResultMessage, воркер берёт из очереди наше.
         """
         await self.start()
         await self._queue.put(content)
+        # A1: любое сообщение при занятом агенте прерывает текущий ход.
+        if self._busy and self._client is not None:
+            await self._interrupt_current()
         await self._emit_status()  # idle→busy при первом сообщении
         return False
+
+    async def _interrupt_current(self) -> None:
+        """Прервать текущий ход (§btw-interrupt A1) — best-effort, не роняет
+        обработчик. interrupt() работает только в streaming-режиме SDK
+        (--input-format stream-json), где мы и живём."""
+        client = self._client
+        if client is None:
+            return
+        try:
+            await client.interrupt()
+            log.info("agent.interrupt", chat=self.meta.chatId)
+        except Exception as e:  # noqa: BLE001
+            log.warning("agent.interrupt_failed", chat=self.meta.chatId,
+                        err=repr(e))
 
     def resolve_permission(self, related: str, decision: str) -> bool:
         return self._resolve(related, decision)

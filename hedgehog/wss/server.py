@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import http
+import time
 from typing import Any
 
 import structlog
@@ -101,6 +102,8 @@ class HedgehogServer:
             await ws.send(dumps(frame))
 
         conn_id = self.hub.register(send)
+        t0 = time.time()
+        peer = ws.remote_address
         try:
             await self.hub.send_global(conn_id, make_frame("hello", {
                 "server_version": self.config.server_version,
@@ -112,6 +115,13 @@ class HedgehogServer:
         except websockets.ConnectionClosed:
             pass
         finally:
+            # §obs: причина и длительность закрытия — чтобы отличать
+            # обрыв клиента / ping-timeout сервера / уход в фон.
+            log.info("conn.closed", conn_id=conn_id,
+                     code=getattr(ws, "close_code", None),
+                     reason=(getattr(ws, "close_reason", None) or "")[:120],
+                     dur=round(time.time() - t0, 1),
+                     peer=(peer[0] if peer else None))
             self.hub.unregister(conn_id)
 
     # ---------- диспетчер ----------
@@ -140,7 +150,11 @@ class HedgehogServer:
 
         # --- системные ---
         if ftype == "ping":
-            await self.hub.send_global(conn_id, make_frame("pong", {}))
+            # §obs (time-sync): кладём серверную метку в pong. Клиент помнит
+            # свой t0 и ловит t2 → offset = server_ts − (t0+t2)/2, RTT = t2−t0.
+            # Так серверные ts кадров переводятся в клиентскую шкалу.
+            await self.hub.send_global(
+                conn_id, make_frame("pong", {"server_ts": time.time()}))
             return
         if ftype == "auth_start":
             await self.auth.start()
@@ -401,6 +415,7 @@ class HedgehogServer:
 
         if ftype == "subscribe_chat":
             self.hub.subscribe(conn_id, frame.chatId)
+            log.info("chat.subscribe", conn_id=conn_id, chat_id=frame.chatId)
             # Для shell-чата поднимаем bash сразу — клиент увидит prompt.
             if meta.addressee == "broker_shell":
                 await self._ensure_session(meta)
@@ -427,10 +442,15 @@ class HedgehogServer:
 
         if ftype == "ack":
             self.store.ack(frame.chatId, p.last_seen_id)
+            log.info("chat.ack", chat_id=frame.chatId,
+                     last_seen=(p.last_seen_id or "")[-6:])
             return
 
         if ftype == "resume":
             events, full_replay = self.store.events_after(frame.chatId, p.last_seen_id)
+            log.info("chat.resume", conn_id=conn_id, chat_id=frame.chatId,
+                     events=len(events), full=full_replay,
+                     last_seen=(p.last_seen_id or "")[-6:])
             payload: dict[str, Any] = {
                 "events": events,
                 "cursor": events[-1]["id"] if events else p.last_seen_id,
@@ -452,9 +472,10 @@ class HedgehogServer:
             # дописываем абсолютные пути (Claude читает их Read'ом). Без
             # вложений поведение идентично прежнему.
             session = await self._ensure_session(meta)
-            # /btw: очередь не пуста (сессия занята) → сообщение вольётся в
-            # текущий ход, а не встанет новым. Помечаем эхо флагом btw, чтобы
-            # все клиенты показали реплику как «дослано».
+            # /btw (§btw-interrupt A1): агент занят → сообщение ПРЕРВЁТ текущий
+            # ход (handle_user_msg → client.interrupt()) и поедет следующим
+            # ходом с контекстом. Помечаем эхо флагом btw — клиенты показывают
+            # реплику как «дослано» (уточнение/«стой»).
             is_btw = (isinstance(session, ClaudeSession)
                       and session.status == "busy")
             await self.hub.publish(frame.chatId, "user_msg_echo", {
@@ -642,6 +663,8 @@ class HedgehogServer:
         доке/списке у ВСЕХ клиентов, без polling). Сюда же позже вешаем
         push-уведомления (busy→idle = «агент ответил»)."""
         async def notify(status: str):
+            # §obs: видимость реальных смен busy⇄idle (для проверки статуса).
+            log.info("chat.status", chat_id=chat_id, status=status)
             await self.hub.broadcast_global(make_frame(
                 "chat_status", {"chatId": chat_id, "status": status}))
             # TODO(push): триггер push-уведомления на переходе busy→idle.
