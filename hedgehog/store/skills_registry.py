@@ -72,8 +72,9 @@ dashboards backed by a DB.
 
 Handler tools:
 - `handler_register(name, script, view_id?)` — register `name` → `script`
-  (a path INSIDE the chat cwd). Pass `view_id` (from `ui_current`) to bind it to
-  a window so it is erased when that window is deleted.
+  (a path INSIDE the chat cwd). Call it right AFTER `ui_open`: if you omit
+  `view_id` it AUTO-BINDS to the current window (so the handler is erased when
+  that window is deleted). Or pass the `view_id` that `ui_open` returned.
 - `handler_list` — list this chat's handlers.
 - `handler_unregister(name)` — remove one.
 - `handler_call(name, args)` — run it yourself to test (`args` is a JSON string).
@@ -109,7 +110,10 @@ needed here).
   targets, no external resources (unless `allow_external`).
 - Do local/presentational logic in page JS. Use `hedgehog.call` for DATA;
   use `hedgehog.notify` only when you genuinely need your intelligence/action.
-- One window per chat is "current"; replace its content with `ui_update`.
+- One window per chat is "current". To CHANGE a live window use `ui_update`
+  (don't spam new `ui_open`s). Calling `ui_open` again with the SAME `title`
+  also updates that same window (stable id — handlers stay bound) instead of
+  piling up duplicates in history.
 
 ## Example
 "Make a word-pair trainer" → `ui_open` with the game: two columns, matching +

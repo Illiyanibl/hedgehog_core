@@ -62,13 +62,26 @@ def _chat(data: dict, chat_id: str) -> dict:
 
 def record_open(data_dir: Path, chat_id: str, *, title: str, html: str,
                 persistent: bool, allow_external: bool) -> dict:
-    """Новое окно стало текущим. Прежний `current` вытесняется без архивации
-    (в историю копятся только явные закрытия). Возвращает созданную запись."""
+    """Новое окно стало текущим. Возвращает запись.
+
+    Если текущее окно имеет ТОТ ЖЕ заголовок — переиспользуем его id (обновление
+    на месте): это держит привязки ручек живыми и не плодит дубли в истории при
+    повторном ui_open. Иначе — новая запись, а прежний `current` вытесняется без
+    архивации (в историю копятся только явные закрытия)."""
+    title = title or "Интерактив"
     data = _load(data_dir)
     entry = _chat(data, chat_id)
+    cur = entry.get("current")
+    if isinstance(cur, dict) and cur.get("title") == title:
+        cur["html"] = html or ""
+        cur["persistent"] = bool(persistent)
+        cur["allow_external"] = bool(allow_external)
+        cur["opened_at"] = time.time()
+        _save(data_dir, data)
+        return cur
     rec = {
         "id": new_ulid(),
-        "title": title or "Интерактив",
+        "title": title,
         "html": html or "",
         "persistent": bool(persistent),
         "allow_external": bool(allow_external),
@@ -99,10 +112,10 @@ def record_close(data_dir: Path, chat_id: str) -> dict | None:
         _save(data_dir, data)
         return None
     cur["closed_at"] = time.time()
+    # Дедуп по ЗАГОЛОВКУ: закрытые окна одного названия схлопываются в одну
+    # (свежую) запись — список «Закрытых» не засоряется дублями при итерациях.
     hist = [h for h in entry["history"]
-            if not (isinstance(h, dict)
-                    and h.get("title") == cur.get("title")
-                    and h.get("html") == cur.get("html"))]
+            if not (isinstance(h, dict) and h.get("title") == cur.get("title"))]
     hist.insert(0, cur)
     entry["history"] = hist[:HISTORY_CAP]
     _save(data_dir, data)

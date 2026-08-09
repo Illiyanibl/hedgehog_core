@@ -357,10 +357,16 @@ class ClaudeSession:
                 "allow_external": allow_external,
             })
             # §views: запомнить как текущее окно чата (для переоткрытия/ui_current).
-            session._view_open(title=title, html=html, allow_external=allow_external)
+            # Тот же title при повторном ui_open обновляет ТО ЖЕ окно (стабильный id).
+            rec = session._view_open(
+                title=title, html=html, allow_external=allow_external)
+            vid = (rec or {}).get("id", "")
             return {"content": [{"type": "text", "text":
-                "Окно открыто. Действия — hedgehog.notify/action/chat/open. "
-                "Меняй через ui_update, закрой ui_close. Состояние — kv_set/kv_get."}]}
+                f"Окно открыто (view_id={vid}). Меняй содержимое через "
+                "ui_update (тот же title в ui_open тоже обновит это окно), "
+                "закрой ui_close. Действия из окна — hedgehog.notify/action/"
+                "chat/open. Данные из БД — handler_register + hedgehog.call "
+                "(ручка сразу привяжется к этому окну). Состояние — kv_set/get."}]}
 
         @tool(
             "ui_update",
@@ -463,6 +469,12 @@ class ClaudeSession:
             if not name or not script:
                 return {"content": [{"type": "text", "text":
                     "Нужны name и script."}]}
+            # Авто-привязка к ТЕКУЩЕМУ окну, если view_id не задан — окно
+            # удалят → ручка сотрётся вместе с ним.
+            if view_id is None:
+                cur = session._view_snapshot().get("current")
+                if isinstance(cur, dict):
+                    view_id = cur.get("id")
             # Проверим, что скрипт реально существует внутри cwd (быстрый фидбэк).
             probe = handler_runner._resolve_script(Path(session.meta.cwd), script)
             if probe is None:
@@ -556,14 +568,16 @@ class ClaudeSession:
     # источник правды «какое окно запущено» + история явных закрытий; на нём
     # держится детерминированный пушер переоткрытия (клиентский ui_reopen) и
     # интроспекция агентом (ui_current). Ошибки реестра не должны ронять тул.
-    def _view_open(self, *, title: str, html: str, allow_external: bool) -> None:
+    def _view_open(self, *, title: str, html: str,
+                   allow_external: bool) -> dict | None:
         try:
-            views_registry.record_open(
+            return views_registry.record_open(
                 self._config.data_dir, self.meta.chatId,
                 title=title, html=html, persistent=True,
                 allow_external=allow_external)
         except OSError as e:
             log.warning("views.open_failed", chat=self.meta.chatId, err=str(e))
+            return None
 
     def _view_update(self, html: str) -> None:
         try:
