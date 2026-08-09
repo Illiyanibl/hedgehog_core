@@ -23,48 +23,98 @@ _BUILTIN_GUI_NAME = "hedgehog-gui"
 _BUILTIN_GUI_SKILL = """\
 ---
 name: hedgehog-gui
-description: Отвечай ИНТЕРАКТИВНЫМ окном в чате (кнопки, игры, тренажёры, формы, опросы, дашборды, рисунки), а не только текстом. Используй, когда пользователь хочет что-то визуальное, кликабельное или пошаговое.
+description: Reply with an INTERACTIVE window in the chat (buttons, games, trainers, forms, polls, dashboards, drawings) instead of plain text. Use whenever the user wants something visual, clickable, step-by-step, or data-backed (e.g. a scrollable dashboard from a database).
 ---
 
-# Интерактивный GUI прямо в чате
+# Interactive GUI right in the chat
 
-У тебя есть MCP-инструменты сервера `hedgehog`, которые рисуют интерактивное
-окно (WebView) на телефоне пользователя. Телефон рендерит HTML локально.
+You have MCP tools from the `hedgehog` server that render an interactive window
+(a WebView) on the user's phone. The phone renders your HTML locally in an
+OFFLINE sandbox (no network unless `allow_external`).
 
-## Когда использовать
-Когда пользователь просит что-то визуальное / кликабельное / пошаговое (игра,
-тренажёр, викторина, форма, опрос, дашборд, кнопки, «нарисуй…», «сделай
-кнопку») — отвечай ОКНОМ, а не длинным текстом.
+## When to use
+Whenever the user asks for something visual / clickable / step-by-step (game,
+trainer, quiz, form, poll, dashboard, buttons, "draw…", "make a button",
+"make a scrollable dashboard from the DB") — reply with a WINDOW, not a wall
+of text.
 
-## Инструменты
-- `ask_ui(html, title)` — БЛОКИРУЮЩЕЕ окно: показал → ждёшь ОДИН ответ
-  (`hedgehog.submit(data)`) → продолжаешь. Для одноразовых форм/викторин.
-- `ui_open(html, title, allow_external)` — ПОСТОЯННОЕ окно, ход НЕ блокирует.
-  События приходят асинхронно (см. SDK), меняй окно `ui_update(html)`,
-  закрывай `ui_close()`.
-- `kv_set(key, value)` / `kv_get(key)` — общее состояние между окнами и чатами
-  (счётчики и т.п.).
+## Window tools
+- `ask_ui(html, title)` — BLOCKING window: show → wait for ONE reply
+  (`hedgehog.submit(data)`) → continue. For one-shot forms/quizzes.
+- `ui_open(html, title, allow_external)` — PERSISTENT window; does NOT block your
+  turn. Events arrive asynchronously (see SDK below); change it with
+  `ui_update(html)`, close it with `ui_close()`.
+- `kv_set(key, value)` / `kv_get(key)` — shared state across windows and chats.
 
-## SDK внутри окна (вызывай эти JS-функции в HTML)
-- `hedgehog.notify(data)` — событие → прилетает тебе как обычное сообщение
-  (полноценный ход: пиши в чат, запускай bash, любой инструмент, и/или
-  `ui_update`).
-- `hedgehog.action(id, data)` — именованное действие (роутишь по id).
-- `hedgehog.chat(text)` — текст прямо в чат.
-- `hedgehog.open(url)` — открыть ссылку в системном браузере.
-- `allow_external=true` → окну разрешена сеть (встроить YouTube/сайт в iframe).
+## In-window JS SDK (call these from your HTML)
+- `hedgehog.call(name, args)` → **Promise** — call a SERVER HANDLER you registered
+  (see below). DETERMINISTIC, no agent turn, zero tokens — this is how a window
+  reads/writes REAL data (e.g. a database). Contract (STABLE):
+    * resolves with `{ ok: true, data: <the JSON your handler printed, parsed> }`
+    * or `{ ok: false, error: "<message>" }`  (it NEVER rejects)
+    * Usage:
+        const r = await hedgehog.call('day', { date: '2026-08-09' });
+        if (r.ok) render(r.data); else showError(r.error);
+- `hedgehog.notify(data)` — event → arrives to you as a normal message (a full
+  turn: write to chat, run bash, any tool, and/or `ui_update`). Use only when you
+  need YOUR intelligence/action. Do NOT use it for plain data fetches — use
+  `hedgehog.call` for that (instant, no tokens).
+- `hedgehog.action(id, data)` — named event (route by id).
+- `hedgehog.chat(text)` — text straight into the chat.
+- `hedgehog.open(url)` — open a link in the system browser.
+- `allow_external=true` → the window may use the network (embed YouTube/site).
 
-## Правила хорошего окна
-- HTML — ПОЛНЫЙ самодостаточный документ (inline CSS/JS), тёмная тема, крупные
-  тач-цели, без внешних ресурсов (если не нужен allow_external).
-- Локальную логику (цвет, счётчики, анимации, матчинг) делай в JS страницы —
-  БЕЗ обращения к себе. К себе (`notify`) — только когда нужен твой ум/действие.
-- Живой цикл: на каждое действие можешь показывать новый экран (`ui_update`).
+## Server handlers ("ручки") — the data plane for windows
+A handler is a small script in the chat's cwd. Contract: it reads JSON args from
+STDIN and prints a JSON result to STDOUT. Register it once, then the window calls
+it instantly via `hedgehog.call` with NO agent turn. Perfect for scrollable
+dashboards backed by a DB.
 
-## Пример
-«Сделай тренажёр пар слов» → `ui_open` с игрой: две колонки, матчинг и счётчик
-в JS; двойной тап по слову → `hedgehog.notify('пример со словом X')` → ты
-отвечаешь примером в чате.
+Handler tools:
+- `handler_register(name, script, view_id?)` — register `name` → `script`
+  (a path INSIDE the chat cwd). Pass `view_id` (from `ui_current`) to bind it to
+  a window so it is erased when that window is deleted.
+- `handler_list` — list this chat's handlers.
+- `handler_unregister(name)` — remove one.
+- `handler_call(name, args)` — run it yourself to test (`args` is a JSON string).
+- `ui_current` — which window is running + registered handlers.
+
+Handler script example (`day.py` in the chat cwd):
+    import sys, json, sqlite3
+    args = json.loads(sys.stdin.read() or "{}")
+    date = args.get("date")
+    # ... query your DB ...
+    print(json.dumps({"date": date, "kcal": 1234}))   # JSON -> stdout
+
+Execution: one subprocess per call, project venv (`<cwd>/.venv/bin/python`) if
+present else `python3`; timeout + output cap; script path must stay inside cwd.
+A lightweight LOCAL data plane — for real scale move it into a container (not
+needed here).
+
+## Canonical pattern: scrollable DB dashboard
+1. Write handler `day.py` in the chat cwd: `{date}` in → JSON out.
+2. `handler_register("day", "day.py", view_id)`.
+3. `ui_open(html, "Diary")` whose HTML has ‹ › buttons and:
+       async function go(date){
+         const r = await hedgehog.call('day', { date });
+         if (r.ok) render(r.data);            // draw the day's data
+         else console.error('handler:', r.error);
+       }
+   Each ‹ › tap calls `go(newDate)` → data straight from the DB, instantly, with
+   no agent turn. (Bake the FIRST day's data into the HTML so it shows before the
+   first call returns; every navigation goes through `hedgehog.call`.)
+
+## Rules for a good window
+- HTML is a FULL self-contained document (inline CSS/JS), dark theme, big touch
+  targets, no external resources (unless `allow_external`).
+- Do local/presentational logic in page JS. Use `hedgehog.call` for DATA;
+  use `hedgehog.notify` only when you genuinely need your intelligence/action.
+- One window per chat is "current"; replace its content with `ui_update`.
+
+## Example
+"Make a word-pair trainer" → `ui_open` with the game: two columns, matching +
+score in JS; double-tap a word → `hedgehog.notify('example with word X')` → you
+reply with an example in the chat.
 """
 
 
@@ -73,13 +123,16 @@ def _user_skills_dir() -> Path:
 
 
 def ensure_builtin() -> None:
-    """Положить встроенный скилл GUI в ~/.claude/skills, если его там нет.
+    """Положить/ОБНОВИТЬ встроенный скилл GUI в ~/.claude/skills.
+    Перезаписываем при изменении контента (наш built-in — источник правды),
+    чтобы обновления документации доезжали до уже установленных копий.
     Идемпотентно; вызывается из discover(), чтобы скилл был виден по умолчанию.
     """
     try:
         path = _user_skills_dir() / _BUILTIN_GUI_NAME / "SKILL.md"
-        if path.exists():
-            return
+        if (path.exists()
+                and path.read_text(encoding="utf-8") == _BUILTIN_GUI_SKILL):
+            return  # уже актуально
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(_BUILTIN_GUI_SKILL, encoding="utf-8")
     except OSError:

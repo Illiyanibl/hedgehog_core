@@ -445,13 +445,15 @@ class ClaudeSession:
         # сервер запускает скрипт (stdin=JSON → stdout=JSON). Реестр — per-chat.
         @tool(
             "handler_register",
-            "Зарегистрировать серверную «ручку» для окна: скрипт в папке чата, "
-            "который на вход (stdin) получает JSON-аргументы, на выход (stdout) "
-            "отдаёт JSON. Окно зовёт её МГНОВЕННО через hedgehog.call(name, args) "
-            "— без твоего хода, детерминированно, ноль токенов. Идеально для "
-            "листаемых дашбордов из БД. view_id (опц., из ui_current) — привязать "
-            "к окну: при удалении окна ручка сотрётся. Скрипт должен лежать ВНУТРИ "
-            "cwd чата.",
+            "Register a server HANDLER for a window: a script in the chat cwd "
+            "that reads JSON args from STDIN and prints a JSON result to STDOUT. "
+            "The window calls it INSTANTLY via `const r = await "
+            "hedgehog.call(name, args)` — no agent turn, deterministic, zero "
+            "tokens — where r is {ok:true, data:<your parsed JSON>} or "
+            "{ok:false, error:'...'} (it never rejects). Ideal for scrollable DB "
+            "dashboards. view_id (optional, from ui_current) binds the handler to "
+            "a window so it is erased when that window is deleted. The script must "
+            "live INSIDE the chat cwd.",
             {"name": str, "script": str, "view_id": str},
         )
         async def handler_register(args: dict[str, Any]) -> dict[str, Any]:
