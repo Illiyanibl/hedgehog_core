@@ -69,14 +69,17 @@ def record_open(data_dir: Path, chat_id: str, *, title: str, html: str,
     повторном ui_open. Иначе — новая запись, а прежний `current` вытесняется без
     архивации (в историю копятся только явные закрытия)."""
     title = title or "Интерактив"
+    now = time.time()
     data = _load(data_dir)
     entry = _chat(data, chat_id)
     cur = entry.get("current")
     if isinstance(cur, dict) and cur.get("title") == title:
+        # Обновление на месте — растим ревизию пуша (versия для ui_current).
         cur["html"] = html or ""
         cur["persistent"] = bool(persistent)
         cur["allow_external"] = bool(allow_external)
-        cur["opened_at"] = time.time()
+        cur["rev"] = int(cur.get("rev", 1)) + 1
+        cur["updated_at"] = now
         _save(data_dir, data)
         return cur
     rec = {
@@ -85,7 +88,9 @@ def record_open(data_dir: Path, chat_id: str, *, title: str, html: str,
         "html": html or "",
         "persistent": bool(persistent),
         "allow_external": bool(allow_external),
-        "opened_at": time.time(),
+        "opened_at": now,
+        "updated_at": now,
+        "rev": 1,
     }
     entry["current"] = rec
     _save(data_dir, data)
@@ -96,8 +101,11 @@ def record_update(data_dir: Path, chat_id: str, html: str) -> None:
     """ui_update — правит HTML текущего окна (если оно есть)."""
     data = _load(data_dir)
     entry = _chat(data, chat_id)
-    if isinstance(entry.get("current"), dict):
-        entry["current"]["html"] = html or ""
+    cur = entry.get("current")
+    if isinstance(cur, dict):
+        cur["html"] = html or ""
+        cur["rev"] = int(cur.get("rev", 1)) + 1   # ревизия пуша +1
+        cur["updated_at"] = time.time()
         _save(data_dir, data)
 
 
@@ -131,7 +139,7 @@ def get(data_dir: Path, chat_id: str) -> dict:
 
 
 _SUMMARY_KEYS = ("id", "title", "persistent", "allow_external",
-                 "opened_at", "closed_at")
+                 "opened_at", "updated_at", "closed_at", "rev")
 
 
 def _light(rec: object) -> dict | None:
@@ -172,7 +180,10 @@ def reopen(data_dir: Path, chat_id: str, view_id: str) -> dict | None:
         return None
     reopened = dict(found)
     reopened.pop("closed_at", None)
-    reopened["opened_at"] = time.time()
+    now = time.time()
+    reopened["opened_at"] = now
+    reopened["updated_at"] = now
+    reopened["rev"] = int(found.get("rev", 1)) + 1   # переоткрытие = новый пуш
     entry["current"] = reopened
     entry["history"] = rest
     _save(data_dir, data)

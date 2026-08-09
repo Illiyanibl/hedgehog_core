@@ -28,6 +28,7 @@ import json
 import mimetypes
 import re
 import shutil
+import time
 from collections import deque
 from pathlib import Path
 from typing import Any
@@ -398,14 +399,29 @@ class ClaudeSession:
             {},
         )
         async def ui_current(args: dict[str, Any]) -> dict[str, Any]:
+            def _ago(ts) -> str:
+                try:
+                    d = int(time.time() - float(ts))
+                except (TypeError, ValueError):
+                    return "?"
+                if d < 60:
+                    return f"{max(d, 0)}с назад"
+                if d < 3600:
+                    return f"{d // 60}мин назад"
+                return f"{d // 3600}ч назад"
+
             snap = session._view_snapshot()
             cur = snap.get("current")
             lines: list[str] = []
             if isinstance(cur, dict):
-                lines.append(f"Открыто сейчас: «{cur.get('title', '')}» "
-                             f"(id={cur.get('id', '')}).")
+                # rev — «версия пуша»: сколько раз окно пушилось (ui_open/update/
+                # reopen). Растёт при каждом пуше сервера в это окно.
+                lines.append(
+                    f"Запущено сейчас: «{cur.get('title', '')}» "
+                    f"(id={cur.get('id', '')}, rev {cur.get('rev', 1)}, "
+                    f"обновлено {_ago(cur.get('updated_at'))}).")
             else:
-                lines.append("Открытого окна нет.")
+                lines.append("Открытого окна сейчас нет.")
             hist = snap.get("history") or []
             if hist:
                 lines.append("Закрытые (можно ui_reopen):")
