@@ -56,6 +56,8 @@ from ..ids import new_ulid
 from ..protocol import Err, make_error
 from ..store.chats import ChatMeta
 from ..store import views_registry
+from ..store import handlers_registry
+from . import handler_runner
 from .session_base import PublishFn
 
 log = structlog.get_logger("claude_session")
@@ -407,6 +409,14 @@ class ClaudeSession:
                                      f"«{h.get('title', '')}»")
             else:
                 lines.append("История закрытых пуста.")
+            # §handlers: заодно показываем зарегистрированные ручки чата.
+            recs = session._handler_list()
+            if recs:
+                lines.append("Ручки (hedgehog.call):")
+                for r in recs:
+                    lines.append(f"  • {r['name']} → {r.get('script', '')}"
+                                 + (f" (окно {r['view_id']})"
+                                    if r.get("view_id") else ""))
             return {"content": [{"type": "text", "text": "\n".join(lines)}]}
 
         @tool(
@@ -429,6 +439,89 @@ class ClaudeSession:
             })
             return {"content": [{"type": "text", "text":
                 f"Окно «{rec.get('title', '')}» снова открыто."}]}
+
+        # §handlers Ф-2: серверные «ручки» для окон — детерминированный доступ
+        # к данным (БД) БЕЗ хода агента. Окно зовёт hedgehog.call(name, args),
+        # сервер запускает скрипт (stdin=JSON → stdout=JSON). Реестр — per-chat.
+        @tool(
+            "handler_register",
+            "Зарегистрировать серверную «ручку» для окна: скрипт в папке чата, "
+            "который на вход (stdin) получает JSON-аргументы, на выход (stdout) "
+            "отдаёт JSON. Окно зовёт её МГНОВЕННО через hedgehog.call(name, args) "
+            "— без твоего хода, детерминированно, ноль токенов. Идеально для "
+            "листаемых дашбордов из БД. view_id (опц., из ui_current) — привязать "
+            "к окну: при удалении окна ручка сотрётся. Скрипт должен лежать ВНУТРИ "
+            "cwd чата.",
+            {"name": str, "script": str, "view_id": str},
+        )
+        async def handler_register(args: dict[str, Any]) -> dict[str, Any]:
+            name = str(args.get("name", "")).strip()
+            script = str(args.get("script", "")).strip()
+            view_id = str(args.get("view_id", "")).strip() or None
+            if not name or not script:
+                return {"content": [{"type": "text", "text":
+                    "Нужны name и script."}]}
+            # Проверим, что скрипт реально существует внутри cwd (быстрый фидбэк).
+            probe = handler_runner._resolve_script(Path(session.meta.cwd), script)
+            if probe is None:
+                return {"content": [{"type": "text", "text":
+                    f"Скрипт не найден или вне cwd чата: {script}"}]}
+            session._handler_register(name, script, view_id)
+            attach = f", привязана к окну {view_id}" if view_id else ""
+            return {"content": [{"type": "text", "text":
+                f"Ручка «{name}» → {script}{attach}. В окне: "
+                f"await hedgehog.call(\"{name}\", args)."}]}
+
+        @tool(
+            "handler_list",
+            "Список серверных «ручек», зарегистрированных в ЭТОМ чате "
+            "(имя → скрипт, привязка к окну).",
+            {},
+        )
+        async def handler_list(args: dict[str, Any]) -> dict[str, Any]:
+            recs = session._handler_list()
+            if not recs:
+                return {"content": [{"type": "text", "text":
+                    "Ручек в этом чате нет."}]}
+            lines = [f"  • {r['name']} → {r.get('script', '')}"
+                     + (f" (окно {r['view_id']})" if r.get("view_id") else "")
+                     for r in recs]
+            return {"content": [{"type": "text", "text":
+                "Ручки чата:\n" + "\n".join(lines)}]}
+
+        @tool(
+            "handler_unregister",
+            "Удалить серверную «ручку» по имени.",
+            {"name": str},
+        )
+        async def handler_unregister(args: dict[str, Any]) -> dict[str, Any]:
+            ok = session._handler_unregister(str(args.get("name", "")).strip())
+            return {"content": [{"type": "text", "text":
+                "Удалена." if ok else "Нет такой ручки (см. handler_list)."}]}
+
+        @tool(
+            "handler_call",
+            "Проверить ручку самому: выполнить её с аргументами и увидеть "
+            "JSON-результат (как это сделает окно через hedgehog.call). "
+            "args — JSON-объект строкой (напр. '{\"date\":\"2026-08-09\"}').",
+            {"name": str, "args": str},
+        )
+        async def handler_call(a: dict[str, Any]) -> dict[str, Any]:
+            name = str(a.get("name", "")).strip()
+            raw = str(a.get("args", "") or "{}")
+            try:
+                parsed = json.loads(raw)
+            except ValueError:
+                return {"content": [{"type": "text", "text":
+                    "args должен быть JSON-объектом строкой."}]}
+            rec = session._handler_get(name)
+            if not rec:
+                return {"content": [{"type": "text", "text":
+                    f"Нет ручки «{name}» (см. handler_list)."}]}
+            res = await handler_runner.run(
+                session.meta.cwd, rec["script"], parsed)
+            return {"content": [{"type": "text", "text":
+                json.dumps(res, ensure_ascii=False)[:2000]}]}
 
         @tool(
             "kv_set",
@@ -453,7 +546,9 @@ class ClaudeSession:
         return create_sdk_mcp_server(
             name="hedgehog",
             tools=[attach_file, ask_ui, ui_open, ui_update, ui_close,
-                   ui_current, ui_reopen, kv_set, kv_get])
+                   ui_current, ui_reopen,
+                   handler_register, handler_list, handler_unregister,
+                   handler_call, kv_set, kv_get])
 
     # §views: тонкие обёртки над реестром окон (data_dir/views.json). Реестр —
     # источник правды «какое окно запущено» + история явных закрытий; на нём
@@ -493,6 +588,36 @@ class ClaudeSession:
                 self._config.data_dir, self.meta.chatId, view_id)
         except OSError:
             return None
+
+    # §handlers Ф-2: тонкие обёртки над реестром ручек (data_dir/handlers.json).
+    def _handler_register(self, name: str, script: str,
+                          view_id: str | None) -> dict | None:
+        try:
+            return handlers_registry.register(
+                self._config.data_dir, self.meta.chatId, name, script, view_id)
+        except OSError as e:
+            log.warning("handler.register_failed", chat=self.meta.chatId, err=str(e))
+            return None
+
+    def _handler_list(self) -> list[dict]:
+        try:
+            return handlers_registry.list_(self._config.data_dir, self.meta.chatId)
+        except OSError:
+            return []
+
+    def _handler_get(self, name: str) -> dict | None:
+        try:
+            return handlers_registry.get(
+                self._config.data_dir, self.meta.chatId, name)
+        except OSError:
+            return None
+
+    def _handler_unregister(self, name: str) -> bool:
+        try:
+            return handlers_registry.unregister(
+                self._config.data_dir, self.meta.chatId, name)
+        except OSError:
+            return False
 
     # §ui Ф-1: общий per-server key-value стор (data_dir/kv.json) — состояние
     # между окнами и чатами (счётчики и т.п.). Один процесс Ёжика, async

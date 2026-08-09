@@ -97,6 +97,15 @@ class UiForgetPayload(_Payload):
     id: str = Field(min_length=1)
 
 
+class UiCallPayload(_Payload):
+    """§handlers Ф-2: окно зовёт серверную ручку (hedgehog.call). name — имя
+    из реестра ручек чата; args — JSON-аргументы СТРОКОЙ (raw); callId —
+    корреляция ответа ui_call_result. Результат вернётся тем же callId."""
+    name: str = Field(min_length=1)
+    args: str = "{}"
+    callId: str = Field(min_length=1)
+
+
 class PtyWritePayload(_Payload):
     data: str
 
@@ -235,6 +244,8 @@ CLIENT_FRAME_TYPES: dict[str, tuple[type[_Payload], bool]] = {
     # §views: пользователь закрыл ПОСТОЯННОЕ окно с телефона (крестик) —
     # сервер архивирует текущее в историю (per-chat).
     "ui_closed": (EmptyPayload, True),
+    # §handlers Ф-2: окно зовёт серверную ручку (детерминированно, без агента)
+    "ui_call": (UiCallPayload, True),
     "pty_write": (PtyWritePayload, True),
     "pty_resize": (PtyResizePayload, True),
     "subscribe_chat": (EmptyPayload, True),

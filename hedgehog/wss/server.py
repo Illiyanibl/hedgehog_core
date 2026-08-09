@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import http
+import json
 import time
 from typing import Any
 
@@ -39,6 +40,8 @@ from ..store.chats import ChatMeta, ChatStore
 from ..store.mcp_registry import McpRegistry
 from ..store import skills_registry
 from ..store import views_registry
+from ..store import handlers_registry
+from ..core import handler_runner
 from ..store.skill_sources import SkillSources, SkillInstallError
 from .. import fileserver
 from .. import authlog
@@ -314,6 +317,7 @@ class HedgehogServer:
             self.store.delete(frame.chatId, delete_cwd=p.delete_cwd,
                               projects_base=self.config.default_cwd)
             views_registry.clear_chat(self.config.data_dir, frame.chatId)  # §views
+            handlers_registry.clear_chat(self.config.data_dir, frame.chatId)  # §handlers
             log.info("chat.deleted", chat=frame.chatId, delete_cwd=p.delete_cwd)
             await self.hub.broadcast_global(
                 make_frame("chat_deleted", {"chatId": frame.chatId}))
@@ -558,6 +562,9 @@ class HedgehogServer:
         if ftype == "ui_forget":
             # §views: убрать окно из истории; вернуть обновлённый список.
             views_registry.forget(self.config.data_dir, frame.chatId, p.id)
+            # §handlers: ручки, привязанные к этому окну, тоже стираем.
+            handlers_registry.unregister_by_view(
+                self.config.data_dir, frame.chatId, p.id)
             await self.hub.send_global(conn_id, make_frame(
                 "ui_list_response",
                 views_registry.summary(self.config.data_dir, frame.chatId),
@@ -573,6 +580,38 @@ class HedgehogServer:
                 "ui_list_response",
                 views_registry.summary(self.config.data_dir, frame.chatId),
                 frame.chatId))
+            return
+
+        if ftype == "ui_call":
+            # §handlers Ф-2: окно зовёт серверную ручку — детерминированно, БЕЗ
+            # хода агента. Находим ручку в реестре чата, запускаем подпроцессом
+            # (stdin=args → stdout=JSON), результат — тем же callId спросившему.
+            rec = handlers_registry.get(
+                self.config.data_dir, frame.chatId, p.name)
+            if rec is None:
+                await self.hub.send_global(conn_id, make_frame(
+                    "ui_call_result",
+                    {"callId": p.callId, "ok": False,
+                     "error": f"нет ручки «{p.name}»"}, frame.chatId))
+                return
+            try:
+                args_obj = json.loads(p.args or "{}")
+            except ValueError:
+                await self.hub.send_global(conn_id, make_frame(
+                    "ui_call_result",
+                    {"callId": p.callId, "ok": False,
+                     "error": "args не JSON"}, frame.chatId))
+                return
+            res = await handler_runner.run(meta.cwd, rec["script"], args_obj)
+            if res.get("ok"):
+                payload = {"callId": p.callId, "ok": True,
+                           "data": json.dumps(res.get("data"),
+                                              ensure_ascii=False)}
+            else:
+                payload = {"callId": p.callId, "ok": False,
+                           "error": res.get("error", "ошибка ручки")}
+            await self.hub.send_global(
+                conn_id, make_frame("ui_call_result", payload, frame.chatId))
             return
 
         if ftype in ("permission_response", "picker_response", "ui_response"):
