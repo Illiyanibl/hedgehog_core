@@ -8,6 +8,7 @@ under the data dir so restarts keep the credential stable.
 
 from __future__ import annotations
 
+import json
 import os
 import secrets
 from dataclasses import dataclass, field
@@ -116,6 +117,38 @@ class Config:
         except OSError:
             return None
         return token or None
+
+    # --- альтернативная авторизация Claude (§altauth): API-ключ / OmniRoute ---
+    # Выбранный способ и его секреты хранятся в data/auth.json. Активный режим
+    # ЗАМЕНЯЕТ прошлый (запись перезаписывает файл целиком → «стирая прошлые
+    # настройки»). Пустой/битый файл или mode=oauth → поведение как раньше
+    # (подписка через OAuth-токен).
+    @property
+    def auth_config_file(self) -> Path:
+        return self.data_dir / "auth.json"
+
+    def load_auth_config(self) -> dict:
+        """Конфиг альт-авторизации. {} если файла нет/битый (⇒ режим oauth)."""
+        try:
+            data = json.loads(self.auth_config_file.read_text())
+        except (OSError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def save_auth_config(self, data: dict) -> None:
+        """Записать выбранный способ (перезаписывая прошлый). chmod 600 — секрет."""
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        tmp = self.auth_config_file.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False))
+        tmp.chmod(0o600)
+        tmp.replace(self.auth_config_file)
+
+    def clear_auth_config(self) -> None:
+        """Сбросить альт-авторизацию (logout) → возврат к OAuth."""
+        try:
+            self.auth_config_file.unlink(missing_ok=True)
+        except OSError:
+            pass
 
     @property
     def token_file(self) -> Path:

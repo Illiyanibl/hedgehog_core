@@ -166,6 +166,18 @@ class HedgehogServer:
                     "auth_result",
                     {"ok": False, "error": "no auth flow in progress"}))
             return
+        if ftype == "auth_apikey":
+            # §altauth: активировать прямой API-ключ (заголовок x-api-key).
+            ok, err = await self._activate_apikey(p.api_key, p.base_url)
+            await self.hub.send_global(conn_id, make_frame(
+                "auth_result", {"ok": ok, "error": err}))
+            return
+        if ftype == "auth_omniroute":
+            # §altauth: активировать шлюз (ключ + base_url + модели тиров).
+            ok, err = await self._activate_omniroute(p)
+            await self.hub.send_global(conn_id, make_frame(
+                "auth_result", {"ok": ok, "error": err}))
+            return
         if ftype == "logout":
             # §13: разлогин. /logout в SDK не работает (интерактивная
             # команда), поэтому удаляем сохранённый OAuth-токен и пересоздаём
@@ -174,6 +186,8 @@ class HedgehogServer:
                 self.config.oauth_token_file.unlink(missing_ok=True)
             except OSError as e:
                 log.warning("auth.logout_unlink_failed", err=str(e))
+            # §altauth: разлогин сбрасывает и альт-способ (API-ключ/OmniRoute).
+            self.config.clear_auth_config()
             for chat_id, session in list(self.sessions.items()):
                 if isinstance(session, ClaudeSession):
                     await self._stop_session(chat_id)
@@ -504,14 +518,24 @@ class HedgehogServer:
                 await session.resize(p.rows, p.cols)
             return
 
-        if ftype in ("permission_response", "picker_response"):
+        if ftype == "ui_event":
+            # §ui async: действие в постоянном окне (hedgehog.notify) →
+            # полноценный ход агента, как обычное сообщение.
+            session = self.sessions.get(frame.chatId)
+            if isinstance(session, ClaudeSession):
+                await session.handle_ui_event(p.data)
+            return
+
+        if ftype in ("permission_response", "picker_response", "ui_response"):
             session = self.sessions.get(frame.chatId)
             resolved = False
             if isinstance(session, ClaudeSession):
                 if ftype == "permission_response":
                     resolved = session.resolve_permission(p.related, p.decision)
-                else:
+                elif ftype == "picker_response":
                     resolved = session.resolve_picker(p.related, p.option_id)
+                else:
+                    resolved = session.resolve_ui(p.related, p.data)
             if not resolved:
                 await self.hub.send_global(conn_id, make_error(
                     Err.BAD_FRAME, f"no pending request {p.related}",
@@ -715,3 +739,70 @@ class HedgehogServer:
         session = self.sessions.pop(chat_id, None)
         if session is not None:
             await session.stop()
+
+    # ------------------------- §altauth: активация ----------------------------
+
+    async def _restart_claude_sessions(self):
+        """Уронить активные claude-сессии → следующий ход поднимет их с новым
+        env (тем же путём, что logout). PTY-сессии не трогаем."""
+        for chat_id, session in list(self.sessions.items()):
+            if isinstance(session, ClaudeSession):
+                await self._stop_session(chat_id)
+
+    async def _probe_auth(self, base_url: str | None, api_key: str,
+                          model: str) -> tuple[bool, str | None]:
+        """Лёгкая проверка креденшела: 1-токенный запрос к <base>/v1/messages
+        с заголовком x-api-key. Успех = достучались И не отказ по авторизации
+        (401/403). 400 «unknown model» доказывает, что ключ принят (Anthropic
+        gateway docs), поэтому считаем это ОК."""
+        import aiohttp
+        root = (base_url or "https://api.anthropic.com").rstrip("/")
+        url = f"{root}/v1/messages"
+        headers = {
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        }
+        body = {"model": model, "max_tokens": 1,
+                "messages": [{"role": "user", "content": "."}]}
+        try:
+            timeout = aiohttp.ClientTimeout(total=15)
+            async with aiohttp.ClientSession(timeout=timeout) as sess:
+                async with sess.post(url, json=body, headers=headers) as r:
+                    if r.status in (401, 403):
+                        return False, f"ключ отклонён ({r.status})"
+                    return True, None
+        except aiohttp.ClientError as e:
+            return False, f"сервер недоступен: {e}"
+        except Exception as e:  # noqa: BLE001 — валидация не должна ронять хендлер
+            return False, f"ошибка проверки: {e}"
+
+    async def _activate_apikey(self, api_key: str,
+                               base_url: str | None) -> tuple[bool, str | None]:
+        ok, err = await self._probe_auth(
+            base_url, api_key, "claude-3-5-haiku-latest")
+        if not ok:
+            return False, err
+        self.config.save_auth_config({
+            "mode": "apikey", "api_key": api_key, "base_url": base_url or None})
+        await self._restart_claude_sessions()
+        log.info("auth.apikey_activated", base_url=base_url or "anthropic")
+        return True, None
+
+    async def _activate_omniroute(self, p) -> tuple[bool, str | None]:
+        # Проверяем моделью дефолтного тира (реальное имя модели шлюза).
+        probe_model = {
+            "opus": p.opus_model, "sonnet": p.sonnet_model,
+        }.get(p.default_tier, p.haiku_model)
+        ok, err = await self._probe_auth(p.base_url, p.api_key, probe_model)
+        if not ok:
+            return False, err
+        self.config.save_auth_config({
+            "mode": "omniroute", "api_key": p.api_key, "base_url": p.base_url,
+            "opus_model": p.opus_model, "sonnet_model": p.sonnet_model,
+            "haiku_model": p.haiku_model,
+            "default_tier": p.default_tier or "haiku"})
+        await self._restart_claude_sessions()
+        log.info("auth.omniroute_activated", base_url=p.base_url,
+                 default_tier=p.default_tier)
+        return True, None

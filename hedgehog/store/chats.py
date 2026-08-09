@@ -229,6 +229,28 @@ class ChatStore:
         except OSError:
             pass  # чат мог быть удалён под ногами — история не критична
 
+    def transcript_last_id(self, chat_id: str) -> str | None:
+        """id последнего события транскрипта — дешёвым чтением хвоста файла
+        (без парсинга всего лога). Для short-circuit в events_after."""
+        path = self._transcript_path(chat_id)
+        try:
+            with path.open("rb") as fh:
+                fh.seek(0, 2)
+                size = fh.tell()
+                fh.seek(max(0, size - 4096))
+                chunk = fh.read()
+        except OSError:
+            return None
+        for raw in reversed(chunk.split(b"\n")):
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                return json.loads(raw).get("id")
+            except ValueError:
+                continue
+        return None
+
     def read_transcript_tail(self, chat_id: str, n: int) -> list[dict]:
         path = self._transcript_path(chat_id)
         if not path.exists():
@@ -317,22 +339,34 @@ class ChatStore:
         self._rewrite_pending(chat_id, keep)
 
     def events_after(self, chat_id: str, last_seen_id: str | None) -> tuple[list[dict], bool]:
-        """(события для resume_response, full_replay) — §5.3."""
+        """(события для resume_response, full_replay) — §5.3.
+
+        §multi-device: pending чистится ack'ом ЛЮБОГО клиента, поэтому второй
+        девайс с более старым курсором не найдёт свои недостающие события в
+        pending. Тогда добираем их из ВЕЧНОГО транскрипта (не труncается по ack)
+        — так сообщения, отправленные с другого устройства, видны везде.
+        """
         events = self.read_pending(chat_id)
         if last_seen_id is None:
             return events, True
-        if not events:
-            # Всё ack'нуто: новых событий нет, история клиента актуальна.
-            return [], False
+        # 1) курсор в pending → всё после него (быстрый путь).
         for i, ev in enumerate(events):
             if ev.get("id") == last_seen_id:
                 return events[i + 1:], False
-        # last_seen_id не в журнале: либо уже ack'нут (норма — отдаём всё,
-        # клиент дедуплицирует по id, §5.4), либо это дыра. Если журнал
-        # начинается с события старше курсора — норма; иначе full replay.
+        # 2) курсор не в pending, но pending начинается ПОСЛЕ курсора → pending и
+        #    есть новое (заакан ровно до курсора). Быстро, без чтения транскрипта.
         if events and str(events[0].get("id", "")) > last_seen_id:
             return events, False
-        return events, True
+        # 3) pending пуст ИЛИ его первый ≤ курсора (курсор в «дыре» — типично при
+        #    мульти-девайсе). Дешёвый short-circuit: курсор == последнему в
+        #    транскрипте → девайс актуален, ничего не читаем целиком.
+        if last_seen_id == self.transcript_last_id(chat_id):
+            return [], False
+        # 4) Девайс реально отстал → добираем всё новее курсора из вечного
+        #    транскрипта (ULID сортируется по времени, клиент дедуплицирует).
+        after = [ev for ev in self.read_transcript_tail(chat_id, 0)
+                 if str(ev.get("id", "")) > last_seen_id]
+        return after, False
 
     def _rewrite_pending(self, chat_id: str, events: list[dict]):
         path = self._pending_path(chat_id)

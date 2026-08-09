@@ -71,6 +71,21 @@ class PickerResponsePayload(_Payload):
     option_id: str
 
 
+class UiResponsePayload(_Payload):
+    """§ui: результат взаимодействия пользователя с интерактивным HTML-экраном
+    (ask_ui). related — id ui_request; data — payload из hedgehog.submit(...)
+    (обычно JSON-строка), уезжает агенту как результат инструмента."""
+    related: str
+    data: str = ""
+
+
+class UiEventPayload(_Payload):
+    """§ui async: событие из постоянного окна (hedgehog.notify) — инжектится
+    агенту как ОБЫЧНОЕ сообщение (полноценный ход: чат/bash/docker/ui_update).
+    data — что прислала страница."""
+    data: str = ""
+
+
 class PtyWritePayload(_Payload):
     data: str
 
@@ -128,6 +143,26 @@ class AuthCodePayload(_Payload):
     code: str = Field(min_length=1)
 
 
+class AuthApiKeyPayload(_Payload):
+    """§altauth: авторизация прямым API-ключом (заголовок x-api-key).
+    base_url — опционально (кастомный Anthropic-совместимый endpoint;
+    None → api.anthropic.com)."""
+    api_key: str = Field(min_length=1)
+    base_url: str | None = None
+
+
+class AuthOmniRoutePayload(_Payload):
+    """§altauth: авторизация через шлюз (OmniRoute и т.п.): ключ + base_url +
+    имена моделей шлюза на 3 тира. default_tier — какой алиас идёт по
+    умолчанию (opus|sonnet|haiku)."""
+    api_key: str = Field(min_length=1)
+    base_url: str = Field(min_length=1)
+    opus_model: str = Field(min_length=1)
+    sonnet_model: str = Field(min_length=1)
+    haiku_model: str = Field(min_length=1)
+    default_tier: str = "haiku"
+
+
 class ClientLogPayload(_Payload):
     # §14: строка(и) лога приложения. Ограничим размер одного кадра.
     text: str = Field(max_length=64 * 1024)
@@ -180,6 +215,8 @@ CLIENT_FRAME_TYPES: dict[str, tuple[type[_Payload], bool]] = {
     "user_msg": (UserMsgPayload, True),
     "permission_response": (PermissionResponsePayload, True),
     "picker_response": (PickerResponsePayload, True),
+    "ui_response": (UiResponsePayload, True),
+    "ui_event": (UiEventPayload, True),
     "pty_write": (PtyWritePayload, True),
     "pty_resize": (PtyResizePayload, True),
     "subscribe_chat": (EmptyPayload, True),
@@ -201,6 +238,8 @@ CLIENT_FRAME_TYPES: dict[str, tuple[type[_Payload], bool]] = {
     # §13: авторизация Claude на сервере (глобальные, без chatId)
     "auth_start": (EmptyPayload, False),
     "auth_code": (AuthCodePayload, False),
+    "auth_apikey": (AuthApiKeyPayload, False),
+    "auth_omniroute": (AuthOmniRoutePayload, False),
     "logout": (EmptyPayload, False),
     # §14: лог приложения-клиента (глобальный, без chatId)
     "client_log": (ClientLogPayload, False),

@@ -24,6 +24,7 @@ PermissionResultAllow с updated_input, где в каждый question допи
 from __future__ import annotations
 
 import asyncio
+import json
 import mimetypes
 import re
 import shutil
@@ -203,6 +204,10 @@ class ClaudeSession:
     def resolve_picker(self, related: str, option_id: str) -> bool:
         return self._resolve(related, option_id)
 
+    def resolve_ui(self, related: str, data: str) -> bool:
+        """§ui: результат взаимодействия с интерактивным HTML (ask_ui)."""
+        return self._resolve(related, data)
+
     def _resolve(self, related: str, answer: str) -> bool:
         entry = self._pending.pop(related, None)
         if entry is None:
@@ -284,7 +289,155 @@ class ClaudeSession:
             text = await session._attach_file_to_chat(str(args.get("path", "")))
             return {"content": [{"type": "text", "text": text}]}
 
-        return create_sdk_mcp_server(name="hedgehog", tools=[attach_file])
+        @tool(
+            "ask_ui",
+            "Показать ПОЛЬЗОВАТЕЛЮ интерактивное окно (WebView) в чате и ДОЖДАТЬСЯ "
+            "его действия. Телефон рендерит HTML сам, локально, без сети. "
+            "\n\nHTML — ПОЛНЫЙ самодостаточный документ (inline CSS/JS, без "
+            "внешних ресурсов). Делай НАСТОЯЩИЕ мини-приложения со своим "
+            "состоянием и логикой в JS: игры, тренажёры, счётчики, формы, кнопки, "
+            "рисовалки. Пример: тренажёр пар слов (рус-англ) со СЧЁТЧИКОМ "
+            "верно/неверно сверху — вся логика матчинга и счёт в JS страницы, а "
+            "не через вопросы. Тёмная тема, крупные тач-цели.\n\n"
+            "СВЯЗЬ С ТОБОЙ: в HTML вызывай `hedgehog.submit(data)` — data (строка "
+            "или JSON) вернётся как результат этого инструмента, разблокировав "
+            "тебя. Окно ОСТАЁТСЯ ОТКРЫТЫМ: следующий вызов ask_ui ЗАМЕНЯЕТ его "
+            "содержимое (то же окно, без мигания).\n\n"
+            "ЖИВОЙ ЦИКЛ (реагируй на каждое действие): если нужно отвечать на "
+            "КАЖДОЕ нажатие своим контентом — зацикли: покажи ask_ui → пользователь "
+            "нажал → submit вернул тебе событие → ты придумал НОВЫЙ контент → снова "
+            "ask_ui, и так пока пользователь не закроет окно (тогда вернётся пустая "
+            "строка — заверши). Пример: большая красная кнопка; на каждый клик ты "
+            "сам придумываешь новую шутку про красную кнопку и показываешь её тем "
+            "же ask_ui. title — короткий заголовок окна.",
+            {"html": str, "title": str},
+        )
+        async def ask_ui(args: dict[str, Any]) -> dict[str, Any]:
+            answer = await session._ask_ui(
+                str(args.get("html", "")),
+                str(args.get("title", "") or "Интерактив"))
+            return {"content": [{"type": "text", "text": answer}]}
+
+        @tool(
+            "ui_open",
+            "Открыть ПОСТОЯННОЕ интерактивное окно (WebView) в чате и СРАЗУ "
+            "вернуть управление (НЕ блокирует ход). Окно живёт, пока не закроешь "
+            "(ui_close) или пользователь. Действия пользователя приходят "
+            "АСИНХРОННО: в HTML вызывай `hedgehog.notify(data)` — это прилетит "
+            "тебе как ОБЫЧНОЕ сообщение в чат, и ты отреагируешь чем угодно "
+            "(текст в чат, bash, docker, любой инструмент) и/или обновишь окно "
+            "через ui_update. Локальные эффекты (сменить цвет и т.п.) делай "
+            "прямо в JS без notify. Пример: мышь с кнопкой на хвосте — по клику "
+            "JS красит мышь + notify('нажата кнопка') → ты пишешь факт о мышах в "
+            "чат. Или красная кнопка → notify('разверни случайный контейнер') → "
+            "ты выполняешь это. Есть и `hedgehog.submit(data)`, но он для "
+            "блокирующего ask_ui; для постоянного окна используй notify. html — "
+            "самодостаточный документ; title — заголовок окна. "
+            "\n\nSDK в окне (пред-паттерн, не изобретай своё): "
+            "`hedgehog.notify(data)` — событие → твой ход; "
+            "`hedgehog.action(id, data)` — именованное действие (роутишь по id); "
+            "`hedgehog.chat(text)` — текст прямо в чат; "
+            "`hedgehog.open(url)` — открыть ссылку в системном браузере. "
+            "Общее состояние между окнами/чатами — инструменты kv_set/kv_get "
+            "(напр. счётчик мыши). allow_external=true → окну РАЗРЕШЕНА внешняя "
+            "сеть (встроить YouTube/сайт в iframe); по умолчанию офлайн-песочница.",
+            {"html": str, "title": str, "allow_external": bool},
+        )
+        async def ui_open(args: dict[str, Any]) -> dict[str, Any]:
+            await session._publish("ui_request", {
+                "html": str(args.get("html", "")),
+                "title": str(args.get("title", "") or "Интерактив"),
+                "persistent": True,
+                "allow_external": bool(args.get("allow_external", False)),
+            })
+            return {"content": [{"type": "text", "text":
+                "Окно открыто. Действия — hedgehog.notify/action/chat/open. "
+                "Меняй через ui_update, закрой ui_close. Состояние — kv_set/kv_get."}]}
+
+        @tool(
+            "ui_update",
+            "Заменить содержимое ОТКРЫТОГО окна (ui_open) новым HTML — телефон "
+            "перерисует тот же WebView. html — полный самодостаточный документ.",
+            {"html": str},
+        )
+        async def ui_update(args: dict[str, Any]) -> dict[str, Any]:
+            await session._publish("ui_update", {"html": str(args.get("html", ""))})
+            return {"content": [{"type": "text", "text": "Окно обновлено."}]}
+
+        @tool(
+            "ui_close",
+            "Закрыть открытое интерактивное окно (ui_open).",
+            {},
+        )
+        async def ui_close(args: dict[str, Any]) -> dict[str, Any]:
+            await session._publish("ui_close", {})
+            return {"content": [{"type": "text", "text": "Окно закрыто."}]}
+
+        @tool(
+            "kv_set",
+            "Сохранить значение по ключу в ОБЩЕЕ хранилище сервера (видно из ВСЕХ "
+            "чатов и окон). Для счётчиков/состояния между окнами и чатами.",
+            {"key": str, "value": str},
+        )
+        async def kv_set(args: dict[str, Any]) -> dict[str, Any]:
+            session._kv_set(str(args.get("key", "")), str(args.get("value", "")))
+            return {"content": [{"type": "text", "text": "ok"}]}
+
+        @tool(
+            "kv_get",
+            "Прочитать значение по ключу из общего хранилища сервера (пусто, если "
+            "нет).",
+            {"key": str},
+        )
+        async def kv_get(args: dict[str, Any]) -> dict[str, Any]:
+            return {"content": [{"type": "text",
+                                 "text": session._kv_get(str(args.get("key", "")))}]}
+
+        return create_sdk_mcp_server(
+            name="hedgehog",
+            tools=[attach_file, ask_ui, ui_open, ui_update, ui_close,
+                   kv_set, kv_get])
+
+    # §ui Ф-1: общий per-server key-value стор (data_dir/kv.json) — состояние
+    # между окнами и чатами (счётчики и т.п.). Один процесс Ёжика, async
+    # single-thread → read-modify-write без гонок.
+    def _kv_path(self):
+        return self._config.data_dir / "kv.json"
+
+    def _kv_load(self) -> dict:
+        try:
+            data = json.loads(self._kv_path().read_text())
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _kv_set(self, key: str, value: str) -> None:
+        if not key:
+            return
+        data = self._kv_load()
+        data[key] = value
+        self._config.data_dir.mkdir(parents=True, exist_ok=True)
+        tmp = self._kv_path().with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False))
+        tmp.replace(self._kv_path())
+
+    def _kv_get(self, key: str) -> str:
+        return str(self._kv_load().get(key, ""))
+
+    async def handle_ui_event(self, data: str) -> None:
+        """§ui async: действие в постоянном окне (hedgehog.notify) → полноценный
+        ход агента, как обычное сообщение. Claude может делать что угодно."""
+        log.info("ui.event", chat=self.meta.chatId, size=len(data or ""))
+        await self.handle_user_msg(data or "(пустое ui-событие)")
+
+    async def _ask_ui(self, html: str, title: str) -> str:
+        """§ui: показать интерактивный HTML в чате и дождаться ответа юзера.
+        Тем же round-trip, что picker/permission (_pending future)."""
+        frame = await self._publish("ui_request", {"html": html, "title": title})
+        data = await self._wait_answer(frame["id"], {})
+        log.info("ui.answered", chat=self.meta.chatId,
+                 related=frame["id"][-6:], size=len(data or ""))
+        return data or "(пользователь закрыл окно без ответа)"
 
     async def _attach_file_to_chat(self, path: str) -> str:
         p = Path(path)
@@ -338,12 +491,34 @@ class ClaudeSession:
             if self.meta.skills:
                 opts["skills"] = list(self.meta.skills)
                 opts["setting_sources"] = ["user", "project"]
-            # Токен из чатной авторизации (§13): setup-token не пишет
-            # ~/.claude/.credentials.json, поэтому подкладываем его CLI
-            # через env. Если файла нет — работаем на базовых кредах.
-            oauth = self._config.load_oauth_token()
-            if oauth:
-                opts["env"] = {"CLAUDE_CODE_OAUTH_TOKEN": oauth}
+            # Авторизация Claude (§13 + §altauth): режим из data/auth.json.
+            #   oauth      — подписка через setup-token (env CLAUDE_CODE_OAUTH_TOKEN);
+            #   apikey     — прямой API-ключ (x-api-key) [+ кастомный base_url];
+            #   omniroute  — шлюз: ключ + base_url + модели шлюза на 3 тира,
+            #                дефолтный тир алиасом в opts["model"].
+            # env кладём ТОЛЬКО для выбранного режима (SDK мержит его поверх
+            # окружения процесса) — так активный способ заменяет прошлый.
+            auth = self._config.load_auth_config()
+            mode = auth.get("mode", "oauth")
+            env: dict[str, str] = {}
+            if mode == "apikey":
+                env["ANTHROPIC_API_KEY"] = auth.get("api_key", "")
+                if auth.get("base_url"):
+                    env["ANTHROPIC_BASE_URL"] = auth["base_url"]
+            elif mode == "omniroute":
+                env["ANTHROPIC_API_KEY"] = auth.get("api_key", "")
+                env["ANTHROPIC_BASE_URL"] = auth.get("base_url", "")
+                env["ANTHROPIC_DEFAULT_OPUS_MODEL"] = auth.get("opus_model", "")
+                env["ANTHROPIC_DEFAULT_SONNET_MODEL"] = auth.get("sonnet_model", "")
+                env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = auth.get("haiku_model", "")
+                opts["model"] = auth.get("default_tier") or "haiku"
+            else:  # oauth (по умолчанию) — setup-token не пишет creds-файл,
+                # поэтому подкладываем его CLI через env; нет файла → базовые креды.
+                oauth = self._config.load_oauth_token()
+                if oauth:
+                    env["CLAUDE_CODE_OAUTH_TOKEN"] = oauth
+            if env:
+                opts["env"] = env
             # Resume контекста: CLI хранит сессии на диске, meta.json помнит
             # id последней — рестарт Ёжика/set_mode больше не амнезия.
             self._resumed_from = self.meta.claude_session_id
