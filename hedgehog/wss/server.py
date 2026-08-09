@@ -564,6 +564,17 @@ class HedgehogServer:
                 frame.chatId))
             return
 
+        if ftype == "ui_closed":
+            # §views: пользователь закрыл ПОСТОЯННОЕ окно крестиком с телефона →
+            # архивируем текущее в историю (агентский ui_close делает это же
+            # серверно). Возвращаем свежий список спросившему.
+            views_registry.record_close(self.config.data_dir, frame.chatId)
+            await self.hub.send_global(conn_id, make_frame(
+                "ui_list_response",
+                views_registry.summary(self.config.data_dir, frame.chatId),
+                frame.chatId))
+            return
+
         if ftype in ("permission_response", "picker_response", "ui_response"):
             session = self.sessions.get(frame.chatId)
             resolved = False

@@ -232,6 +232,9 @@ CLIENT_FRAME_TYPES: dict[str, tuple[type[_Payload], bool]] = {
     "ui_list": (EmptyPayload, True),
     "ui_reopen": (UiReopenPayload, True),
     "ui_forget": (UiForgetPayload, True),
+    # §views: пользователь закрыл ПОСТОЯННОЕ окно с телефона (крестик) —
+    # сервер архивирует текущее в историю (per-chat).
+    "ui_closed": (EmptyPayload, True),
     "pty_write": (PtyWritePayload, True),
     "pty_resize": (PtyResizePayload, True),
     "subscribe_chat": (EmptyPayload, True),
