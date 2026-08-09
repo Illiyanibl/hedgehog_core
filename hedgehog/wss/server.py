@@ -38,6 +38,7 @@ from ..protocol import (
 from ..store.chats import ChatMeta, ChatStore
 from ..store.mcp_registry import McpRegistry
 from ..store import skills_registry
+from ..store import views_registry
 from ..store.skill_sources import SkillSources, SkillInstallError
 from .. import fileserver
 from .. import authlog
@@ -312,6 +313,7 @@ class HedgehogServer:
             await self._stop_session(frame.chatId)
             self.store.delete(frame.chatId, delete_cwd=p.delete_cwd,
                               projects_base=self.config.default_cwd)
+            views_registry.clear_chat(self.config.data_dir, frame.chatId)  # §views
             log.info("chat.deleted", chat=frame.chatId, delete_cwd=p.delete_cwd)
             await self.hub.broadcast_global(
                 make_frame("chat_deleted", {"chatId": frame.chatId}))
@@ -524,6 +526,42 @@ class HedgehogServer:
             session = self.sessions.get(frame.chatId)
             if isinstance(session, ClaudeSession):
                 await session.handle_ui_event(p.data)
+            return
+
+        if ftype == "ui_list":
+            # §views: список окон чата (текущее + история закрытых) БЕЗ html —
+            # клиент строит меню «переоткрыть». Ответ только спросившему.
+            await self.hub.send_global(conn_id, make_frame(
+                "ui_list_response",
+                views_registry.summary(self.config.data_dir, frame.chatId),
+                frame.chatId))
+            return
+
+        if ftype == "ui_reopen":
+            # §views: детерминированный пушер — сервер сам повторно шлёт
+            # сохранённый ui_request в чат, БЕЗ хода агента (ноль токенов).
+            # Уходит всем подписчикам чата (мультидевайс) + в журнал.
+            rec = views_registry.reopen(self.config.data_dir, frame.chatId, p.id)
+            if rec:
+                await self.hub.publish(frame.chatId, "ui_request", {
+                    "html": rec.get("html", ""),
+                    "title": rec.get("title", "Интерактив"),
+                    "persistent": True,
+                    "allow_external": bool(rec.get("allow_external", False)),
+                })
+            else:
+                await self.hub.send_global(conn_id, make_error(
+                    Err.BAD_FRAME, f"no view {p.id}",
+                    chat_id=frame.chatId, related=frame.id))
+            return
+
+        if ftype == "ui_forget":
+            # §views: убрать окно из истории; вернуть обновлённый список.
+            views_registry.forget(self.config.data_dir, frame.chatId, p.id)
+            await self.hub.send_global(conn_id, make_frame(
+                "ui_list_response",
+                views_registry.summary(self.config.data_dir, frame.chatId),
+                frame.chatId))
             return
 
         if ftype in ("permission_response", "picker_response", "ui_response"):

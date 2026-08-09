@@ -55,6 +55,7 @@ from ..fileserver import _safe_name
 from ..ids import new_ulid
 from ..protocol import Err, make_error
 from ..store.chats import ChatMeta
+from ..store import views_registry
 from .session_base import PublishFn
 
 log = structlog.get_logger("claude_session")
@@ -344,12 +345,17 @@ class ClaudeSession:
             {"html": str, "title": str, "allow_external": bool},
         )
         async def ui_open(args: dict[str, Any]) -> dict[str, Any]:
+            html = str(args.get("html", ""))
+            title = str(args.get("title", "") or "Интерактив")
+            allow_external = bool(args.get("allow_external", False))
             await session._publish("ui_request", {
-                "html": str(args.get("html", "")),
-                "title": str(args.get("title", "") or "Интерактив"),
+                "html": html,
+                "title": title,
                 "persistent": True,
-                "allow_external": bool(args.get("allow_external", False)),
+                "allow_external": allow_external,
             })
+            # §views: запомнить как текущее окно чата (для переоткрытия/ui_current).
+            session._view_open(title=title, html=html, allow_external=allow_external)
             return {"content": [{"type": "text", "text":
                 "Окно открыто. Действия — hedgehog.notify/action/chat/open. "
                 "Меняй через ui_update, закрой ui_close. Состояние — kv_set/kv_get."}]}
@@ -361,7 +367,9 @@ class ClaudeSession:
             {"html": str},
         )
         async def ui_update(args: dict[str, Any]) -> dict[str, Any]:
-            await session._publish("ui_update", {"html": str(args.get("html", ""))})
+            html = str(args.get("html", ""))
+            await session._publish("ui_update", {"html": html})
+            session._view_update(html)   # §views: держим current в актуальном виде
             return {"content": [{"type": "text", "text": "Окно обновлено."}]}
 
         @tool(
@@ -371,7 +379,56 @@ class ClaudeSession:
         )
         async def ui_close(args: dict[str, Any]) -> dict[str, Any]:
             await session._publish("ui_close", {})
+            session._view_close()   # §views: явное закрытие → в историю чата
             return {"content": [{"type": "text", "text": "Окно закрыто."}]}
+
+        @tool(
+            "ui_current",
+            "Узнать, какое интерактивное окно (view) сейчас запущено в ЭТОМ "
+            "чате и список недавно закрытых (id + заголовок). Переоткрыть "
+            "закрытое можно через ui_reopen(id).",
+            {},
+        )
+        async def ui_current(args: dict[str, Any]) -> dict[str, Any]:
+            snap = session._view_snapshot()
+            cur = snap.get("current")
+            lines: list[str] = []
+            if isinstance(cur, dict):
+                lines.append(f"Открыто сейчас: «{cur.get('title', '')}» "
+                             f"(id={cur.get('id', '')}).")
+            else:
+                lines.append("Открытого окна нет.")
+            hist = snap.get("history") or []
+            if hist:
+                lines.append("Закрытые (можно ui_reopen):")
+                for h in hist:
+                    if isinstance(h, dict):
+                        lines.append(f"  • id={h.get('id', '')} — "
+                                     f"«{h.get('title', '')}»")
+            else:
+                lines.append("История закрытых пуста.")
+            return {"content": [{"type": "text", "text": "\n".join(lines)}]}
+
+        @tool(
+            "ui_reopen",
+            "Переоткрыть ранее закрытое (или текущее) окно по id из ui_current "
+            "— сервер заново покажет сохранённый HTML БЕЗ пересборки. "
+            "id — идентификатор записи view.",
+            {"id": str},
+        )
+        async def ui_reopen(args: dict[str, Any]) -> dict[str, Any]:
+            rec = session._view_reopen(str(args.get("id", "")))
+            if not rec:
+                return {"content": [{"type": "text", "text":
+                    "Нет view с таким id (см. ui_current)."}]}
+            await session._publish("ui_request", {
+                "html": rec.get("html", ""),
+                "title": rec.get("title", "Интерактив"),
+                "persistent": True,
+                "allow_external": bool(rec.get("allow_external", False)),
+            })
+            return {"content": [{"type": "text", "text":
+                f"Окно «{rec.get('title', '')}» снова открыто."}]}
 
         @tool(
             "kv_set",
@@ -396,7 +453,46 @@ class ClaudeSession:
         return create_sdk_mcp_server(
             name="hedgehog",
             tools=[attach_file, ask_ui, ui_open, ui_update, ui_close,
-                   kv_set, kv_get])
+                   ui_current, ui_reopen, kv_set, kv_get])
+
+    # §views: тонкие обёртки над реестром окон (data_dir/views.json). Реестр —
+    # источник правды «какое окно запущено» + история явных закрытий; на нём
+    # держится детерминированный пушер переоткрытия (клиентский ui_reopen) и
+    # интроспекция агентом (ui_current). Ошибки реестра не должны ронять тул.
+    def _view_open(self, *, title: str, html: str, allow_external: bool) -> None:
+        try:
+            views_registry.record_open(
+                self._config.data_dir, self.meta.chatId,
+                title=title, html=html, persistent=True,
+                allow_external=allow_external)
+        except OSError as e:
+            log.warning("views.open_failed", chat=self.meta.chatId, err=str(e))
+
+    def _view_update(self, html: str) -> None:
+        try:
+            views_registry.record_update(
+                self._config.data_dir, self.meta.chatId, html)
+        except OSError as e:
+            log.warning("views.update_failed", chat=self.meta.chatId, err=str(e))
+
+    def _view_close(self) -> None:
+        try:
+            views_registry.record_close(self._config.data_dir, self.meta.chatId)
+        except OSError as e:
+            log.warning("views.close_failed", chat=self.meta.chatId, err=str(e))
+
+    def _view_snapshot(self) -> dict:
+        try:
+            return views_registry.get(self._config.data_dir, self.meta.chatId)
+        except OSError:
+            return {"current": None, "history": []}
+
+    def _view_reopen(self, view_id: str) -> dict | None:
+        try:
+            return views_registry.reopen(
+                self._config.data_dir, self.meta.chatId, view_id)
+        except OSError:
+            return None
 
     # §ui Ф-1: общий per-server key-value стор (data_dir/kv.json) — состояние
     # между окнами и чатами (счётчики и т.п.). Один процесс Ёжика, async

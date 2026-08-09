@@ -86,6 +86,17 @@ class UiEventPayload(_Payload):
     data: str = ""
 
 
+class UiReopenPayload(_Payload):
+    """§views: переоткрыть сохранённое окно по id (детерминированный пушер —
+    сервер повторно шлёт ui_request без хода агента)."""
+    id: str = Field(min_length=1)
+
+
+class UiForgetPayload(_Payload):
+    """§views: удалить закрытое окно из истории чата."""
+    id: str = Field(min_length=1)
+
+
 class PtyWritePayload(_Payload):
     data: str
 
@@ -217,6 +228,10 @@ CLIENT_FRAME_TYPES: dict[str, tuple[type[_Payload], bool]] = {
     "picker_response": (PickerResponsePayload, True),
     "ui_response": (UiResponsePayload, True),
     "ui_event": (UiEventPayload, True),
+    # §views: реестр GUI-окон — список/переоткрытие/удаление (per-chat)
+    "ui_list": (EmptyPayload, True),
+    "ui_reopen": (UiReopenPayload, True),
+    "ui_forget": (UiForgetPayload, True),
     "pty_write": (PtyWritePayload, True),
     "pty_resize": (PtyResizePayload, True),
     "subscribe_chat": (EmptyPayload, True),
