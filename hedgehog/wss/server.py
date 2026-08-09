@@ -439,6 +439,19 @@ class HedgehogServer:
             # Для shell-чата поднимаем bash сразу — клиент увидит prompt.
             if meta.addressee == "broker_shell":
                 await self._ensure_session(meta)
+            # §views авто-возврат: если в чате есть ОТКРЫТОЕ окно (current),
+            # ре-пушим его этому соединению — окно переживает рестарт/реконнект
+            # (клиент на реконнекте пере-сидит ленту и теряет живое окно).
+            # Точечно (send_global) — не броадкастим другим устройствам.
+            snap = views_registry.get(self.config.data_dir, frame.chatId)
+            cur = snap.get("current")
+            if isinstance(cur, dict) and cur.get("html"):
+                await self.hub.send_global(conn_id, make_frame("ui_request", {
+                    "html": cur.get("html", ""),
+                    "title": cur.get("title", "Интерактив"),
+                    "persistent": True,
+                    "allow_external": bool(cur.get("allow_external", False)),
+                }, frame.chatId))
             return
         if ftype == "unsubscribe_chat":
             self.hub.unsubscribe(conn_id, frame.chatId)
