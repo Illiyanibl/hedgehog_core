@@ -16,6 +16,7 @@ import asyncio
 import http
 import json
 import time
+from pathlib import Path
 from typing import Any
 
 import structlog
@@ -451,6 +452,8 @@ class HedgehogServer:
                     "title": cur.get("title", "Интерактив"),
                     "persistent": True,
                     "allow_external": bool(cur.get("allow_external", False)),
+                    "view_id": cur.get("id", ""),
+                    "kind": cur.get("kind", "app"),
                 }, frame.chatId))
             return
         if ftype == "unsubscribe_chat":
@@ -521,6 +524,12 @@ class HedgehogServer:
             resolved = fileserver.resolve_attachment_paths(
                 self.config.chats_dir, frame.chatId, p.attachments)
             prompt = fileserver.compose_prompt(p.content, resolved)
+            # §draw: если сообщение несёт разметку окна — подкладываем её агенту
+            # (скриншот + координаты + подсказка по HTML).
+            if p.draw_view_id:
+                note = self._draw_note(frame.chatId, p.draw_view_id)
+                if note:
+                    prompt = f"{prompt}\n\n{note}" if prompt.strip() else note
             await session.handle_user_msg(prompt)
             return
 
@@ -565,6 +574,8 @@ class HedgehogServer:
                     "title": rec.get("title", "Интерактив"),
                     "persistent": True,
                     "allow_external": bool(rec.get("allow_external", False)),
+                    "view_id": rec.get("id", ""),
+                    "kind": rec.get("kind", "app"),
                 })
             else:
                 await self.hub.send_global(conn_id, make_error(
@@ -627,6 +638,46 @@ class HedgehogServer:
                 conn_id, make_frame("ui_call_result", payload, frame.chatId))
             return
 
+        if ftype == "ui_new_blank":
+            # §draw: пользователь нажал ＋ — создаём пустое белое §views-окно
+            # (холст для свободного рисунка) и пушим его как обычное окно.
+            blank = ("<!DOCTYPE html><html><head><meta charset='UTF-8'>"
+                     "<meta name='viewport' content='width=device-width,"
+                     "initial-scale=1,maximum-scale=1'></head>"
+                     "<body style='margin:0;background:#ffffff;'></body></html>")
+            rec = views_registry.record_open(
+                self.config.data_dir, frame.chatId,
+                title=p.title or "Пустой холст", html=blank,
+                persistent=True, allow_external=False, kind="blank")
+            await self.hub.publish(frame.chatId, "ui_request", {
+                "html": blank, "title": rec.get("title", "Пустой холст"),
+                "persistent": True, "allow_external": False,
+                "view_id": rec.get("id", ""), "kind": "blank",
+            })
+            return
+
+        if ftype == "ui_draw_apply":
+            # §draw: «Применить» — сохранить рисунок (координаты + скриншот) на view.
+            try:
+                figs = json.loads(p.figures or "[]")
+            except ValueError:
+                figs = []
+            res = views_registry.set_drawing(
+                self.config.data_dir, frame.chatId, p.view_id,
+                size={"w": p.width, "h": p.height}, figures=figs,
+                image=p.image_id or "")
+            if res and res.get("old_image"):
+                self._delete_chat_file(frame.chatId, res["old_image"])
+            return
+
+        if ftype == "ui_draw_clear":
+            # §draw: «Очистить/Стереть» — снять рисунок с view (+ удалить картинку).
+            old = views_registry.clear_drawing(
+                self.config.data_dir, frame.chatId, p.view_id)
+            if old:
+                self._delete_chat_file(frame.chatId, old)
+            return
+
         if ftype in ("permission_response", "picker_response", "ui_response"):
             session = self.sessions.get(frame.chatId)
             resolved = False
@@ -644,6 +695,54 @@ class HedgehogServer:
             return
 
         raise AssertionError(f"unrouted frame type {ftype}")  # защита от рассинхрона с protocol.py
+
+    # ---------- §draw: файлы разметки + инъекция в промпт ----------
+
+    def _chat_file_path(self, chat_id: str, file_id: str) -> str | None:
+        """fileId → абсолютный путь в хранилище файлов чата (или None)."""
+        if not file_id or not file_id.isalnum():
+            return None
+        files_dir = self.config.chats_dir / chat_id / "files"
+        try:
+            matches = sorted(files_dir.glob(f"{file_id}__*")) \
+                if files_dir.exists() else []
+        except OSError:
+            return None
+        return str(matches[0]) if matches else None
+
+    def _delete_chat_file(self, chat_id: str, file_id: str) -> None:
+        path = self._chat_file_path(chat_id, file_id)
+        if path:
+            try:
+                Path(path).unlink()
+            except OSError:
+                pass
+
+    def _draw_note(self, chat_id: str, view_id: str) -> str:
+        """Текст-приписка к промпту с разметкой окна (скриншот + координаты)."""
+        view = views_registry.get_view(self.config.data_dir, chat_id, view_id)
+        dr = (view or {}).get("drawing")
+        if not isinstance(dr, dict):
+            return ""
+        figs = dr.get("figures") or []
+        size = dr.get("size") or {}
+        lines = [f"§draw: пользователь нарисовал разметку поверх окна "
+                 f"«{view.get('title', '')}» (view_id={view_id}). "
+                 f"Фигур: {len(figs)} (одна фигура = одно движение), "
+                 f"размер вью {size.get('w')}×{size.get('h')} CSS-px."]
+        img = self._chat_file_path(chat_id, dr.get("image", ""))
+        if img:
+            lines.append("Скриншот окна С рисунком (ОБЯЗАТЕЛЬНО посмотри его "
+                         "инструментом Read — на нём видно, что отмечено поверх "
+                         f"реального состояния экрана): {img}")
+        lines.append("Координаты фигур (CSS-px, в порядке рисования): "
+                     + json.dumps(figs, ensure_ascii=False)[:4000])
+        if view.get("kind") != "blank":
+            lines.append("Это окно-приложение: сопоставь разметку с элементами "
+                         "и правь его HTML (ui_update / ui_open с тем же title).")
+        else:
+            lines.append("Это пустой холст — пользователь рисует идею с нуля.")
+        return "\n".join(lines)
 
     # ---------- лог приложения-клиента (§14) ----------
 

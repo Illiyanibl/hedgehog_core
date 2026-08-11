@@ -61,7 +61,7 @@ def _chat(data: dict, chat_id: str) -> dict:
 
 
 def record_open(data_dir: Path, chat_id: str, *, title: str, html: str,
-                persistent: bool, allow_external: bool) -> dict:
+                persistent: bool, allow_external: bool, kind: str = "app") -> dict:
     """Новое окно стало текущим. Возвращает запись.
 
     Если текущее окно имеет ТОТ ЖЕ заголовок — переиспользуем его id (обновление
@@ -88,6 +88,7 @@ def record_open(data_dir: Path, chat_id: str, *, title: str, html: str,
         "html": html or "",
         "persistent": bool(persistent),
         "allow_external": bool(allow_external),
+        "kind": kind or "app",
         "opened_at": now,
         "updated_at": now,
         "rev": 1,
@@ -210,3 +211,53 @@ def clear_chat(data_dir: Path, chat_id: str) -> None:
     if chat_id in data:
         del data[chat_id]
         _save(data_dir, data)
+
+
+# §draw: разметка поверх окна — хранится ПРЯМО в записи view (current/history),
+# поэтому едет вместе с окном при переоткрытии и стирается вместе с ним.
+
+def _find_view(entry: dict, view_id: str) -> dict | None:
+    cur = entry.get("current")
+    if isinstance(cur, dict) and cur.get("id") == view_id:
+        return cur
+    for h in entry.get("history", []):
+        if isinstance(h, dict) and h.get("id") == view_id:
+            return h
+    return None
+
+
+def get_view(data_dir: Path, chat_id: str, view_id: str) -> dict | None:
+    """Запись view по id (current или из истории) — с html/kind/drawing."""
+    data = _load(data_dir)
+    v = _find_view(_chat(data, chat_id), view_id)
+    return dict(v) if isinstance(v, dict) else None
+
+
+def set_drawing(data_dir: Path, chat_id: str, view_id: str, *,
+                size: dict, figures: list, image: str) -> dict | None:
+    """Сохранить разметку на view. Возврат {view_id, old_image} (old_image —
+    fileId прежней картинки для удаления) или None, если view не найдена."""
+    data = _load(data_dir)
+    v = _find_view(_chat(data, chat_id), view_id)
+    if v is None:
+        return None
+    old = (v.get("drawing") or {}).get("image")
+    v["drawing"] = {
+        "size": size, "figures": figures, "image": image or "",
+        "updated_at": time.time(),
+    }
+    _save(data_dir, data)
+    return {"view_id": view_id,
+            "old_image": old if (old and old != image) else None}
+
+
+def clear_drawing(data_dir: Path, chat_id: str, view_id: str) -> str | None:
+    """Снять разметку с view. Возврат fileId прежней картинки (для удаления)."""
+    data = _load(data_dir)
+    v = _find_view(_chat(data, chat_id), view_id)
+    if not isinstance(v, dict) or "drawing" not in v:
+        return None
+    old = (v.get("drawing") or {}).get("image")
+    del v["drawing"]
+    _save(data_dir, data)
+    return old or None

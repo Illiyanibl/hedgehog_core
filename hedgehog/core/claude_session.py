@@ -351,17 +351,20 @@ class ClaudeSession:
             html = str(args.get("html", ""))
             title = str(args.get("title", "") or "Интерактив")
             allow_external = bool(args.get("allow_external", False))
+            # §views: сперва фиксируем окно в реестре (получаем стабильный id),
+            # затем пушим — чтобы клиент СРАЗУ знал view_id (для §draw).
+            # Тот же title при повторном ui_open обновляет ТО ЖЕ окно.
+            rec = session._view_open(
+                title=title, html=html, allow_external=allow_external)
+            vid = (rec or {}).get("id", "")
             await session._publish("ui_request", {
                 "html": html,
                 "title": title,
                 "persistent": True,
                 "allow_external": allow_external,
+                "view_id": vid,
+                "kind": "app",
             })
-            # §views: запомнить как текущее окно чата (для переоткрытия/ui_current).
-            # Тот же title при повторном ui_open обновляет ТО ЖЕ окно (стабильный id).
-            rec = session._view_open(
-                title=title, html=html, allow_external=allow_external)
-            vid = (rec or {}).get("id", "")
             return {"content": [{"type": "text", "text":
                 f"Окно открыто (view_id={vid}). Меняй содержимое через "
                 "ui_update (тот же title в ui_open тоже обновит это окно), "
@@ -416,10 +419,13 @@ class ClaudeSession:
             if isinstance(cur, dict):
                 # rev — «версия пуша»: сколько раз окно пушилось (ui_open/update/
                 # reopen). Растёт при каждом пуше сервера в это окно.
+                dr = cur.get("drawing")
+                mark = (f", разметка: {len(dr.get('figures') or [])} фигур "
+                        "(ui_drawing)") if isinstance(dr, dict) else ""
                 lines.append(
                     f"Запущено сейчас: «{cur.get('title', '')}» "
                     f"(id={cur.get('id', '')}, rev {cur.get('rev', 1)}, "
-                    f"обновлено {_ago(cur.get('updated_at'))}).")
+                    f"обновлено {_ago(cur.get('updated_at'))}{mark}).")
             else:
                 lines.append("Открытого окна сейчас нет.")
             hist = snap.get("history") or []
@@ -458,9 +464,43 @@ class ClaudeSession:
                 "title": rec.get("title", "Интерактив"),
                 "persistent": True,
                 "allow_external": bool(rec.get("allow_external", False)),
+                "view_id": rec.get("id", ""),
+                "kind": rec.get("kind", "app"),
             })
             return {"content": [{"type": "text", "text":
                 f"Окно «{rec.get('title', '')}» снова открыто."}]}
+
+        @tool(
+            "ui_drawing",
+            "Прочитать РАЗМЕТКУ пользователя на окне (§draw): скриншот webview с "
+            "его рисунком (обязательно посмотри его Read'ом — на нём видно, что "
+            "подчёркнуто/обведено поверх реального состояния), координаты фигур "
+            "(CSS-px) и размер вью. view_id необязателен — по умолчанию текущее "
+            "окно. Так ты понимаешь правки даже при анимации/данных из БД.",
+            {"view_id": str},
+        )
+        async def ui_drawing(a: dict[str, Any]) -> dict[str, Any]:
+            vid = str(a.get("view_id", "")).strip()
+            if not vid:
+                cur = session._view_snapshot().get("current")
+                vid = (cur or {}).get("id", "") if isinstance(cur, dict) else ""
+            view = session._view_get(vid) if vid else None
+            dr = (view or {}).get("drawing")
+            if not isinstance(dr, dict):
+                return {"content": [{"type": "text", "text":
+                    "На этом окне разметки нет."}]}
+            figs = dr.get("figures") or []
+            parts = [f"Разметка на «{view.get('title', '')}» (view_id={vid}): "
+                     f"{len(figs)} фигур, размер вью {dr.get('size', {})}."]
+            img = session._chat_file_path(dr.get("image", ""))
+            if img:
+                parts.append(f"Скриншот с рисунком (посмотри Read'ом): {img}")
+            parts.append("Координаты фигур (CSS-px, порядок рисования): "
+                         + json.dumps(figs, ensure_ascii=False)[:2000])
+            if view.get("kind") != "blank":
+                parts.append("Окно-приложение — правь его HTML под разметку "
+                             "(HTML есть у тебя из ui_open/ui_current).")
+            return {"content": [{"type": "text", "text": "\n".join(parts)}]}
 
         # §handlers Ф-2: серверные «ручки» для окон — детерминированный доступ
         # к данным (БД) БЕЗ хода агента. Окно зовёт hedgehog.call(name, args),
@@ -576,7 +616,7 @@ class ClaudeSession:
         return create_sdk_mcp_server(
             name="hedgehog",
             tools=[attach_file, ask_ui, ui_open, ui_update, ui_close,
-                   ui_current, ui_reopen,
+                   ui_current, ui_reopen, ui_drawing,
                    handler_register, handler_list, handler_unregister,
                    handler_call, kv_set, kv_get])
 
@@ -620,6 +660,25 @@ class ClaudeSession:
                 self._config.data_dir, self.meta.chatId, view_id)
         except OSError:
             return None
+
+    def _view_get(self, view_id: str) -> dict | None:
+        try:
+            return views_registry.get_view(
+                self._config.data_dir, self.meta.chatId, view_id)
+        except OSError:
+            return None
+
+    def _chat_file_path(self, file_id: str) -> str | None:
+        """§draw: fileId → абсолютный путь файла в хранилище чата (для Read)."""
+        if not file_id or not file_id.isalnum():
+            return None
+        files_dir = self._config.chats_dir / self.meta.chatId / "files"
+        try:
+            matches = sorted(files_dir.glob(f"{file_id}__*")) \
+                if files_dir.exists() else []
+        except OSError:
+            return None
+        return str(matches[0]) if matches else None
 
     # §handlers Ф-2: тонкие обёртки над реестром ручек (data_dir/handlers.json).
     def _handler_register(self, name: str, script: str,

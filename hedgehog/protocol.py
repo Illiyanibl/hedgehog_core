@@ -59,6 +59,9 @@ class UserMsgPayload(_Payload):
     attachments: list[Attachment] = Field(default_factory=list)
     # Метка отправителя для user_msg_echo (§4.15): "tg", "cli", "cron", ...
     sender: str | None = None
+    # §draw: id view, чью сохранённую разметку подложить в промпт (скриншот +
+    # координаты + HTML окна). None — обычное сообщение без рисунка.
+    draw_view_id: str | None = None
 
 
 class PermissionResponsePayload(_Payload):
@@ -104,6 +107,31 @@ class UiCallPayload(_Payload):
     name: str = Field(min_length=1)
     args: str = "{}"
     callId: str = Field(min_length=1)
+
+
+# §draw: разметка поверх окна (рисунок пользователя → Claude).
+
+class UiNewBlankPayload(_Payload):
+    """§draw: пользователь нажал ＋ — создать пустое белое §views-окно (холст)."""
+    title: str = "Пустой холст"
+
+
+class UiDrawApplyPayload(_Payload):
+    """§draw: «Применить» — сохранить рисунок на view. figures — raw-JSON строка
+    [[{x,y}, …], …] (одна фигура = одно движение). width/height — размер вью в
+    CSS-px (для маппинга на HTML). image_id — fileId загруженного скриншота
+    (снимок webview + рисунок), пусто — без картинки."""
+    view_id: str = Field(min_length=1)
+    width: float = 0
+    height: float = 0
+    figures: str = "[]"
+    image_id: str = ""
+    image_name: str = "drawing.png"
+
+
+class UiDrawClearPayload(_Payload):
+    """§draw: «Очистить/Стереть» — снять рисунок с view."""
+    view_id: str = Field(min_length=1)
 
 
 class PtyWritePayload(_Payload):
@@ -246,6 +274,10 @@ CLIENT_FRAME_TYPES: dict[str, tuple[type[_Payload], bool]] = {
     "ui_closed": (EmptyPayload, True),
     # §handlers Ф-2: окно зовёт серверную ручку (детерминированно, без агента)
     "ui_call": (UiCallPayload, True),
+    # §draw: разметка поверх окна (пустой холст / сохранить / очистить)
+    "ui_new_blank": (UiNewBlankPayload, True),
+    "ui_draw_apply": (UiDrawApplyPayload, True),
+    "ui_draw_clear": (UiDrawClearPayload, True),
     "pty_write": (PtyWritePayload, True),
     "pty_resize": (PtyResizePayload, True),
     "subscribe_chat": (EmptyPayload, True),
