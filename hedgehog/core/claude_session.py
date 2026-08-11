@@ -283,10 +283,10 @@ class ClaudeSession:
 
         @tool(
             "attach_file",
-            "Отправить файл ПОЛЬЗОВАТЕЛЮ в текущий чат — он появится карточкой, "
-            "которую можно открыть/сохранить. Вызывай после генерации файла "
-            "(PDF, изображение, документ и т.п.). path — абсолютный путь или "
-            "относительно рабочей папки.",
+            "Send a file to the USER in the current chat — it appears as a card "
+            "they can open/save. Call this after generating a file "
+            "(PDF, image, document, etc.). path — absolute path or "
+            "relative to the working directory.",
             {"path": str},
         )
         async def attach_file(args: dict[str, Any]) -> dict[str, Any]:
@@ -295,61 +295,62 @@ class ClaudeSession:
 
         @tool(
             "ask_ui",
-            "Показать ПОЛЬЗОВАТЕЛЮ интерактивное окно (WebView) в чате и ДОЖДАТЬСЯ "
-            "его действия. Телефон рендерит HTML сам, локально, без сети. "
-            "\n\nHTML — ПОЛНЫЙ самодостаточный документ (inline CSS/JS, без "
-            "внешних ресурсов). Делай НАСТОЯЩИЕ мини-приложения со своим "
-            "состоянием и логикой в JS: игры, тренажёры, счётчики, формы, кнопки, "
-            "рисовалки. Пример: тренажёр пар слов (рус-англ) со СЧЁТЧИКОМ "
-            "верно/неверно сверху — вся логика матчинга и счёт в JS страницы, а "
-            "не через вопросы. Тёмная тема, крупные тач-цели.\n\n"
-            "СВЯЗЬ С ТОБОЙ: в HTML вызывай `hedgehog.submit(data)` — data (строка "
-            "или JSON) вернётся как результат этого инструмента, разблокировав "
-            "тебя. Окно ОСТАЁТСЯ ОТКРЫТЫМ: следующий вызов ask_ui ЗАМЕНЯЕТ его "
-            "содержимое (то же окно, без мигания).\n\n"
-            "ЖИВОЙ ЦИКЛ (реагируй на каждое действие): если нужно отвечать на "
-            "КАЖДОЕ нажатие своим контентом — зацикли: покажи ask_ui → пользователь "
-            "нажал → submit вернул тебе событие → ты придумал НОВЫЙ контент → снова "
-            "ask_ui, и так пока пользователь не закроет окно (тогда вернётся пустая "
-            "строка — заверши). Пример: большая красная кнопка; на каждый клик ты "
-            "сам придумываешь новую шутку про красную кнопку и показываешь её тем "
-            "же ask_ui. title — короткий заголовок окна.",
+            "Show the USER an interactive window (WebView) in the chat and WAIT "
+            "for their action. The phone renders the HTML itself, locally, offline. "
+            "\n\nHTML — a COMPLETE self-contained document (inline CSS/JS, no "
+            "external resources). Build REAL mini-apps with their own "
+            "state and logic in JS: games, trainers, counters, forms, buttons, "
+            "drawing tools. Example: a word-pair trainer (e.g. two languages) with a "
+            "correct/incorrect COUNTER on top — all matching logic and the score live "
+            "in the page's JS, not via questions. Dark theme, large touch targets.\n\n"
+            "LINK BACK TO YOU: in the HTML call `hedgehog.submit(data)` — data (a "
+            "string or JSON) is returned as the result of this tool, unblocking "
+            "you. The window STAYS OPEN: the next ask_ui call REPLACES its "
+            "content (same window, no flicker).\n\n"
+            "LIVE LOOP (react to every action): if you need to respond to "
+            "EVERY tap with your own content — loop it: show ask_ui → the user "
+            "taps → submit returns the event to you → you come up with NEW content → "
+            "ask_ui again, and so on until the user closes the window (then an empty "
+            "string is returned — finish). Example: a big red button; on each click you "
+            "come up with a new joke about the red button and show it via the "
+            "same ask_ui. title — a short window title.",
             {"html": str, "title": str},
         )
         async def ask_ui(args: dict[str, Any]) -> dict[str, Any]:
             answer = await session._ask_ui(
                 str(args.get("html", "")),
-                str(args.get("title", "") or "Интерактив"))
+                str(args.get("title", "") or "Interactive"))
             return {"content": [{"type": "text", "text": answer}]}
 
         @tool(
             "ui_open",
-            "Открыть ПОСТОЯННОЕ интерактивное окно (WebView) в чате и СРАЗУ "
-            "вернуть управление (НЕ блокирует ход). Окно живёт, пока не закроешь "
-            "(ui_close) или пользователь. Действия пользователя приходят "
-            "АСИНХРОННО: в HTML вызывай `hedgehog.notify(data)` — это прилетит "
-            "тебе как ОБЫЧНОЕ сообщение в чат, и ты отреагируешь чем угодно "
-            "(текст в чат, bash, docker, любой инструмент) и/или обновишь окно "
-            "через ui_update. Локальные эффекты (сменить цвет и т.п.) делай "
-            "прямо в JS без notify. Пример: мышь с кнопкой на хвосте — по клику "
-            "JS красит мышь + notify('нажата кнопка') → ты пишешь факт о мышах в "
-            "чат. Или красная кнопка → notify('разверни случайный контейнер') → "
-            "ты выполняешь это. Есть и `hedgehog.submit(data)`, но он для "
-            "блокирующего ask_ui; для постоянного окна используй notify. html — "
-            "самодостаточный документ; title — заголовок окна. "
-            "\n\nSDK в окне (пред-паттерн, не изобретай своё): "
-            "`hedgehog.notify(data)` — событие → твой ход; "
-            "`hedgehog.action(id, data)` — именованное действие (роутишь по id); "
-            "`hedgehog.chat(text)` — текст прямо в чат; "
-            "`hedgehog.open(url)` — открыть ссылку в системном браузере. "
-            "Общее состояние между окнами/чатами — инструменты kv_set/kv_get "
-            "(напр. счётчик мыши). allow_external=true → окну РАЗРЕШЕНА внешняя "
-            "сеть (встроить YouTube/сайт в iframe); по умолчанию офлайн-песочница.",
+            "Open a PERSISTENT interactive window (WebView) in the chat and "
+            "return control IMMEDIATELY (does NOT block the turn). The window lives "
+            "until you close it (ui_close) or the user does. User actions arrive "
+            "ASYNCHRONOUSLY: in the HTML call `hedgehog.notify(data)` — it arrives "
+            "to you as a REGULAR chat message, and you can react with anything "
+            "(text in chat, bash, docker, any tool) and/or update the window "
+            "via ui_update. Do local effects (change color, etc.) "
+            "right in the JS without notify. Example: a mouse with a button on its "
+            "tail — on click the JS colors the mouse + notify('button pressed') → you "
+            "write a fact about mice in the chat. Or a red button → notify('spin up a "
+            "random container') → you do it. There's also `hedgehog.submit(data)`, but "
+            "that's for the blocking ask_ui; for a persistent window use notify. html — "
+            "a self-contained document; title — the window title. "
+            "\n\nSDK inside the window (a ready-made pattern, don't invent your own): "
+            "`hedgehog.notify(data)` — event → your turn; "
+            "`hedgehog.action(id, data)` — a named action (you route by id); "
+            "`hedgehog.chat(text)` — text straight to the chat; "
+            "`hedgehog.open(url)` — open a link in the system browser. "
+            "Shared state across windows/chats — the kv_set/kv_get tools "
+            "(e.g. a mouse counter). allow_external=true → the window is ALLOWED "
+            "external network (embed YouTube/a site in an iframe); by default it's an "
+            "offline sandbox.",
             {"html": str, "title": str, "allow_external": bool},
         )
         async def ui_open(args: dict[str, Any]) -> dict[str, Any]:
             html = str(args.get("html", ""))
-            title = str(args.get("title", "") or "Интерактив")
+            title = str(args.get("title", "") or "Interactive")
             allow_external = bool(args.get("allow_external", False))
             # §views: сперва фиксируем окно в реестре (получаем стабильный id),
             # затем пушим — чтобы клиент СРАЗУ знал view_id (для §draw).
@@ -366,16 +367,16 @@ class ClaudeSession:
                 "kind": "app",
             })
             return {"content": [{"type": "text", "text":
-                f"Окно открыто (view_id={vid}). Меняй содержимое через "
-                "ui_update (тот же title в ui_open тоже обновит это окно), "
-                "закрой ui_close. Действия из окна — hedgehog.notify/action/"
-                "chat/open. Данные из БД — handler_register + hedgehog.call "
-                "(ручка сразу привяжется к этому окну). Состояние — kv_set/get."}]}
+                f"Window opened (view_id={vid}). Change its content via "
+                "ui_update (the same title in ui_open also updates this window), "
+                "close it with ui_close. Actions from the window — hedgehog.notify/"
+                "action/chat/open. Data from a DB — handler_register + hedgehog.call "
+                "(the handler binds to this window right away). State — kv_set/get."}]}
 
         @tool(
             "ui_update",
-            "Заменить содержимое ОТКРЫТОГО окна (ui_open) новым HTML — телефон "
-            "перерисует тот же WebView. html — полный самодостаточный документ.",
+            "Replace the content of an OPEN window (ui_open) with new HTML — the "
+            "phone redraws the same WebView. html — a complete self-contained document.",
             {"html": str},
         )
         async def ui_update(args: dict[str, Any]) -> dict[str, Any]:
@@ -390,7 +391,7 @@ class ClaudeSession:
             if src is None:
                 hist = snap.get("history") or []
                 src = hist[0] if hist and isinstance(hist[0], dict) else {}
-            title = src.get("title", "Интерактив")
+            title = src.get("title", "Interactive")
             kind = src.get("kind", "app")
             allow_ext = bool(src.get("allow_external", False))
             # reuse-by-title → стабильный id (у current сохраняется kind).
@@ -401,23 +402,23 @@ class ClaudeSession:
                 "html": html, "title": title, "persistent": True,
                 "allow_external": allow_ext, "view_id": vid, "kind": kind,
             })
-            return {"content": [{"type": "text", "text": "Окно обновлено."}]}
+            return {"content": [{"type": "text", "text": "Window updated."}]}
 
         @tool(
             "ui_close",
-            "Закрыть открытое интерактивное окно (ui_open).",
+            "Close the open interactive window (ui_open).",
             {},
         )
         async def ui_close(args: dict[str, Any]) -> dict[str, Any]:
             await session._publish("ui_close", {})
             session._view_close()   # §views: явное закрытие → в историю чата
-            return {"content": [{"type": "text", "text": "Окно закрыто."}]}
+            return {"content": [{"type": "text", "text": "Window closed."}]}
 
         @tool(
             "ui_current",
-            "Узнать, какое интерактивное окно (view) сейчас запущено в ЭТОМ "
-            "чате и список недавно закрытых (id + заголовок). Переоткрыть "
-            "закрытое можно через ui_reopen(id).",
+            "Find out which interactive window (view) is currently running in THIS "
+            "chat and a list of recently closed ones (id + title). You can reopen "
+            "a closed one via ui_reopen(id).",
             {},
         )
         async def ui_current(args: dict[str, Any]) -> dict[str, Any]:
@@ -427,10 +428,10 @@ class ClaudeSession:
                 except (TypeError, ValueError):
                     return "?"
                 if d < 60:
-                    return f"{max(d, 0)}с назад"
+                    return f"{max(d, 0)}s ago"
                 if d < 3600:
-                    return f"{d // 60}мин назад"
-                return f"{d // 3600}ч назад"
+                    return f"{d // 60}min ago"
+                return f"{d // 3600}h ago"
 
             snap = session._view_snapshot()
             cur = snap.get("current")
@@ -439,63 +440,63 @@ class ClaudeSession:
                 # rev — «версия пуша»: сколько раз окно пушилось (ui_open/update/
                 # reopen). Растёт при каждом пуше сервера в это окно.
                 dr = cur.get("drawing")
-                mark = (f", разметка: {len(dr.get('figures') or [])} фигур "
+                mark = (f", drawing: {len(dr.get('figures') or [])} figures "
                         "(ui_drawing)") if isinstance(dr, dict) else ""
                 lines.append(
-                    f"Запущено сейчас: «{cur.get('title', '')}» "
+                    f"Running now: «{cur.get('title', '')}» "
                     f"(id={cur.get('id', '')}, rev {cur.get('rev', 1)}, "
-                    f"обновлено {_ago(cur.get('updated_at'))}{mark}).")
+                    f"updated {_ago(cur.get('updated_at'))}{mark}).")
             else:
-                lines.append("Открытого окна сейчас нет.")
+                lines.append("No window is open right now.")
             hist = snap.get("history") or []
             if hist:
-                lines.append("Закрытые (можно ui_reopen):")
+                lines.append("Closed (can ui_reopen):")
                 for h in hist:
                     if isinstance(h, dict):
                         lines.append(f"  • id={h.get('id', '')} — "
                                      f"«{h.get('title', '')}»")
             else:
-                lines.append("История закрытых пуста.")
+                lines.append("Closed history is empty.")
             # §handlers: заодно показываем зарегистрированные ручки чата.
             recs = session._handler_list()
             if recs:
-                lines.append("Ручки (hedgehog.call):")
+                lines.append("Handlers (hedgehog.call):")
                 for r in recs:
                     lines.append(f"  • {r['name']} → {r.get('script', '')}"
-                                 + (f" (окно {r['view_id']})"
+                                 + (f" (window {r['view_id']})"
                                     if r.get("view_id") else ""))
             return {"content": [{"type": "text", "text": "\n".join(lines)}]}
 
         @tool(
             "ui_reopen",
-            "Переоткрыть ранее закрытое (или текущее) окно по id из ui_current "
-            "— сервер заново покажет сохранённый HTML БЕЗ пересборки. "
-            "id — идентификатор записи view.",
+            "Reopen a previously closed (or current) window by id from ui_current "
+            "— the server shows the saved HTML again WITHOUT rebuilding it. "
+            "id — the identifier of the view record.",
             {"id": str},
         )
         async def ui_reopen(args: dict[str, Any]) -> dict[str, Any]:
             rec = session._view_reopen(str(args.get("id", "")))
             if not rec:
                 return {"content": [{"type": "text", "text":
-                    "Нет view с таким id (см. ui_current)."}]}
+                    "No view with that id (see ui_current)."}]}
             await session._publish("ui_request", {
                 "html": rec.get("html", ""),
-                "title": rec.get("title", "Интерактив"),
+                "title": rec.get("title", "Interactive"),
                 "persistent": True,
                 "allow_external": bool(rec.get("allow_external", False)),
                 "view_id": rec.get("id", ""),
                 "kind": rec.get("kind", "app"),
             })
             return {"content": [{"type": "text", "text":
-                f"Окно «{rec.get('title', '')}» снова открыто."}]}
+                f"Window «{rec.get('title', '')}» is open again."}]}
 
         @tool(
             "ui_drawing",
-            "Прочитать РАЗМЕТКУ пользователя на окне (§draw): скриншот webview с "
-            "его рисунком (обязательно посмотри его Read'ом — на нём видно, что "
-            "подчёркнуто/обведено поверх реального состояния), координаты фигур "
-            "(CSS-px) и размер вью. view_id необязателен — по умолчанию текущее "
-            "окно. Так ты понимаешь правки даже при анимации/данных из БД.",
+            "Read the user's DRAWING on a window (§draw): a webview screenshot with "
+            "their drawing (be sure to view it with Read — it shows what is "
+            "underlined/circled over the real state), the figure coordinates "
+            "(CSS-px) and the view size. view_id is optional — defaults to the current "
+            "window. This lets you understand the edits even with animation/DB data.",
             {"view_id": str},
         )
         async def ui_drawing(a: dict[str, Any]) -> dict[str, Any]:
@@ -507,18 +508,18 @@ class ClaudeSession:
             dr = (view or {}).get("drawing")
             if not isinstance(dr, dict):
                 return {"content": [{"type": "text", "text":
-                    "На этом окне разметки нет."}]}
+                    "This window has no drawing."}]}
             figs = dr.get("figures") or []
-            parts = [f"Разметка на «{view.get('title', '')}» (view_id={vid}): "
-                     f"{len(figs)} фигур, размер вью {dr.get('size', {})}."]
+            parts = [f"Drawing on «{view.get('title', '')}» (view_id={vid}): "
+                     f"{len(figs)} figures, view size {dr.get('size', {})}."]
             img = session._chat_file_path(dr.get("image", ""))
             if img:
-                parts.append(f"Скриншот с рисунком (посмотри Read'ом): {img}")
-            parts.append("Координаты фигур (CSS-px, порядок рисования): "
+                parts.append(f"Screenshot with the drawing (view it with Read): {img}")
+            parts.append("Figure coordinates (CSS-px, drawing order): "
                          + json.dumps(figs, ensure_ascii=False)[:2000])
             if view.get("kind") != "blank":
-                parts.append("Окно-приложение — правь его HTML под разметку "
-                             "(HTML есть у тебя из ui_open/ui_current).")
+                parts.append("This is an app window — edit its HTML to match the "
+                             "drawing (you have the HTML from ui_open/ui_current).")
             return {"content": [{"type": "text", "text": "\n".join(parts)}]}
 
         # §handlers Ф-2: серверные «ручки» для окон — детерминированный доступ
@@ -543,7 +544,7 @@ class ClaudeSession:
             view_id = str(args.get("view_id", "")).strip() or None
             if not name or not script:
                 return {"content": [{"type": "text", "text":
-                    "Нужны name и script."}]}
+                    "name and script are required."}]}
             # Авто-привязка к ТЕКУЩЕМУ окну, если view_id не задан — окно
             # удалят → ручка сотрётся вместе с ним.
             if view_id is None:
@@ -554,45 +555,45 @@ class ClaudeSession:
             probe = handler_runner._resolve_script(Path(session.meta.cwd), script)
             if probe is None:
                 return {"content": [{"type": "text", "text":
-                    f"Скрипт не найден или вне cwd чата: {script}"}]}
+                    f"Script not found or outside the chat cwd: {script}"}]}
             session._handler_register(name, script, view_id)
-            attach = f", привязана к окну {view_id}" if view_id else ""
+            attach = f", bound to window {view_id}" if view_id else ""
             return {"content": [{"type": "text", "text":
-                f"Ручка «{name}» → {script}{attach}. В окне: "
+                f"Handler «{name}» → {script}{attach}. In the window: "
                 f"await hedgehog.call(\"{name}\", args)."}]}
 
         @tool(
             "handler_list",
-            "Список серверных «ручек», зарегистрированных в ЭТОМ чате "
-            "(имя → скрипт, привязка к окну).",
+            "List the server handlers registered in THIS chat "
+            "(name → script, window binding).",
             {},
         )
         async def handler_list(args: dict[str, Any]) -> dict[str, Any]:
             recs = session._handler_list()
             if not recs:
                 return {"content": [{"type": "text", "text":
-                    "Ручек в этом чате нет."}]}
+                    "There are no handlers in this chat."}]}
             lines = [f"  • {r['name']} → {r.get('script', '')}"
-                     + (f" (окно {r['view_id']})" if r.get("view_id") else "")
+                     + (f" (window {r['view_id']})" if r.get("view_id") else "")
                      for r in recs]
             return {"content": [{"type": "text", "text":
-                "Ручки чата:\n" + "\n".join(lines)}]}
+                "Chat handlers:\n" + "\n".join(lines)}]}
 
         @tool(
             "handler_unregister",
-            "Удалить серверную «ручку» по имени.",
+            "Delete a server handler by name.",
             {"name": str},
         )
         async def handler_unregister(args: dict[str, Any]) -> dict[str, Any]:
             ok = session._handler_unregister(str(args.get("name", "")).strip())
             return {"content": [{"type": "text", "text":
-                "Удалена." if ok else "Нет такой ручки (см. handler_list)."}]}
+                "Deleted." if ok else "No such handler (see handler_list)."}]}
 
         @tool(
             "handler_call",
-            "Проверить ручку самому: выполнить её с аргументами и увидеть "
-            "JSON-результат (как это сделает окно через hedgehog.call). "
-            "args — JSON-объект строкой (напр. '{\"date\":\"2026-08-09\"}').",
+            "Test a handler yourself: run it with arguments and see the "
+            "JSON result (the way the window does via hedgehog.call). "
+            "args — a JSON object as a string (e.g. '{\"date\":\"2026-08-09\"}').",
             {"name": str, "args": str},
         )
         async def handler_call(a: dict[str, Any]) -> dict[str, Any]:
@@ -602,11 +603,11 @@ class ClaudeSession:
                 parsed = json.loads(raw)
             except ValueError:
                 return {"content": [{"type": "text", "text":
-                    "args должен быть JSON-объектом строкой."}]}
+                    "args must be a JSON object as a string."}]}
             rec = session._handler_get(name)
             if not rec:
                 return {"content": [{"type": "text", "text":
-                    f"Нет ручки «{name}» (см. handler_list)."}]}
+                    f"No handler «{name}» (see handler_list)."}]}
             res = await handler_runner.run(
                 session.meta.cwd, rec["script"], parsed)
             return {"content": [{"type": "text", "text":
@@ -614,8 +615,8 @@ class ClaudeSession:
 
         @tool(
             "kv_set",
-            "Сохранить значение по ключу в ОБЩЕЕ хранилище сервера (видно из ВСЕХ "
-            "чатов и окон). Для счётчиков/состояния между окнами и чатами.",
+            "Save a value under a key in the server's SHARED store (visible from ALL "
+            "chats and windows). For counters/state shared across windows and chats.",
             {"key": str, "value": str},
         )
         async def kv_set(args: dict[str, Any]) -> dict[str, Any]:
@@ -624,8 +625,8 @@ class ClaudeSession:
 
         @tool(
             "kv_get",
-            "Прочитать значение по ключу из общего хранилища сервера (пусто, если "
-            "нет).",
+            "Read a value by key from the server's shared store (empty if "
+            "not set).",
             {"key": str},
         )
         async def kv_get(args: dict[str, Any]) -> dict[str, Any]:
@@ -759,7 +760,7 @@ class ClaudeSession:
         """§ui async: действие в постоянном окне (hedgehog.notify) → полноценный
         ход агента, как обычное сообщение. Claude может делать что угодно."""
         log.info("ui.event", chat=self.meta.chatId, size=len(data or ""))
-        await self.handle_user_msg(data or "(пустое ui-событие)")
+        await self.handle_user_msg(data or "(empty ui event)")
 
     async def _ask_ui(self, html: str, title: str) -> str:
         """§ui: показать интерактивный HTML в чате и дождаться ответа юзера.
@@ -768,14 +769,14 @@ class ClaudeSession:
         data = await self._wait_answer(frame["id"], {})
         log.info("ui.answered", chat=self.meta.chatId,
                  related=frame["id"][-6:], size=len(data or ""))
-        return data or "(пользователь закрыл окно без ответа)"
+        return data or "(the user closed the window without answering)"
 
     async def _attach_file_to_chat(self, path: str) -> str:
         p = Path(path)
         if not p.is_absolute():
             p = Path(self.meta.cwd) / path
         if not p.is_file():
-            return f"файл не найден: {path}"
+            return f"file not found: {path}"
         files_dir = self._config.chats_dir / self.meta.chatId / "files"
         files_dir.mkdir(parents=True, exist_ok=True)
         file_id = new_ulid()
@@ -787,7 +788,7 @@ class ClaudeSession:
         try:
             shutil.copy2(p, dest)
         except OSError as e:
-            return f"не удалось скопировать файл: {e}"
+            return f"failed to copy file: {e}"
         size = dest.stat().st_size
         mime = mimetypes.guess_type(safe)[0] or "application/octet-stream"
         await self._publish("agent_file", {
@@ -795,7 +796,7 @@ class ClaudeSession:
         })
         log.info("agent.file_sent", chat=self.meta.chatId, file=file_id,
                  name=safe, size=size)
-        return f"файл «{safe}» отправлен пользователю в чат"
+        return f"file '{safe}' sent to the user in the chat"
 
     async def _ensure_client(self) -> ClaudeSDKClient:
         if self._client is None:

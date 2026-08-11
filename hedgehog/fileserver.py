@@ -92,9 +92,9 @@ def compose_prompt(content: str, resolved: list[dict]) -> str:
         if r["path"]:
             lines.append(f"- {r['path']} ({r['mime']}) — {r['name']}")
         else:
-            lines.append(f"- (файл {r['name']} не найден на сервере)")
-    note = ("Прикреплённые файлы (прочитай инструментом Read по абсолютному "
-            "пути):\n" + "\n".join(lines))
+            lines.append(f"- (file {r['name']} not found on the server)")
+    note = ("Attached files (read them with the Read tool by absolute "
+            "path):\n" + "\n".join(lines))
     return f"{content}\n\n{note}" if content.strip() else note
 
 

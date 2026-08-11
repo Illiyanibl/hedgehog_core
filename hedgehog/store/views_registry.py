@@ -68,7 +68,7 @@ def record_open(data_dir: Path, chat_id: str, *, title: str, html: str,
     на месте): это держит привязки ручек живыми и не плодит дубли в истории при
     повторном ui_open. Иначе — новая запись, а прежний `current` вытесняется без
     архивации (в историю копятся только явные закрытия)."""
-    title = title or "Интерактив"
+    title = title or "Interactive"
     now = time.time()
     data = _load(data_dir)
     entry = _chat(data, chat_id)

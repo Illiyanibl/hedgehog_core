@@ -47,7 +47,7 @@ async def run(cwd: str, script: str, args: object,
     cwd_path = Path(cwd)
     script_path = _resolve_script(cwd_path, script)
     if script_path is None:
-        return {"ok": False, "error": f"скрипт не найден или вне cwd: {script}"}
+        return {"ok": False, "error": f"script not found or outside cwd: {script}"}
     interp = _resolve_interpreter(cwd_path)
     payload = json.dumps(args if args is not None else {}, ensure_ascii=False)
     try:
@@ -59,7 +59,7 @@ async def run(cwd: str, script: str, args: object,
             cwd=str(cwd_path),
         )
     except OSError as e:
-        return {"ok": False, "error": f"не запустить ручку: {e}"}
+        return {"ok": False, "error": f"failed to start handler: {e}"}
     try:
         out, err = await asyncio.wait_for(
             proc.communicate(payload.encode()), timeout=timeout)
@@ -67,11 +67,11 @@ async def run(cwd: str, script: str, args: object,
         proc.kill()
         await proc.wait()
         log.warning("handler.timeout", script=script, timeout=timeout)
-        return {"ok": False, "error": f"таймаут {timeout}с"}
+        return {"ok": False, "error": f"timeout {timeout}s"}
     if len(out) > MAX_OUTPUT:
-        return {"ok": False, "error": f"ответ больше {MAX_OUTPUT} байт"}
+        return {"ok": False, "error": f"output larger than {MAX_OUTPUT} bytes"}
     if proc.returncode != 0:
-        msg = err.decode(errors="replace").strip()[:500] or f"код {proc.returncode}"
+        msg = err.decode(errors="replace").strip()[:500] or f"exit code {proc.returncode}"
         return {"ok": False, "error": msg}
     text = out.decode(errors="replace").strip()
     if not text:
@@ -79,4 +79,4 @@ async def run(cwd: str, script: str, args: object,
     try:
         return {"ok": True, "data": json.loads(text)}
     except ValueError:
-        return {"ok": False, "error": "ручка вернула не-JSON в stdout"}
+        return {"ok": False, "error": "handler returned non-JSON on stdout"}

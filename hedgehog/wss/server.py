@@ -449,7 +449,7 @@ class HedgehogServer:
             if isinstance(cur, dict) and cur.get("html"):
                 await self.hub.send_global(conn_id, make_frame("ui_request", {
                     "html": cur.get("html", ""),
-                    "title": cur.get("title", "Интерактив"),
+                    "title": cur.get("title", "Interactive"),
                     "persistent": True,
                     "allow_external": bool(cur.get("allow_external", False)),
                     "view_id": cur.get("id", ""),
@@ -571,7 +571,7 @@ class HedgehogServer:
             if rec:
                 await self.hub.publish(frame.chatId, "ui_request", {
                     "html": rec.get("html", ""),
-                    "title": rec.get("title", "Интерактив"),
+                    "title": rec.get("title", "Interactive"),
                     "persistent": True,
                     "allow_external": bool(rec.get("allow_external", False)),
                     "view_id": rec.get("id", ""),
@@ -616,7 +616,7 @@ class HedgehogServer:
                 await self.hub.send_global(conn_id, make_frame(
                     "ui_call_result",
                     {"callId": p.callId, "ok": False,
-                     "error": f"нет ручки «{p.name}»"}, frame.chatId))
+                     "error": f"no handler '{p.name}'"}, frame.chatId))
                 return
             try:
                 args_obj = json.loads(p.args or "{}")
@@ -624,7 +624,7 @@ class HedgehogServer:
                 await self.hub.send_global(conn_id, make_frame(
                     "ui_call_result",
                     {"callId": p.callId, "ok": False,
-                     "error": "args не JSON"}, frame.chatId))
+                     "error": "args not JSON"}, frame.chatId))
                 return
             res = await handler_runner.run(meta.cwd, rec["script"], args_obj)
             if res.get("ok"):
@@ -633,7 +633,7 @@ class HedgehogServer:
                                               ensure_ascii=False)}
             else:
                 payload = {"callId": p.callId, "ok": False,
-                           "error": res.get("error", "ошибка ручки")}
+                           "error": res.get("error", "handler error")}
             await self.hub.send_global(
                 conn_id, make_frame("ui_call_result", payload, frame.chatId))
             return
@@ -647,10 +647,10 @@ class HedgehogServer:
                      "<body style='margin:0;background:#ffffff;'></body></html>")
             rec = views_registry.record_open(
                 self.config.data_dir, frame.chatId,
-                title=p.title or "Пустой холст", html=blank,
+                title=p.title or "Empty canvas", html=blank,
                 persistent=True, allow_external=False, kind="blank")
             await self.hub.publish(frame.chatId, "ui_request", {
-                "html": blank, "title": rec.get("title", "Пустой холст"),
+                "html": blank, "title": rec.get("title", "Empty canvas"),
                 "persistent": True, "allow_external": False,
                 "view_id": rec.get("id", ""), "kind": "blank",
             })
@@ -726,22 +726,23 @@ class HedgehogServer:
             return ""
         figs = dr.get("figures") or []
         size = dr.get("size") or {}
-        lines = [f"§draw: пользователь нарисовал разметку поверх окна "
+        lines = [f"§draw: the user drew a marking over the window "
                  f"«{view.get('title', '')}» (view_id={view_id}). "
-                 f"Фигур: {len(figs)} (одна фигура = одно движение), "
-                 f"размер вью {size.get('w')}×{size.get('h')} CSS-px."]
+                 f"Figures: {len(figs)} (one figure = one stroke), "
+                 f"view size {size.get('w')}×{size.get('h')} CSS-px."]
         img = self._chat_file_path(chat_id, dr.get("image", ""))
         if img:
-            lines.append("Скриншот окна С рисунком (ОБЯЗАТЕЛЬНО посмотри его "
-                         "инструментом Read — на нём видно, что отмечено поверх "
-                         f"реального состояния экрана): {img}")
-        lines.append("Координаты фигур (CSS-px, в порядке рисования): "
+            lines.append("Screenshot of the window WITH the drawing (BE SURE to view "
+                         "it with the Read tool — it shows what is marked over the "
+                         f"real state of the screen): {img}")
+        lines.append("Figure coordinates (CSS-px, in drawing order): "
                      + json.dumps(figs, ensure_ascii=False)[:4000])
         if view.get("kind") != "blank":
-            lines.append("Это окно-приложение: сопоставь разметку с элементами "
-                         "и правь его HTML (ui_update / ui_open с тем же title).")
+            lines.append("This is an app window: match the drawing to the elements "
+                         "and edit its HTML (ui_update / ui_open with the same title).")
         else:
-            lines.append("Это пустой холст — пользователь рисует идею с нуля.")
+            lines.append("This is an empty canvas — the user is drawing an idea from "
+                         "scratch.")
         return "\n".join(lines)
 
     # ---------- лог приложения-клиента (§14) ----------
