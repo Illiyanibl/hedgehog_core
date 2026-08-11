@@ -128,6 +128,12 @@ class ClaudeSession:
         self._worker: asyncio.Task | None = None
         # True, пока агент обрабатывает user_msg (для get_status, §3.7c).
         self._busy = False
+        # §btw-interrupt fix: после client.interrupt() SDK-стрим остаётся
+        # рассинхронизирован на один ResultMessage (следующий receive_response
+        # подхватывает ответ ПРЕДЫДУЩЕГО хода → «ответ на прошлое»). Помечаем,
+        # чтобы воркер переподключил клиента после прерванного хода (resume по
+        # session_id сохраняет контекст, стрим стартует чистым).
+        self._needs_reconnect = False
         # related frame id → (future решения, контекст для маппинга ответа)
         self._pending: dict[str, tuple[asyncio.Future, dict]] = {}
         # Ответы, пришедшие раньше регистрации future: publish() уже отдал
@@ -197,6 +203,9 @@ class ClaudeSession:
             return
         try:
             await client.interrupt()
+            # §btw-interrupt fix: interrupt десинхронизирует стрим — после
+            # завершения прерванного хода воркер переподключит клиента.
+            self._needs_reconnect = True
             log.info("agent.interrupt", chat=self.meta.chatId)
         except Exception as e:  # noqa: BLE001
             log.warning("agent.interrupt_failed", chat=self.meta.chatId,
@@ -254,6 +263,12 @@ class ClaudeSession:
                 await self._disconnect()
             finally:
                 self._busy = False
+                # §btw-interrupt fix: прерванный ход разъехал SDK-стрим —
+                # переподключаемся, чтобы следующее сообщение получило СВОЙ
+                # ответ (иначе «ответ на прошлое»). Контекст цел (resume).
+                if self._needs_reconnect:
+                    self._needs_reconnect = False
+                    await self._disconnect()
                 await self._emit_status()  # busy→idle, когда очередь пуста
 
     @property
