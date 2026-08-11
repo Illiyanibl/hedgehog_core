@@ -380,8 +380,27 @@ class ClaudeSession:
         )
         async def ui_update(args: dict[str, Any]) -> dict[str, Any]:
             html = str(args.get("html", ""))
-            await session._publish("ui_update", {"html": html})
-            session._view_update(html)   # §views: держим current в актуальном виде
+            # §views надёжность: кадр ui_update ИГНОРИРУЕТСЯ клиентом, если окно
+            # на нём закрыто/пропало (pendingUI=nil). Поэтому пушим ui_request —
+            # его клиент показывает ВСЕГДА: открыто → перерисуется на месте (тот
+            # же webview), свёрнуто → бейдж, закрыто/пропало → покажется заново.
+            snap = session._view_snapshot()
+            cur = snap.get("current")
+            src = cur if isinstance(cur, dict) else None
+            if src is None:
+                hist = snap.get("history") or []
+                src = hist[0] if hist and isinstance(hist[0], dict) else {}
+            title = src.get("title", "Интерактив")
+            kind = src.get("kind", "app")
+            allow_ext = bool(src.get("allow_external", False))
+            # reuse-by-title → стабильный id (у current сохраняется kind).
+            rec = session._view_open(title=title, html=html,
+                                     allow_external=allow_ext, kind=kind)
+            vid = (rec or {}).get("id", "")
+            await session._publish("ui_request", {
+                "html": html, "title": title, "persistent": True,
+                "allow_external": allow_ext, "view_id": vid, "kind": kind,
+            })
             return {"content": [{"type": "text", "text": "Окно обновлено."}]}
 
         @tool(
@@ -624,13 +643,13 @@ class ClaudeSession:
     # источник правды «какое окно запущено» + история явных закрытий; на нём
     # держится детерминированный пушер переоткрытия (клиентский ui_reopen) и
     # интроспекция агентом (ui_current). Ошибки реестра не должны ронять тул.
-    def _view_open(self, *, title: str, html: str,
-                   allow_external: bool) -> dict | None:
+    def _view_open(self, *, title: str, html: str, allow_external: bool,
+                   kind: str = "app") -> dict | None:
         try:
             return views_registry.record_open(
                 self._config.data_dir, self.meta.chatId,
                 title=title, html=html, persistent=True,
-                allow_external=allow_external)
+                allow_external=allow_external, kind=kind)
         except OSError as e:
             log.warning("views.open_failed", chat=self.meta.chatId, err=str(e))
             return None
