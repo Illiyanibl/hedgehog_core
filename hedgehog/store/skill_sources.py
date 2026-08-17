@@ -69,8 +69,14 @@ class SkillSources:
     def set_default_for_new(self, source: str, on: bool) -> bool:
         data = self._load()
         if source not in data:
-            return False
-        data[source]["default_for_new"] = bool(on)
+            # §fix: встроенный/осиротевший скилл (лежит на ФС, но без git-
+            # источника в реестре) — заводим минимальную запись, иначе флаг
+            # «по умолчанию для новых чатов» не сохранялся и тумблер откатывался.
+            # skills=[source]: у одиночных групп имя источника = имя скилла.
+            data[source] = {"url": None, "skills": [source],
+                            "default_for_new": bool(on)}
+        else:
+            data[source]["default_for_new"] = bool(on)
         self._save(data)
         return True
 
