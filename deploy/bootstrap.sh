@@ -31,13 +31,57 @@ IMAGE="${HEDGEHOG_IMAGE:-ghcr.io/illiyanibl/hedgehog:latest}"
 
 log(){ echo "[bootstrap] $*"; }
 
+# --- прогресс установки (§install-progress) --------------------------------
+# Пишем ход в файлы, чтобы клиент опрашивал установку даже после разрыва SSH.
+# Каталог состояния задаёт loader через HEDGEHOG_INSTALL_STATE:
+#   progress  — строки STEP:<key>:<begin|ok|fail>
+#   log       — полный stdout/stderr (перенаправляет loader)
+#   status    — running|ok|fail
+#   result.json — JSON коннекта (на успехе)
+STATE="${HEDGEHOG_INSTALL_STATE:-}"
+CURSTEP=""
+mark(){ CURSTEP="$1"; [ -n "$STATE" ] && echo "STEP:$1:$2" >> "$STATE/progress" 2>/dev/null || true; }
+on_err(){
+  [ -n "$STATE" ] && { echo "STEP:${CURSTEP}:fail" >> "$STATE/progress" 2>/dev/null; echo fail > "$STATE/status" 2>/dev/null; }
+  log "ошибка на шаге '${CURSTEP}'"
+  return 0
+}
+trap on_err ERR
+
+# 0) DNS (§install-dns) ------------------------------------------------------
+# Явные резолверы Google + Cloudflare: часть VPS приезжает со сломанным DNS,
+# из-за чего падают apt/git/docker pull. Правим хост И docker-демон.
+mark dns begin
+log "DNS: 8.8.8.8, 8.8.4.4, 1.1.1.1 (хост + docker)"
+for ns in 8.8.8.8 8.8.4.4 1.1.1.1; do
+  grep -q "$ns" /etc/resolv.conf 2>/dev/null || echo "nameserver $ns" >> /etc/resolv.conf 2>/dev/null || true
+done
+if systemctl is-active systemd-resolved >/dev/null 2>&1; then
+  mkdir -p /etc/systemd/resolved.conf.d
+  printf '[Resolve]\nDNS=8.8.8.8 1.1.1.1 8.8.4.4\nFallbackDNS=8.8.4.4\n' \
+    > /etc/systemd/resolved.conf.d/hedgehog.conf
+  systemctl restart systemd-resolved >/dev/null 2>&1 || true
+fi
+mkdir -p /etc/docker
+if [ ! -f /etc/docker/daemon.json ]; then
+  printf '{\n  "dns": ["8.8.8.8", "1.1.1.1", "8.8.4.4"]\n}\n' > /etc/docker/daemon.json
+  # docker уже запущен (идемпотентный повтор) — применяем dns рестартом.
+  { command -v docker >/dev/null 2>&1 && systemctl restart docker >/dev/null 2>&1; } || true
+else
+  grep -q '"dns"' /etc/docker/daemon.json || log "daemon.json без dns — не трогаю чужой конфиг"
+fi
+mark dns ok
+
 # 1) apt --------------------------------------------------------------------
+mark packages begin
 log "apt update + базовые пакеты"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq ca-certificates curl git ufw openssl fail2ban >/dev/null
+mark packages ok
 
 # 2) docker (движок) --------------------------------------------------------
+mark docker begin
 if ! command -v docker >/dev/null 2>&1; then
   log "установка Docker Engine (get.docker.com)"
   curl -fsSL https://get.docker.com | sh >/dev/null
@@ -47,8 +91,10 @@ fi
 # Демон может быть не запущен (свежий docker.io) — поднимаем.
 systemctl enable --now docker >/dev/null 2>&1 || service docker start >/dev/null 2>&1 || true
 docker info >/dev/null 2>&1 || { echo "docker демон недоступен"; exit 1; }
+mark docker ok
 
 # 3) firewall ---------------------------------------------------------------
+mark firewall begin
 if command -v ufw >/dev/null 2>&1; then
   log "firewall (ufw): 22, $WS_PORT, $FILE_PORT, $APP_MIN:$APP_MAX, $CADDY_HTTP, $CADDY_HTTPS"
   ufw allow 22/tcp >/dev/null 2>&1 || true
@@ -61,6 +107,7 @@ if command -v ufw >/dev/null 2>&1; then
 else
   log "ufw нет — firewall пропущен (настрой вручную)"
 fi
+mark firewall ok
 
 # 4) IP + токен -------------------------------------------------------------
 PUBLIC_IP="${SERVER_IP:-$(curl -fsS https://api.ipify.org 2>/dev/null || true)}"
@@ -69,16 +116,21 @@ TOKEN="${HEDGEHOG_TOKEN:-$(openssl rand -hex 32)}"
 log "IP=$PUBLIC_IP, WS=$WS_PORT FILE=$FILE_PORT, токен сгенерирован"
 
 # 5) сеть + тома ------------------------------------------------------------
+mark network begin
 docker network create "$NET" >/dev/null 2>&1 || true
 for v in hedgehog-data hedgehog-apps hedgehog-caddy-data hedgehog-caddy-config; do
   docker volume create "$v" >/dev/null 2>&1 || true
 done
+mark network ok
 
 # 6) получение образа Ёжика (готовый из реестра, без сборки) ----------------
+mark image begin
 log "получение образа: $IMAGE"
 docker pull "$IMAGE"
+mark image ok
 
 # 7) контейнеры (пересоздаём идемпотентно) ----------------------------------
+mark containers begin
 log "запуск контейнеров"
 docker rm -f hedgehog hedgehog-socket-proxy hedgehog-caddy >/dev/null 2>&1 || true
 
@@ -111,8 +163,10 @@ docker run -d --name hedgehog-caddy --restart unless-stopped \
   -v "$SCRIPT_DIR/caddy/Caddyfile":/etc/caddy/Caddyfile:ro \
   -v hedgehog-caddy-data:/data -v hedgehog-caddy-config:/config \
   caddy:2.8 >/dev/null
+mark containers ok
 
 # 7.5) fail2ban -------------------------------------------------------------
+mark fail2ban begin
 # Баним перебор: SSH (парольный вход) + токен Ёжика. Реальный IP атакующего
 # Ёжик берёт из TCP-пира и пишет в auth_failures.log (том hedgehog-data → виден
 # с хоста). ВАЖНО: порты Ёжика публикует Docker, трафик идёт через FORWARD, а не
@@ -157,8 +211,10 @@ JAIL
 else
   log "fail2ban не установлен — бан перебора пропущен"
 fi
+mark fail2ban ok
 
 # 8) ждём Ёжика и считаем TLS-отпечаток -------------------------------------
+mark tls begin
 log "ждём старт Ёжика…"
 FP=""
 for _ in $(seq 1 40); do
@@ -171,9 +227,17 @@ for _ in $(seq 1 40); do
   sleep 2
 done
 [ -n "$FP" ] || log "предупреждение: TLS-отпечаток не получен (проверь: docker logs hedgehog)"
+mark tls ok
 
 # 9) JSON коннекта ----------------------------------------------------------
+CONNECT_JSON="{\"host\":\"$PUBLIC_IP\",\"ws_port\":$WS_PORT,\"file_port\":$FILE_PORT,\"token\":\"$TOKEN\",\"tls\":true,\"file_fingerprint\":\"$FP\"}"
+# §install-progress: результат + финальный статус для опроса клиентом.
+if [ -n "$STATE" ]; then
+  printf '%s\n' "$CONNECT_JSON" > "$STATE/result.json" 2>/dev/null || true
+  echo ok > "$STATE/status" 2>/dev/null || true
+fi
+# Старые маркеры оставляем (обратная совместимость / ручная отладка по SSH).
 echo "===HEDGEHOG_CONNECT_BEGIN==="
-echo "{\"host\":\"$PUBLIC_IP\",\"ws_port\":$WS_PORT,\"file_port\":$FILE_PORT,\"token\":\"$TOKEN\",\"tls\":true,\"file_fingerprint\":\"$FP\"}"
+echo "$CONNECT_JSON"
 echo "===HEDGEHOG_CONNECT_END==="
 log "готово. Клиент подключается по данным выше (WS ws://$PUBLIC_IP:$WS_PORT)."
