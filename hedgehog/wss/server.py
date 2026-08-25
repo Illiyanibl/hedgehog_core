@@ -682,12 +682,11 @@ class HedgehogServer:
             session = self.sessions.get(frame.chatId)
             resolved = False
             if isinstance(session, ClaudeSession):
-                if ftype == "permission_response":
-                    resolved = session.resolve_permission(p.related, p.decision)
-                elif ftype == "picker_response":
-                    resolved = session.resolve_picker(p.related, p.option_id)
-                else:
-                    resolved = session.resolve_ui(p.related, p.data)
+                # значение ответа зависит от типа фрейма; резолв — единый (§req).
+                value = (p.decision if ftype == "permission_response"
+                         else p.option_id if ftype == "picker_response"
+                         else p.data)
+                resolved = session.resolve(p.related, value)
             if not resolved:
                 await self.hub.send_global(conn_id, make_error(
                     Err.BAD_FRAME, f"no pending request {p.related}",

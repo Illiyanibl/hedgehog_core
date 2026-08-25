@@ -134,8 +134,8 @@ class ClaudeSession:
         # чтобы воркер переподключил клиента после прерванного хода (resume по
         # session_id сохраняет контекст, стрим стартует чистым).
         self._needs_reconnect = False
-        # related frame id → (future решения, контекст для маппинга ответа)
-        self._pending: dict[str, tuple[asyncio.Future, dict]] = {}
+        # related frame id → future ответа (round-trip request/response, §req)
+        self._pending: dict[str, asyncio.Future] = {}
         # Ответы, пришедшие раньше регистрации future: publish() уже отдал
         # фрейм в сокет, а _wait_answer ещё не выполнился (гонка при
         # мгновенном авто-ответе тестового клиента).
@@ -157,7 +157,7 @@ class ClaudeSession:
                 pass
             self._worker = None
         await self._disconnect()
-        for fut, _ in self._pending.values():
+        for fut in self._pending.values():
             if not fut.done():
                 fut.cancel()
         self._pending.clear()
@@ -211,27 +211,29 @@ class ClaudeSession:
             log.warning("agent.interrupt_failed", chat=self.meta.chatId,
                         err=repr(e))
 
-    def resolve_permission(self, related: str, decision: str) -> bool:
-        return self._resolve(related, decision)
+    async def request(self, frame_type: str, payload: dict[str, Any], *,
+                      timeout: float | None = None) -> str:
+        """Round-trip к клиенту: опубликовать *_request с уникальным id и
+        дождаться ответного фрейма (related == id). Смысловой аналог
+        acknowledgement-callback Socket.IO, но поверх нашего протокола — единый
+        путь для всех интерактивных диалогов (permission/picker/ui).
+        timeout=None → штатный permission_timeout из конфига."""
+        frame = await self._publish(frame_type, payload)
+        return await self._wait_answer(frame["id"], timeout=timeout)
 
-    def resolve_picker(self, related: str, option_id: str) -> bool:
-        return self._resolve(related, option_id)
-
-    def resolve_ui(self, related: str, data: str) -> bool:
-        """§ui: результат взаимодействия с интерактивным HTML (ask_ui)."""
-        return self._resolve(related, data)
-
-    def _resolve(self, related: str, answer: str) -> bool:
-        entry = self._pending.pop(related, None)
-        if entry is None:
+    def resolve(self, related: str, value: str) -> bool:
+        """Единая точка резолва любого round-trip (permission/picker/ui):
+        ответный фрейм несёт related == id исходного *_request. Значение
+        (decision/option_id/data) извлекает транспорт по типу фрейма."""
+        fut = self._pending.pop(related, None)
+        if fut is None:
             # Ответ обогнал регистрацию future — придержим (см. __init__).
             if len(self._early_answers) > 256:
                 self._early_answers.clear()  # мусор от битых related
-            self._early_answers[related] = answer
+            self._early_answers[related] = value
             return True
-        fut, _ = entry
         if not fut.done():
-            fut.set_result(answer)
+            fut.set_result(value)
         return True
 
     # ---------- worker ----------
@@ -780,10 +782,8 @@ class ClaudeSession:
     async def _ask_ui(self, html: str, title: str) -> str:
         """§ui: показать интерактивный HTML в чате и дождаться ответа юзера.
         Тем же round-trip, что picker/permission (_pending future)."""
-        frame = await self._publish("ui_request", {"html": html, "title": title})
-        data = await self._wait_answer(frame["id"], {})
-        log.info("ui.answered", chat=self.meta.chatId,
-                 related=frame["id"][-6:], size=len(data or ""))
+        data = await self.request("ui_request", {"html": html, "title": title})
+        log.info("ui.answered", chat=self.meta.chatId, size=len(data or ""))
         return data or "(the user closed the window without answering)"
 
     async def _attach_file_to_chat(self, path: str) -> str:
@@ -1028,11 +1028,10 @@ class ClaudeSession:
         if tool_name in self._always_allowed:
             return PermissionResultAllow()
 
-        frame = await self._publish("permission_request", {
+        decision = await self.request("permission_request", {
             "tool": tool_name,
             "input": tool_input,
         })
-        decision = await self._wait_answer(frame["id"], {})
         log.info("permission.decision", chat=self.meta.chatId,
                  tool=tool_name, decision=decision)
         if decision == "allow_always":
@@ -1056,12 +1055,11 @@ class ClaudeSession:
                 {"id": str(i), "label": opt.get("label", str(opt))}
                 for i, opt in enumerate(q.get("options") or [])
             ]
-            frame = await self._publish("picker_request", {
+            option_id = await self.request("picker_request", {
                 "question": q.get("question", ""),
                 "options": options,
                 "multi": bool(q.get("multiSelect")),
             })
-            option_id = await self._wait_answer(frame["id"], {})
             try:
                 label = options[int(option_id)]["label"]
             except (ValueError, IndexError):
@@ -1071,14 +1069,15 @@ class ClaudeSession:
         return PermissionResultAllow(
             updated_input={**tool_input, "answers": answers})
 
-    async def _wait_answer(self, related: str, ctx: dict) -> str:
+    async def _wait_answer(self, related: str, *, timeout: float | None = None) -> str:
         early = self._early_answers.pop(related, None)
         if early is not None:
             return early
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
-        self._pending[related] = (fut, ctx)
+        self._pending[related] = fut
+        to = timeout if timeout is not None else self._config.permission_timeout
         try:
-            return await asyncio.wait_for(fut, timeout=self._config.permission_timeout)
+            return await asyncio.wait_for(fut, timeout=to)
         finally:
             self._pending.pop(related, None)
 
