@@ -383,6 +383,16 @@ class HedgehogServer:
                 "mcp_response", self._mcp_tree(meta), frame.chatId))
             return
 
+        if ftype == "clear_session":
+            # §clear: сброс контекста — роняем сессию И забываем session_id CLI,
+            # чтобы следующий user_msg стартовал СВЕЖУЮ сессию без resume.
+            # Спасает «отравленный» чат (напр. залипший на 400 content-filter),
+            # минуя модель. Видимая переписка чата не трогается.
+            await self._stop_session(frame.chatId)
+            self.store.update_meta(frame.chatId, claude_session_id=None)
+            log.info("chat.context_cleared", chat=frame.chatId)
+            return
+
         if ftype == "list_mcp":
             await self.hub.send_global(conn_id, make_frame(
                 "mcp_response", self._mcp_tree(meta), frame.chatId))

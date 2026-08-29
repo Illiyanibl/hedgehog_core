@@ -312,6 +312,9 @@ CLIENT_FRAME_TYPES: dict[str, tuple[type[_Payload], bool]] = {
     "remove_neko": (EmptyPayload, False),
     # §mcp: перезапуск агента чата + управление MCP-серверами (per-chat)
     "restart_agent": (EmptyPayload, True),
+    # §clear: сброс контекста чата — забыть session_id CLI (свежая сессия на
+    # следующем user_msg). Управляющий фрейм, минует модель/фильтр.
+    "clear_session": (EmptyPayload, True),
     "list_mcp": (EmptyPayload, True),
     "add_mcp": (AddMcpPayload, True),
     "set_mcp_enabled": (SetMcpEnabledPayload, True),
