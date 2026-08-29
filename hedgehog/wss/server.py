@@ -391,6 +391,10 @@ class HedgehogServer:
             await self._stop_session(frame.chatId)
             self.store.update_meta(frame.chatId, claude_session_id=None)
             log.info("chat.context_cleared", chat=frame.chatId)
+            # Подтверждаем клиенту — он покажет заметку ТОЛЬКО по этому фрейму
+            # (иначе на старом Ёжике без хендлера был бы ложный «очищено»).
+            await self.hub.send_global(conn_id, make_frame(
+                "session_cleared", {}, frame.chatId))
             return
 
         if ftype == "list_mcp":
