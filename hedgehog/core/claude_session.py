@@ -650,12 +650,36 @@ class ClaudeSession:
             return {"content": [{"type": "text",
                                  "text": session._kv_get(str(args.get("key", "")))}]}
 
+        @tool(
+            "notify",
+            "Send the USER a notification (a banner in the app). Use when YOU "
+            "decide the user should be alerted — e.g. a long task finished, or "
+            "you need their input and they may not be watching. If the app is in "
+            "the foreground it pops up a banner; if not, it waits and arrives "
+            "when they reopen the app (nothing is lost). It also lands in their "
+            "in-app notifications list. Do NOT spam — notify only on meaningful "
+            "events. title — a short headline; body — one or two lines.",
+            {"title": str, "body": str},
+        )
+        async def notify(args: dict[str, Any]) -> dict[str, Any]:
+            title = str(args.get("title", "") or "").strip()
+            body = str(args.get("body", "") or "").strip()
+            if not title and not body:
+                return {"content": [{"type": "text", "text": "notify: empty, skipped"}]}
+            # Журналируемый фрейм (§clear-подобный путь): store-and-forward +
+            # ack бесплатно — офлайн-клиент получит на resume. id фрейма = id
+            # уведомления (клиент дедупит по нему).
+            await session._publish("notification", {"title": title, "body": body})
+            log.info("notify.sent", chat=session.meta.chatId,
+                     title=title[:40], size=len(body))
+            return {"content": [{"type": "text", "text": "notification sent"}]}
+
         return create_sdk_mcp_server(
             name="hedgehog",
             tools=[attach_file, ask_ui, ui_open, ui_update, ui_close,
                    ui_current, ui_reopen, ui_drawing,
                    handler_register, handler_list, handler_unregister,
-                   handler_call, kv_set, kv_get])
+                   handler_call, kv_set, kv_get, notify])
 
     # §views: тонкие обёртки над реестром окон (data_dir/views.json). Реестр —
     # источник правды «какое окно запущено» + история явных закрытий; на нём
