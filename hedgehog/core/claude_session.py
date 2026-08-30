@@ -143,8 +143,12 @@ class ClaudeSession:
     def __init__(self, meta: ChatMeta, publish: PublishFn,
                  send_chat_error, config: Config,
                  mcp_servers: dict[str, dict] | None = None,
-                 on_auth_required=None, on_session_id=None, on_status=None):
+                 on_auth_required=None, on_session_id=None, on_status=None,
+                 scheduler=None):
         self.meta = meta
+        # §sched: сервис планировщика/блэкборда (один на процесс) — для MCP-тулов
+        # schedule_*/remind/artifact_*. None в тестах/старых вызовах.
+        self._scheduler = scheduler
         self._publish = publish
         self._send_chat_error = send_chat_error  # (code, message) → journal+fanout
         self._config = config
@@ -719,12 +723,143 @@ class ClaudeSession:
                      title=title[:40], size=len(body))
             return {"content": [{"type": "text", "text": "notification sent"}]}
 
+        # §sched: планировщик задач ------------------------------------------
+        def _text(v: Any) -> dict:
+            return {"content": [{"type": "text", "text": str(v)}]}
+
+        @tool(
+            "schedule_add",
+            "Schedule a task in THIS chat to run later, once or on a recurring "
+            "schedule. kind: 'cron' (5-field 'm h dom month dow', server LOCAL "
+            "time), 'interval' (spec = seconds, for sub-minute repeats), or 'once' "
+            "(spec = absolute epoch seconds; for relative 'in N seconds' prefer the "
+            "`remind`/one-shot). action: 'inject_text' — send `text` into this chat "
+            "as if the user typed it (you, the agent, will then act on it) — use "
+            "for recurring agent work; or 'notify' — just show a banner/inbox item "
+            "(title+body). Returns the job id.",
+            {"kind": str, "spec": str, "action": str,
+             "text": str, "title": str, "body": str},
+        )
+        async def schedule_add(args: dict[str, Any]) -> dict[str, Any]:
+            if session._scheduler is None:
+                return _text("scheduler unavailable")
+            action = str(args.get("action", "inject_text") or "inject_text")
+            if action == "inject_text":
+                payload = {"text": str(args.get("text", "") or "")}
+            else:
+                payload = {"title": str(args.get("title", "") or ""),
+                           "body": str(args.get("body", "") or "")}
+            try:
+                jid = await session._scheduler.add_job(
+                    chat_id=session.meta.chatId,
+                    kind=str(args.get("kind", "once") or "once"),
+                    spec=str(args.get("spec", "") or ""),
+                    action=action, payload=payload, created_by="agent")
+            except Exception as e:
+                return _text(f"schedule_add failed: {e}")
+            log.info("sched.add", chat=session.meta.chatId, job=jid, action=action)
+            return _text(f"scheduled job {jid}")
+
+        @tool(
+            "remind",
+            "Remind the USER after a delay: schedules a one-shot notification "
+            "(banner + inbox) in `after` seconds. Sugar over schedule_add. "
+            "after — seconds from now; title — short headline; body — one/two lines.",
+            {"after": int, "title": str, "body": str},
+        )
+        async def remind(args: dict[str, Any]) -> dict[str, Any]:
+            if session._scheduler is None:
+                return _text("scheduler unavailable")
+            after = max(1, int(args.get("after", 0) or 0))
+            when = time.time() + after
+            try:
+                jid = await session._scheduler.add_job(
+                    chat_id=session.meta.chatId, kind="once", spec=str(when),
+                    action="notify",
+                    payload={"title": str(args.get("title", "") or ""),
+                             "body": str(args.get("body", "") or "")},
+                    created_by="agent")
+            except Exception as e:
+                return _text(f"remind failed: {e}")
+            return _text(f"reminder set in {after}s (job {jid})")
+
+        @tool("schedule_list",
+              "List scheduled tasks (jobs) of THIS chat with their id, kind, "
+              "spec, action and next run time.", {})
+        async def schedule_list(args: dict[str, Any]) -> dict[str, Any]:
+            if session._scheduler is None:
+                return _text("scheduler unavailable")
+            jobs = await session._scheduler.list_jobs(session.meta.chatId)
+            return _text(json.dumps(jobs, ensure_ascii=False))
+
+        @tool("schedule_cancel", "Cancel/delete a scheduled task of THIS chat by "
+              "its job id.", {"job_id": str})
+        async def schedule_cancel(args: dict[str, Any]) -> dict[str, Any]:
+            if session._scheduler is None:
+                return _text("scheduler unavailable")
+            ok = await session._scheduler.cancel_job(
+                str(args.get("job_id", "")), session.meta.chatId)
+            return _text("cancelled" if ok else "not found")
+
+        # §sched: блэкборд артефактов ----------------------------------------
+        @tool(
+            "artifact_put",
+            "Store a durable/large/reusable RESULT or intermediate DATA in the "
+            "chat's blackboard DB (kept OUT of context; pull back only when "
+            "needed). Prefer this over dumping big data into your reply. For small "
+            "cross-chat values use kv_set instead; for small sub-agent results just "
+            "return them. kind: 'result'|'note'|'intermediate'. summary: short "
+            "description (this is what the main agent reads). data: the payload "
+            "(large data is written to a file automatically). task_id/agent_id: "
+            "optional labels to group/filter. Returns the artifact id.",
+            {"kind": str, "summary": str, "data": str,
+             "task_id": str, "agent_id": str},
+        )
+        async def artifact_put(args: dict[str, Any]) -> dict[str, Any]:
+            if session._scheduler is None:
+                return _text("scheduler unavailable")
+            aid = await session._scheduler.put_artifact(
+                chat_id=session.meta.chatId,
+                kind=str(args.get("kind", "result") or "result"),
+                summary=str(args.get("summary", "") or ""),
+                data=str(args.get("data", "") or ""),
+                agent_id=str(args.get("agent_id", "") or ""),
+                task_id=str(args.get("task_id", "") or ""))
+            return _text(f"artifact {aid}")
+
+        @tool("artifact_get", "Read a stored artifact by id (returns summary + full "
+              "data, loading the file for large ones).", {"id": str})
+        async def artifact_get(args: dict[str, Any]) -> dict[str, Any]:
+            if session._scheduler is None:
+                return _text("scheduler unavailable")
+            row = await session._scheduler.get_artifact(str(args.get("id", "")))
+            return _text(json.dumps(row, ensure_ascii=False) if row else "not found")
+
+        @tool(
+            "artifact_list",
+            "List artifacts (summaries only, newest first) of a chat's blackboard. "
+            "Defaults to THIS chat; pass chat_id to read ANOTHER chat's blackboard "
+            "(cross-chat). Optional filters: task_id, agent_id, kind.",
+            {"chat_id": str, "task_id": str, "agent_id": str, "kind": str},
+        )
+        async def artifact_list(args: dict[str, Any]) -> dict[str, Any]:
+            if session._scheduler is None:
+                return _text("scheduler unavailable")
+            rows = await session._scheduler.list_artifacts(
+                chat_id=str(args.get("chat_id", "") or session.meta.chatId),
+                task_id=str(args.get("task_id", "") or ""),
+                agent_id=str(args.get("agent_id", "") or ""),
+                kind=str(args.get("kind", "") or ""))
+            return _text(json.dumps(rows, ensure_ascii=False))
+
         return create_sdk_mcp_server(
             name="hedgehog",
             tools=[attach_file, ask_ui, ui_open, ui_update, ui_close,
                    ui_current, ui_reopen, ui_drawing,
                    handler_register, handler_list, handler_unregister,
-                   handler_call, kv_set, kv_get, notify])
+                   handler_call, kv_set, kv_get, notify,
+                   schedule_add, remind, schedule_list, schedule_cancel,
+                   artifact_put, artifact_get, artifact_list])
 
     # §views: тонкие обёртки над реестром окон (data_dir/views.json). Реестр —
     # источник правды «какое окно запущено» + история явных закрытий; на нём

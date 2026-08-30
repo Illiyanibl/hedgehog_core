@@ -11,6 +11,7 @@ import structlog
 
 from .config import Config
 from .wss.server import HedgehogServer
+from .scheduler import SchedulerService
 from . import fileserver
 
 
@@ -34,6 +35,16 @@ async def _amain():
     config = Config()
     config.data_dir.mkdir(parents=True, exist_ok=True)
     server = HedgehogServer(config)
+    # §sched: планировщик задач + блэкборд. Колбэки замкнуты на сервер (инъекция
+    # текста / уведомление в чат). Ставим ДО старта приёма соединений.
+    scheduler = SchedulerService(
+        db_path=config.data_dir / "scheduler.db",
+        artifacts_dir=config.data_dir / "artifacts",
+        inject_cb=server.inject_message,
+        notify_cb=server.notify_chat,
+    )
+    server.scheduler = scheduler
+    await scheduler.start()
     log.info("hedgehog.start", version=config.server_version,
              data_dir=str(config.data_dir), token_file=str(config.token_file))
 

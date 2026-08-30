@@ -68,6 +68,36 @@ class HedgehogServer:
         self.hub = Hub(self.store)
         self.sessions: dict[str, ClaudeSession | PtySession] = {}
         self.auth = AuthManager(config, self._auth_broadcast)
+        # §sched: планировщик задач + блэкборд. Ставится из main.py после
+        # конструктора (нужны колбэки inject/notify, замкнутые на этот сервер).
+        self.scheduler = None
+
+    # ---------- §sched: точки входа для планировщика ----------
+
+    async def inject_message(self, chat_id: str, text: str) -> None:
+        """Инъекция текста в чат как user-сообщения (агент отвечает штатно).
+        Тот же путь, что WS user_msg: echo в ленту + handle_user_msg."""
+        text = (text or "").strip()
+        if not text:
+            return
+        meta = self.store.get(chat_id)
+        if meta is None or meta.addressee != "claude":
+            log.warning("sched.inject_skip", chat=chat_id,
+                        reason="no meta or not claude")
+            return
+        session = await self._ensure_session(meta)
+        await self.hub.publish(chat_id, "user_msg_echo", {
+            "content": text, "sender": "cron", "related": None,
+            "attachments": [], "btw": False,
+        })
+        await session.handle_user_msg(text)
+
+    async def notify_chat(self, chat_id: str, title: str, body: str) -> None:
+        """Уведомление (баннер/инбокс) в чат по расписанию — журналируемый фрейм."""
+        if self.store.get(chat_id) is None:
+            return
+        await self.hub.publish(chat_id, "notification",
+                               {"title": title or "", "body": body or ""})
 
     # ---------- запуск ----------
 
@@ -85,6 +115,8 @@ class HedgehogServer:
 
     async def shutdown(self):
         await self.auth.stop()
+        if self.scheduler is not None:
+            await self.scheduler.stop()
         for session in list(self.sessions.values()):
             await session.stop()
         self.sessions.clear()
@@ -949,7 +981,8 @@ class HedgehogServer:
                                     mcp_servers=mcp_servers,
                                     on_auth_required=self.auth.start,
                                     on_session_id=save_session_id,
-                                    on_status=self._chat_status_notifier(meta.chatId))
+                                    on_status=self._chat_status_notifier(meta.chatId),
+                                    scheduler=self.scheduler)
         else:
             session = PtySession(meta, publish, self.config)
         self.sessions[meta.chatId] = session
