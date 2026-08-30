@@ -843,6 +843,11 @@ class ClaudeSession:
                 "cwd": self.meta.cwd,
                 "can_use_tool": self._can_use_tool,
                 "stderr": self._stderr_tail.append,
+                # Дефолт SDK — 1 МБ на одно stdio-JSON сообщение. Read-tool
+                # возвращает картинку/файл base64 ОДНИМ сообщением → большое фото
+                # валило агента (AGENT_CRASH «JSON exceeded 1048576 bytes»).
+                # Поднимаем потолок; фактически аллоцируется лишь размер сообщения.
+                "max_buffer_size": 32 * 1024 * 1024,   # 32 МБ
             }
             self._stderr_tail.clear()
             # permission_mode обрабатываем САМИ в _can_use_tool, а не через
