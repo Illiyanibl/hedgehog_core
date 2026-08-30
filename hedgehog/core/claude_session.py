@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import json
 import mimetypes
+import os
 import re
 import shutil
 import time
@@ -62,6 +63,50 @@ from . import handler_runner
 from .session_base import PublishFn
 
 log = structlog.get_logger("claude_session")
+
+# §caps: путеводитель по инструментам Ёжика. Дописывается (append) к дефолтному
+# системному промпту Claude Code, НЕ заменяет его. Задача — чтобы агент в
+# ПРИОРИТЕТЕ пользовался встроенными тулами Ёжика (и пользовательскими MCP), а не
+# изобретал самодельные обходные пути (фейковые «уведомления», ручная отдача
+# файлов, curl-скрейпинг вместо браузера).
+HEDGEHOG_SYSTEM_APPEND = """\
+# Hedgehog — the environment you run in
+
+You are running inside "Hedgehog" — a self-hosted host that connects you to the
+user's app (iOS/Mac). Hedgehog gives you first-class tools to talk to the user
+and their device.
+
+PRIORITY RULE: if a task is covered by a tool below, USE THAT TOOL — do not
+improvise your own workaround. Don't print a fake "notification" as text, don't
+deliver files or send email out-of-band, and don't scrape sites with curl when a
+browser tool is available.
+
+## Hedgehog tools (namespace `mcp__hedgehog__`)
+- `notify(title, body)` — alert the user (in-app banner + inbox). Use for
+  meaningful events: a long task finished, or you need input they may not see.
+- `attach_file(...)` — send a file into the current chat as a card (this is how
+  the user receives a result file; don't invent other delivery methods).
+- `ask_ui(...)` — show an interactive window (WebView) in the chat and WAIT for
+  the result.
+- `ui_open` / `ui_update` / `ui_close` / `ui_current` / `ui_reopen` — persistent
+  interactive windows (dashboards, forms, games) in the chat.
+- `ui_drawing(...)` — read the user's drawing on a window.
+- `handler_register` / `handler_list` / `handler_unregister` / `handler_call` —
+  server-side scripts that back windows.
+- `kv_set` / `kv_get` — shared key/value store (visible across all chats/windows).
+
+## Neko browser
+If `mcp__neko_browser__*` tools are available, use THEM for web navigation and
+browser automation (clicks, forms, screenshots) instead of curl/manual parsing.
+
+## User-connected MCP servers
+The user can connect their OWN MCP servers from the app. If tools from other MCP
+servers are present and fit the task, prefer them for their domain — they are
+capabilities the user deliberately enabled.
+
+Bottom line: the user sees results through your text, `notify`, `attach_file` and
+UI windows — keep the interaction inside Hedgehog's tools.
+"""
 
 # Маркеры auth-ошибок SDK/CLI (логаут, протухший/отозванный токен) —
 # такие падения классифицируются как AUTH_REQUIRED, а не AGENT_CRASH.
@@ -848,6 +893,13 @@ class ClaudeSession:
                 # валило агента (AGENT_CRASH «JSON exceeded 1048576 bytes»).
                 # Поднимаем потолок; фактически аллоцируется лишь размер сообщения.
                 "max_buffer_size": 32 * 1024 * 1024,   # 32 МБ
+                # §caps: дополняем (НЕ заменяем) дефолтный Claude Code промпт
+                # путеводителем по тулам Ёжика — приоритет встроенным тулам.
+                "system_prompt": {
+                    "type": "preset",
+                    "preset": "claude_code",
+                    "append": HEDGEHOG_SYSTEM_APPEND,
+                },
             }
             self._stderr_tail.clear()
             # permission_mode обрабатываем САМИ в _can_use_tool, а не через
@@ -893,6 +945,16 @@ class ClaudeSession:
                 oauth = self._config.load_oauth_token()
                 if oauth:
                     env["CLAUDE_CODE_OAUTH_TOKEN"] = oauth
+            # §tool-search (progressive disclosure): при большом числе MCP-тулов
+            # (напр. чат с браузером neko ~40 тулов) CLI откладывает их схемы из
+            # начального списка и подгружает по требованию через tool-search —
+            # контекст чат-агента остаётся лёгким, тулы вызываются НАТИВНО.
+            #   auto/auto:N — CLI сам решает по порогу (малые наборы не трогает);
+            #   on/true     — всегда откладывать MCP; off/100 — выключить (как было).
+            # Тюнится через env Ёжика HEDGEHOG_TOOL_SEARCH; дефолт "auto".
+            ts_mode = os.environ.get("HEDGEHOG_TOOL_SEARCH", "auto").strip()
+            if ts_mode and ts_mode.lower() != "off":
+                env["ENABLE_TOOL_SEARCH"] = ts_mode
             if env:
                 opts["env"] = env
             # Resume контекста: CLI хранит сессии на диске, meta.json помнит
