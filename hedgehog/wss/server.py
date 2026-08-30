@@ -46,10 +46,16 @@ from ..core import handler_runner
 from ..store.skill_sources import SkillSources, SkillInstallError
 from .. import fileserver
 from .. import authlog
+from .. import updater
 
 log = structlog.get_logger("wss")
 
 WS_PATH = "/v1/connect"
+
+# §update: короткий SHA HEAD этого процесса — клиент сравнивает его с последним
+# коммитом репозитория (GitHub) и предлагает «Обновить». Меняется только при
+# рестарте после update_self (git reset --hard), поэтому кэшируем один раз.
+_SERVER_COMMIT = updater.current_sha()
 
 
 class HedgehogServer:
@@ -112,6 +118,7 @@ class HedgehogServer:
         try:
             await self.hub.send_global(conn_id, make_frame("hello", {
                 "server_version": self.config.server_version,
+                "server_commit": _SERVER_COMMIT,   # §update: HEAD для сверки с репо
                 "supported_v": list(self.config.protocol_versions),
                 "capabilities": list(self.config.capabilities),
             }))
