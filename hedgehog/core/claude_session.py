@@ -1214,6 +1214,69 @@ class ClaudeSession:
                 await self._on_auth_required()
             # Клиент бесполезен без логина; свежий — на следующий user_msg.
             await self._disconnect()
+        else:
+            # §resync: авто-починка «ответ на прошлое». Если сессия была
+            # рассинхронизирована (редкая порча стрима — переживает рестарт через
+            # resume), receive_response выше отдал ЛИШНИЙ ответ, а НАСТОЯЩИЙ ответ
+            # этого хода застрял в трубе. Дочитываем и ДОСЫЛАЕМ его в чат,
+            # выравнивая трубу. В синхроне — no-op (первый месседж не приходит).
+            await self._drain_and_deliver(client)
+
+    async def _drain_and_deliver(self, client) -> int:
+        """§resync: вычитать из трубы ЗАСТРЯВШИЕ ответы (десинк) и досылать их в
+        чат обычными фреймами, выравнивая поток. Первый месседж ждём КОРОТКО:
+        застрявший ответ уже в буфере (приходит мгновенно), а в синхроне трубе
+        нечего отдавать → таймаут → 0 доставок (no-op, ~0.5с на ход). Возвращает
+        число досланных застрявших ответов."""
+        delivered = 0
+        for _ in range(6):                       # предохранитель от бесконечного цикла
+            gen = client.receive_response()
+            agent_msg_id = new_ulid()
+            last_result: ResultMessage | None = None
+            got = False
+            timeout = 0.5                         # короткий — только на ПЕРВЫЙ месседж
+            try:
+                while True:
+                    msg = await asyncio.wait_for(gen.__anext__(), timeout)
+                    got = True
+                    timeout = 45.0                # дальше дочитываем ответ спокойно
+                    if isinstance(msg, AssistantMessage):
+                        for block in msg.content:
+                            if isinstance(block, TextBlock):
+                                await self._publish("text_delta", {
+                                    "delta": block.text, "agent_msg_id": agent_msg_id})
+                            elif isinstance(block, ToolUseBlock):
+                                await self._publish("tool_use", {
+                                    "tool_use_id": block.id, "tool": block.name,
+                                    "input": block.input})
+                    elif isinstance(msg, UserMessage):
+                        content = msg.content if isinstance(msg.content, list) else []
+                        for block in content:
+                            if isinstance(block, ToolResultBlock):
+                                await self._publish("tool_result", {
+                                    "tool_use_id": block.tool_use_id,
+                                    "output": _result_text(block.content),
+                                    "is_error": bool(block.is_error)})
+                    elif isinstance(msg, ResultMessage):
+                        last_result = msg
+                        if msg.session_id:
+                            self._set_session_id(msg.session_id)
+                        break
+            except (asyncio.TimeoutError, StopAsyncIteration):
+                pass
+            if not got:
+                break                             # труба пуста → синхрон, выходим
+            if last_result is not None:
+                usage = last_result.usage or {}
+                await self._publish("agent_done", {
+                    "result": last_result.result or "",
+                    "usage": {"input_tokens": usage.get("input_tokens", 0),
+                              "output_tokens": usage.get("output_tokens", 0)}})
+            delivered += 1
+        if delivered:
+            log.warning("resync.delivered_leftover", chat=self.meta.chatId,
+                        count=delivered)
+        return delivered
 
     # ---------- permission / picker (SDK callback) ----------
 
