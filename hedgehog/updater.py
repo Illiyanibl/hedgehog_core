@@ -20,10 +20,17 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-# git fetch к GitHub изредка троттлится на анонимном HTTPS (rate-limit отдаёт
-# не-протокольный ответ → git не парсит его и в отчаянии просит логин:
-# «could not read Username» / «expected flush after ref listing»). Повторяем
-# с нарастающей паузой — переживаем транзиентные сбои/лимиты.
+# Ёжик обновляется ТОЛЬКО с публичного репозитория. Часть серверов была
+# склонирована с приватного git.insapp.pro (токен в /root/.git-credentials —
+# фактически дыра: root читает секрет к приватному git). Токен протух → git
+# fetch отдавал HTTP 401. Публичный github токена не требует: на каждом апдейте
+# перецеливаем origin сюда и тянем АНОНИМНО (credential.helper пустой) — 401
+# и утечка токена исключены by design.
+_PUBLIC_REMOTE = "https://github.com/Illiyanibl/hedgehog_core.git"
+
+# git fetch по HTTPS изредка спотыкается (HTTP/2-фрейминг git↔GitHub, разовые
+# сетевые сбои) → git не парсит ответ и просит логин («could not read Username»
+# / «expected flush after ref listing»). Повторяем с нарастающей паузой.
 _FETCH_BACKOFF = (1.5, 4.0, 9.0)   # паузы между попытками; попыток = len+1
 
 
@@ -52,20 +59,35 @@ def _run(args: list[str], cwd: Path) -> tuple[int, str]:
 def _fetch(root: Path, branch: str) -> tuple[int, str]:
     """git fetch к origin с ретраями (см. _FETCH_BACKOFF).
 
-    http.version=HTTP/1.1: git 2.43 по HTTP/2 к GitHub изредка спотыкается на
-    фрейминге ответа («fatal: expected flush after ref listing» + запрос логина),
-    хотя curl тот же URL тянет нормально. Форс HTTP/1.1 убирает этот флап (curl-
-    транспорт HTTP/1.1 у git стабилен). Ретрай добивает разовые сетевые сбои."""
+    credential.helper= (пустой) — НЕ слать никакой stored-токен: репозиторий
+    публичный, тянем анонимно, протухший приватный токен не даёт 401.
+    http.version=HTTP/1.1 — git по HTTP/2 к GitHub изредка спотыкается на
+    фрейминге ответа («expected flush after ref listing»); форс 1.1 убирает флап.
+    Ретрай добивает разовые сетевые сбои."""
     code, out = 1, ""
     for i in range(len(_FETCH_BACKOFF) + 1):
         code, out = _run(
-            ["git", "-c", "http.version=HTTP/1.1",
+            ["git", "-c", "credential.helper=", "-c", "http.version=HTTP/1.1",
              "fetch", "--depth", "1", "origin", branch], root)
         if code == 0:
             return 0, out
         if i < len(_FETCH_BACKOFF):
             time.sleep(_FETCH_BACKOFF[i])
     return code, out
+
+
+def _ensure_public_origin(root: Path) -> str | None:
+    """Перецелить origin на публичный репозиторий, если он смотрит в другое место
+    (старый провижининг клонировал приватный git.insapp.pro). Идемпотентно.
+    Возвращает прежний URL, если менялся, иначе None — для сообщения апдейта."""
+    code, url = _run(["git", "remote", "get-url", "origin"], root)
+    if code != 0:
+        return None
+    url = url.strip()
+    if url == _PUBLIC_REMOTE:
+        return None
+    _run(["git", "remote", "set-url", "origin", _PUBLIC_REMOTE], root)
+    return url
 
 
 def repo_root() -> Path | None:
@@ -112,8 +134,12 @@ def pull_latest() -> UpdateResult:
     req = _requirements(root)
     req_before = req.read_bytes() if req else b""
 
-    # fetch + hard reset — работает и на shallow (--depth 1) клоне.
-    # _fetch ретраит троттлинг анонимного HTTPS (см. _FETCH_BACKOFF).
+    # «Ссылаться только на публичный»: перецеливаем origin на публичный github,
+    # если он смотрел на приватный источник (старый провижининг).
+    repointed = _ensure_public_origin(root)
+
+    # fetch + hard reset — работает и на shallow (--depth 1) клоне. _fetch тянет
+    # АНОНИМНО (без stored-токена), с HTTP/1.1 и ретраями.
     code, out = _fetch(root, branch)
     if code != 0:
         return UpdateResult(ok=False, old=old, message=f"git fetch: {out[-300:]}")
@@ -133,6 +159,8 @@ def pull_latest() -> UpdateResult:
                                 message=f"pip install: {out[-300:]}")
 
     msg = f"обновлено {old} → {new}" if changed else f"уже актуально ({old})"
+    if repointed:
+        msg += " · origin → публичный github"
     return UpdateResult(ok=True, changed=changed, old=old, new=new, message=msg)
 
 
