@@ -1,11 +1,16 @@
 """ClaudeSession — чат с Claude через claude-agent-sdk. Без PTY.
 
 Поток (docs/broker-audit.md, раздел «Связь с Claude Agent SDK»):
-    user_msg → ClaudeSDKClient.query() → receive_response():
+    user_msg → ClaudeSDKClient.query();  ПОСТОЯННЫЙ _reader читает
+    receive_messages() и диспетчит каждый фрейм (_dispatch):
         AssistantMessage/TextBlock  → text_delta
         AssistantMessage/ToolUseBlock → tool_use
         UserMessage/ToolResultBlock → tool_result
-        ResultMessage               → agent_done
+        ResultMessage               → agent_done (+ взвод _turn_done)
+    §reader: труба НЕ «запрос-ответ» — фоновые Task-субагенты досылают
+    продолжения и лишние ResultMessage ПОСЛЕ конца хода. Ридер читает поток
+    непрерывно, поэтому такие хвосты доезжают сразу, а не застревают до
+    следующего сообщения («ответ на прошлое»/зависший ответ).
 
 Permission-flow: SDK-callback `can_use_tool` шлёт permission_request и
 ждёт asyncio.Future, которую резолвит permission_response от клиента
@@ -177,12 +182,33 @@ class ClaudeSession:
         self._worker: asyncio.Task | None = None
         # True, пока агент обрабатывает user_msg (для get_status, §3.7c).
         self._busy = False
-        # §btw-interrupt fix: после client.interrupt() SDK-стрим остаётся
-        # рассинхронизирован на один ResultMessage (следующий receive_response
-        # подхватывает ответ ПРЕДЫДУЩЕГО хода → «ответ на прошлое»). Помечаем,
-        # чтобы воркер переподключил клиента после прерванного хода (resume по
-        # session_id сохраняет контекст, стрим стартует чистым).
-        self._needs_reconnect = False
+        # §reader (постоянный ридер трубы). Раньше _turn читал receive_response()
+        # ДО первого ResultMessage и останавливался — но труба НЕ «запрос-ответ»:
+        # фоновые Task-субагенты досылают продолжения и ЛИШНИЕ ResultMessage уже
+        # ПОСЛЕ конца хода. Они застревали в трубе до следующего чтения → «ответ
+        # на прошлое»/зависший ответ. Теперь один _reader непрерывно читает
+        # receive_messages() и публикует ВСЁ сразу; agent_done — на каждом
+        # ResultMessage. Ход ждёт свой результат через событие _turn_done.
+        self._reader: asyncio.Task | None = None
+        # Взводится ридером на каждом ResultMessage — _turn ждёт его как «ход
+        # завершён». Чистится перед каждым query().
+        self._turn_done = asyncio.Event()
+        # Причина выхода ридера (крах CLI/закрытие потока) — прокидываем в _turn,
+        # чтобы _run отработал разбор auth/crash + свежий коннект.
+        self._reader_error: BaseException | None = None
+        # ResultMessage хода отдал auth-ошибку (CLI не залогинен) — ставит
+        # диспетчер, разбирает _turn после пробуждения.
+        self._turn_auth_needed = False
+        # Группирует text_delta ОДНОГО ответа (§4.2). Ридер обновляет его после
+        # каждого ResultMessage — следующий ответ (в т.ч. фоновый хвост) идёт
+        # своей группой.
+        self._agent_msg_id = new_ulid()
+        # §reader BUG2-диагностика: счётчик ходов, ждущих результат. query()
+        # инкрементит, ResultMessage декрементит. Результат при счётчике 0 —
+        # НЕзапрошенный фоновый хвост (лишний ResultMessage субагента). Логируем
+        # его поля, чтобы найти дискриминатор query↔result для точного фикса
+        # рассинхрона тайминга (корреляции в stream-json пока нет).
+        self._awaiting_result = 0
         # related frame id → future ответа (round-trip request/response, §req)
         self._pending: dict[str, asyncio.Future] = {}
         # Ответы, пришедшие раньше регистрации future: publish() уже отдал
@@ -212,6 +238,15 @@ class ClaudeSession:
         self._pending.clear()
 
     async def _disconnect(self):
+        # §reader: сначала гасим ридер (перестаёт читать закрываемую трубу),
+        # потом рвём коннект. Свежий клиент поднимет новый ридер (_ensure_client).
+        if self._reader is not None:
+            self._reader.cancel()
+            try:
+                await self._reader
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._reader = None
         if self._client is not None:
             try:
                 await self._client.disconnect()
@@ -224,10 +259,10 @@ class ClaudeSession:
     async def handle_user_msg(self, content: str) -> bool:
         """Поставить сообщение в очередь. Всегда возвращает False.
 
-        Каждое сообщение — отдельный ход строго по очереди: воркер читает ответ
-        ПОЛНОСТЬЮ (receive_response до ResultMessage), затем берёт следующее.
-        Порядок «сообщение→ответ» гарантирован (без гонки idle-grace, которая
-        ломала старый досыл через query() в тот же ход).
+        Каждое сообщение — отдельный ход строго по очереди: воркер ждёт
+        ResultMessage хода (событие _turn_done от постоянного ридера), затем
+        берёт следующее. Порядок «сообщение→ответ» гарантирован (без гонки
+        idle-grace, которая ломала старый досыл через query() в тот же ход).
 
         §btw-interrupt (A1): если агент СЕЙЧАС занят ходом — ПРЕРЫВАЕМ текущий
         ход (client.interrupt()), чтобы досланное сообщение поехало СЛЕДУЮЩИМ
@@ -252,9 +287,11 @@ class ClaudeSession:
             return
         try:
             await client.interrupt()
-            # §btw-interrupt fix: interrupt десинхронизирует стрим — после
-            # завершения прерванного хода воркер переподключит клиента.
-            self._needs_reconnect = True
+            # §reader: реконнект после interrupt больше НЕ нужен — постоянный
+            # ридер дочитывает прерванный ход штатно (застрявшего +1 нет, это
+            # подтверждено живым тестом SDK). interrupt лишь досрочно завершает
+            # текущий ход своим ResultMessage; ридер его опубликует, _turn_done
+            # взведётся, воркер возьмёт следующее сообщение из очереди.
             log.info("agent.interrupt", chat=self.meta.chatId)
         except Exception as e:  # noqa: BLE001
             log.warning("agent.interrupt_failed", chat=self.meta.chatId,
@@ -314,12 +351,6 @@ class ClaudeSession:
                 await self._disconnect()
             finally:
                 self._busy = False
-                # §btw-interrupt fix: прерванный ход разъехал SDK-стрим —
-                # переподключаемся, чтобы следующее сообщение получило СВОЙ
-                # ответ (иначе «ответ на прошлое»). Контекст цел (resume).
-                if self._needs_reconnect:
-                    self._needs_reconnect = False
-                    await self._disconnect()
                 await self._emit_status()  # busy→idle, когда очередь пуста
 
     @property
@@ -1018,6 +1049,16 @@ class ClaudeSession:
         return f"file '{safe}' sent to the user in the chat"
 
     async def _ensure_client(self) -> ClaudeSDKClient:
+        # §reader (BUG1): ридер мог умереть при живом клиенте (битый фрейм →
+        # MessageParseError, сбой _publish/колбэка). Тогда клиент не None, но
+        # трубу никто не читает — следующий query() пройдёт, а _turn_done никто
+        # не взведёт → вечный ханг. Ловим мёртвый ридер и переподключаемся
+        # (resume по session_id сохранит контекст).
+        if self._client is not None and (
+                self._reader is None or self._reader.done()):
+            log.warning("reader.dead_client_reset", chat=self.meta.chatId,
+                        err=repr(self._reader_error))
+            await self._disconnect()
         if self._client is None:
             opts: dict = {
                 "cwd": self.meta.cwd,
@@ -1099,6 +1140,16 @@ class ClaudeSession:
                 opts["resume"] = self._resumed_from
             self._client = ClaudeSDKClient(ClaudeAgentOptions(**opts))
             await self._client.connect()
+            # §reader: единственный потребитель трубы этого клиента. Стартует
+            # сразу после connect и живёт до _disconnect.
+            self._reader_error = None
+            # Старая труба мертва — её недождавшиеся результаты уже не придут;
+            # сбрасываем счётчик ожидания, иначе крах/ретрай хода протёк бы
+            # вверх и BUG2-телеметрия недосчитала бы фоновые хвосты.
+            self._awaiting_result = 0
+            self._reader = asyncio.create_task(
+                self._reader_loop(self._client),
+                name=f"reader:{self.meta.chatId}")
             log.info("sdk.connected", chat=self.meta.chatId, cwd=self.meta.cwd,
                      resume=self._resumed_from,
                      mcp=list(self._mcp_servers),
@@ -1134,77 +1185,26 @@ class ClaudeSession:
         log.info("sdk.session_id", chat=self.meta.chatId, session=sid)
 
     async def _turn(self, prompt: str):
+        """Отправить сообщение и дождаться ЕГО результата. Сам поток НЕ читаем —
+        это делает постоянный ридер (_reader_loop); он взводит _turn_done на
+        ResultMessage. Долгий ход (минуты) ждём без таймаута: сигнал — либо
+        результат, либо смерть ридера (крах CLI/закрытие трубы)."""
         client = await self._ensure_client()
+        # _reader_error НЕ трогаем здесь (BUG1-нит): его сбрасывает _ensure_client
+        # при подъёме нового ридера. Сброс тут стёр бы причину смерти ридера
+        # раньше, чем проверка живости успеет её увидеть.
+        self._turn_auth_needed = False
+        self._turn_done.clear()
+        self._awaiting_result += 1     # ждём ResultMessage этого хода (BUG2-диаг)
         await client.query(prompt)
-        agent_msg_id = new_ulid()  # группирует text_delta одного ответа (§4.2)
-        # Неавторизованный CLI не кидает исключение, а отвечает обычным
-        # результатом «Not logged in · Please run /login» (e2e 2026-07-12).
-        auth_needed = False
-
-        # §fix: receive_response() отдаёт сообщения ДО ResultMessage включительно
-        # и завершается — ход читается ПОЛНОСТЬЮ, без гонки idle-grace. Каждое
-        # сообщение = свой ход (очередь, см. handle_user_msg), поэтому ответ
-        # больше не теряется и не «сползает» под следующее сообщение.
-        last_result: ResultMessage | None = None
-        async for msg in client.receive_response():
-            if isinstance(msg, SystemMessage):
-                if msg.subtype == "init":
-                    sid = (msg.data or {}).get("session_id")
-                    if sid:
-                        self._set_session_id(sid)
-            elif isinstance(msg, AssistantMessage):
-                for block in msg.content:
-                    if isinstance(block, TextBlock):
-                        await self._publish("text_delta", {
-                            "delta": block.text,
-                            "agent_msg_id": agent_msg_id,
-                        })
-                    elif isinstance(block, ToolUseBlock):
-                        await self._publish("tool_use", {
-                            "tool_use_id": block.id,
-                            "tool": block.name,
-                            "input": block.input,
-                        })
-                        # §grep-audit: Grep-инструмент запускает ugrep, который
-                        # изредка падает (2.2 ГБ core). Логируем его аргументы в
-                        # hedgehog.log (не ротируется) — при краше/подвисании
-                        # последняя запись покажет виновный запрос.
-                        if block.name == "Grep":
-                            inp = block.input or {}
-                            log.info("agent.grep", chat=self.meta.chatId,
-                                     pattern=inp.get("pattern"),
-                                     path=inp.get("path"),
-                                     glob=inp.get("glob"),
-                                     type=inp.get("type"),
-                                     output_mode=inp.get("output_mode"))
-            elif isinstance(msg, UserMessage):
-                content = msg.content if isinstance(msg.content, list) else []
-                for block in content:
-                    if isinstance(block, ToolResultBlock):
-                        await self._publish("tool_result", {
-                            "tool_use_id": block.tool_use_id,
-                            "output": _result_text(block.content),
-                            "is_error": bool(block.is_error),
-                        })
-            elif isinstance(msg, ResultMessage):
-                if is_auth_error(msg.result or ""):
-                    auth_needed = True
-                if msg.session_id:
-                    self._set_session_id(msg.session_id)
-                last_result = msg
-
-        # Один agent_done с итоговым результатом хода.
-        if last_result is not None:
-            usage = last_result.usage or {}
-            await self._publish("agent_done", {
-                "result": last_result.result or "",
-                "usage": {
-                    "input_tokens": usage.get("input_tokens", 0),
-                    "output_tokens": usage.get("output_tokens", 0),
-                },
-            })
-
-        if auth_needed:
+        await self._turn_done.wait()
+        # Ридер упал (крах/закрытие потока) — пробрасываем, _run разберёт
+        # auth/crash и поднимет свежий коннект.
+        if self._reader_error is not None:
+            raise self._reader_error
+        # Неавторизованный CLI не кидает исключение, а отдаёт ResultMessage с
+        # «Not logged in» — диспетчер выставил флаг, обрабатываем тут.
+        if self._turn_auth_needed:
             log.warning("agent.auth_required_result", chat=self.meta.chatId)
             await self._send_chat_error(
                 Err.AUTH_REQUIRED,
@@ -1214,69 +1214,114 @@ class ClaudeSession:
                 await self._on_auth_required()
             # Клиент бесполезен без логина; свежий — на следующий user_msg.
             await self._disconnect()
-        else:
-            # §resync: авто-починка «ответ на прошлое». Если сессия была
-            # рассинхронизирована (редкая порча стрима — переживает рестарт через
-            # resume), receive_response выше отдал ЛИШНИЙ ответ, а НАСТОЯЩИЙ ответ
-            # этого хода застрял в трубе. Дочитываем и ДОСЫЛАЕМ его в чат,
-            # выравнивая трубу. В синхроне — no-op (первый месседж не приходит).
-            await self._drain_and_deliver(client)
 
-    async def _drain_and_deliver(self, client) -> int:
-        """§resync: вычитать из трубы ЗАСТРЯВШИЕ ответы (десинк) и досылать их в
-        чат обычными фреймами, выравнивая поток. Первый месседж ждём КОРОТКО:
-        застрявший ответ уже в буфере (приходит мгновенно), а в синхроне трубе
-        нечего отдавать → таймаут → 0 доставок (no-op, ~0.5с на ход). Возвращает
-        число досланных застрявших ответов."""
-        delivered = 0
-        for _ in range(6):                       # предохранитель от бесконечного цикла
-            gen = client.receive_response()
-            agent_msg_id = new_ulid()
-            last_result: ResultMessage | None = None
-            got = False
-            timeout = 0.5                         # короткий — только на ПЕРВЫЙ месседж
-            try:
-                while True:
-                    msg = await asyncio.wait_for(gen.__anext__(), timeout)
-                    got = True
-                    timeout = 45.0                # дальше дочитываем ответ спокойно
-                    if isinstance(msg, AssistantMessage):
-                        for block in msg.content:
-                            if isinstance(block, TextBlock):
-                                await self._publish("text_delta", {
-                                    "delta": block.text, "agent_msg_id": agent_msg_id})
-                            elif isinstance(block, ToolUseBlock):
-                                await self._publish("tool_use", {
-                                    "tool_use_id": block.id, "tool": block.name,
-                                    "input": block.input})
-                    elif isinstance(msg, UserMessage):
-                        content = msg.content if isinstance(msg.content, list) else []
-                        for block in content:
-                            if isinstance(block, ToolResultBlock):
-                                await self._publish("tool_result", {
-                                    "tool_use_id": block.tool_use_id,
-                                    "output": _result_text(block.content),
-                                    "is_error": bool(block.is_error)})
-                    elif isinstance(msg, ResultMessage):
-                        last_result = msg
-                        if msg.session_id:
-                            self._set_session_id(msg.session_id)
-                        break
-            except (asyncio.TimeoutError, StopAsyncIteration):
-                pass
-            if not got:
-                break                             # труба пуста → синхрон, выходим
-            if last_result is not None:
-                usage = last_result.usage or {}
-                await self._publish("agent_done", {
-                    "result": last_result.result or "",
-                    "usage": {"input_tokens": usage.get("input_tokens", 0),
-                              "output_tokens": usage.get("output_tokens", 0)}})
-            delivered += 1
-        if delivered:
-            log.warning("resync.delivered_leftover", chat=self.meta.chatId,
-                        count=delivered)
-        return delivered
+    async def _reader_loop(self, client) -> None:
+        """§reader: ЕДИНСТВЕННЫЙ потребитель трубы клиента. Непрерывно читает
+        receive_messages() всю жизнь клиента и публикует каждый фрейм через
+        _dispatch. Ключ фикса «ответ на прошлое»/зависший ответ: фоновые хвосты
+        (Task-субагенты, лишние ResultMessage ПОСЛЕ конца хода) доезжают сразу,
+        а не ждут следующего сообщения. На закрытии/краше потока кладёт причину
+        в _reader_error и будит ждущий ход через _turn_done."""
+        try:
+            async for msg in client.receive_messages():
+                # BUG1-компаньон: сбой публикации/колбэка одного фрейма НЕ должен
+                # убивать ридера (иначе живой клиент + мёртвый ридер = ханг).
+                # Ошибка САМОГО потока (parse/транспорт) — фатальна: async-for
+                # прерывается, ловим ниже и помечаем на реконнект.
+                try:
+                    await self._dispatch(msg)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:  # noqa: BLE001
+                    log.warning("reader.dispatch_error", chat=self.meta.chatId,
+                                err=repr(e), msg=type(msg).__name__)
+                    # Если упала публикация РЕЗУЛЬТАТА — всё равно будим ход,
+                    # чтобы он не завис (деградация: без agent_done, но не ханг).
+                    if isinstance(msg, ResultMessage):
+                        self._turn_done.set()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            self._reader_error = e
+            log.warning("reader.exit", chat=self.meta.chatId, err=repr(e))
+        else:
+            # Поток закрылся без исключения (CLI вышел) — тоже сигнал ходу.
+            if self._reader_error is None:
+                self._reader_error = RuntimeError("SDK stream closed")
+            log.info("reader.stream_closed", chat=self.meta.chatId)
+        finally:
+            self._turn_done.set()   # разбудить ждущий _turn (успех взвёл сам)
+
+    async def _dispatch(self, msg) -> None:
+        """Опубликовать один фрейм SDK в чат. На ResultMessage — agent_done,
+        взвод _turn_done и новая группа agent_msg_id для следующего ответа."""
+        if isinstance(msg, SystemMessage):
+            if msg.subtype == "init":
+                sid = (msg.data or {}).get("session_id")
+                if sid:
+                    self._set_session_id(sid)
+        elif isinstance(msg, AssistantMessage):
+            for block in msg.content:
+                if isinstance(block, TextBlock):
+                    await self._publish("text_delta", {
+                        "delta": block.text,
+                        "agent_msg_id": self._agent_msg_id,
+                    })
+                elif isinstance(block, ToolUseBlock):
+                    await self._publish("tool_use", {
+                        "tool_use_id": block.id,
+                        "tool": block.name,
+                        "input": block.input,
+                    })
+                    # §grep-audit: Grep запускает ugrep, который изредка падает
+                    # (2.2 ГБ core). Логируем аргументы — при краше последняя
+                    # запись покажет виновный запрос.
+                    if block.name == "Grep":
+                        inp = block.input or {}
+                        log.info("agent.grep", chat=self.meta.chatId,
+                                 pattern=inp.get("pattern"),
+                                 path=inp.get("path"),
+                                 glob=inp.get("glob"),
+                                 type=inp.get("type"),
+                                 output_mode=inp.get("output_mode"))
+        elif isinstance(msg, UserMessage):
+            content = msg.content if isinstance(msg.content, list) else []
+            for block in content:
+                if isinstance(block, ToolResultBlock):
+                    await self._publish("tool_result", {
+                        "tool_use_id": block.tool_use_id,
+                        "output": _result_text(block.content),
+                        "is_error": bool(block.is_error),
+                    })
+        elif isinstance(msg, ResultMessage):
+            # BUG2-диагностика: результат без ожидающего query — фоновый хвост
+            # (лишний ResultMessage субагента ПОСЛЕ конца хода). Логируем поля,
+            # чтобы эмпирически найти дискриминатор для будущей корреляции.
+            if self._awaiting_result > 0:
+                self._awaiting_result -= 1
+            else:
+                log.info("reader.trailer_result", chat=self.meta.chatId,
+                         subtype=getattr(msg, "subtype", None),
+                         num_turns=getattr(msg, "num_turns", None),
+                         session=msg.session_id)
+            if is_auth_error(msg.result or ""):
+                self._turn_auth_needed = True
+            if msg.session_id:
+                self._set_session_id(msg.session_id)
+            usage = msg.usage or {}
+            await self._publish("agent_done", {
+                "result": msg.result or "",
+                "usage": {
+                    "input_tokens": usage.get("input_tokens", 0),
+                    "output_tokens": usage.get("output_tokens", 0),
+                },
+            })
+            self._turn_done.set()          # разбудить ждущий _turn
+            # Следующий ответ (в т.ч. фоновый хвост) — своя группа. Косметика:
+            # если ТЕКСТ хвоста прошлого хода придёт вперемешку с текстом
+            # следующего хода до первого результата, они разок склеятся в одну
+            # группу (без корреляции неустранимо) — приемлемо.
+            self._agent_msg_id = new_ulid()
 
     # ---------- permission / picker (SDK callback) ----------
 
