@@ -16,8 +16,15 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
+
+# git fetch к GitHub изредка троттлится на анонимном HTTPS (rate-limit отдаёт
+# не-протокольный ответ → git не парсит его и в отчаянии просит логин:
+# «could not read Username» / «expected flush after ref listing»). Повторяем
+# с нарастающей паузой — переживаем транзиентные сбои/лимиты.
+_FETCH_BACKOFF = (1.5, 4.0, 9.0)   # паузы между попытками; попыток = len+1
 
 
 @dataclass
@@ -30,12 +37,29 @@ class UpdateResult:
 
 
 def _run(args: list[str], cwd: Path) -> tuple[int, str]:
+    # GIT_TERMINAL_PROMPT=0 / GIT_ASKPASS=true: git НИКОГДА не зависает в ожидании
+    # логина (нет TTY) — падает быстро с понятным кодом, а не «No such device».
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": "true"}
     try:
         proc = subprocess.run(
-            args, cwd=str(cwd), capture_output=True, text=True, timeout=180)
+            args, cwd=str(cwd), capture_output=True, text=True, timeout=180,
+            env=env)
     except (OSError, subprocess.SubprocessError) as e:
         return 1, f"{type(e).__name__}: {e}"
     return proc.returncode, (proc.stdout + proc.stderr).strip()
+
+
+def _fetch(root: Path, branch: str) -> tuple[int, str]:
+    """git fetch с ретраями (см. _FETCH_BACKOFF) — гасит транзиентный троттлинг
+    анонимного HTTPS к GitHub. Возвращает результат последней попытки."""
+    code, out = 1, ""
+    for i in range(len(_FETCH_BACKOFF) + 1):
+        code, out = _run(["git", "fetch", "--depth", "1", "origin", branch], root)
+        if code == 0:
+            return 0, out
+        if i < len(_FETCH_BACKOFF):
+            time.sleep(_FETCH_BACKOFF[i])
+    return code, out
 
 
 def repo_root() -> Path | None:
@@ -82,8 +106,9 @@ def pull_latest() -> UpdateResult:
     req = _requirements(root)
     req_before = req.read_bytes() if req else b""
 
-    # fetch + hard reset — работает и на shallow (--depth 1) клоне
-    code, out = _run(["git", "fetch", "--depth", "1", "origin", branch], root)
+    # fetch + hard reset — работает и на shallow (--depth 1) клоне.
+    # _fetch ретраит троттлинг анонимного HTTPS (см. _FETCH_BACKOFF).
+    code, out = _fetch(root, branch)
     if code != 0:
         return UpdateResult(ok=False, old=old, message=f"git fetch: {out[-300:]}")
     code, out = _run(["git", "reset", "--hard", f"origin/{branch}"], root)
