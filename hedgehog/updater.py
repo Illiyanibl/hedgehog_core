@@ -50,11 +50,17 @@ def _run(args: list[str], cwd: Path) -> tuple[int, str]:
 
 
 def _fetch(root: Path, branch: str) -> tuple[int, str]:
-    """git fetch с ретраями (см. _FETCH_BACKOFF) — гасит транзиентный троттлинг
-    анонимного HTTPS к GitHub. Возвращает результат последней попытки."""
+    """git fetch к origin с ретраями (см. _FETCH_BACKOFF).
+
+    http.version=HTTP/1.1: git 2.43 по HTTP/2 к GitHub изредка спотыкается на
+    фрейминге ответа («fatal: expected flush after ref listing» + запрос логина),
+    хотя curl тот же URL тянет нормально. Форс HTTP/1.1 убирает этот флап (curl-
+    транспорт HTTP/1.1 у git стабилен). Ретрай добивает разовые сетевые сбои."""
     code, out = 1, ""
     for i in range(len(_FETCH_BACKOFF) + 1):
-        code, out = _run(["git", "fetch", "--depth", "1", "origin", branch], root)
+        code, out = _run(
+            ["git", "-c", "http.version=HTTP/1.1",
+             "fetch", "--depth", "1", "origin", branch], root)
         if code == 0:
             return 0, out
         if i < len(_FETCH_BACKOFF):
