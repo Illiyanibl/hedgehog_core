@@ -20,14 +20,6 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-# Ёжик обновляется ТОЛЬКО с публичного репозитория. Часть серверов была
-# склонирована с приватного git.insapp.pro (токен в /root/.git-credentials —
-# фактически дыра: root читает секрет к приватному git). Токен протух → git
-# fetch отдавал HTTP 401. Публичный github токена не требует: на каждом апдейте
-# перецеливаем origin сюда и тянем АНОНИМНО (credential.helper пустой) — 401
-# и утечка токена исключены by design.
-_PUBLIC_REMOTE = "https://github.com/Illiyanibl/hedgehog_core.git"
-
 # git fetch по HTTPS изредка спотыкается (HTTP/2-фрейминг git↔GitHub, разовые
 # сетевые сбои) → git не парсит ответ и просит логин («could not read Username»
 # / «expected flush after ref listing»). Повторяем с нарастающей паузой.
@@ -76,20 +68,6 @@ def _fetch(root: Path, branch: str) -> tuple[int, str]:
     return code, out
 
 
-def _ensure_public_origin(root: Path) -> str | None:
-    """Перецелить origin на публичный репозиторий, если он смотрит в другое место
-    (старый провижининг клонировал приватный git.insapp.pro). Идемпотентно.
-    Возвращает прежний URL, если менялся, иначе None — для сообщения апдейта."""
-    code, url = _run(["git", "remote", "get-url", "origin"], root)
-    if code != 0:
-        return None
-    url = url.strip()
-    if url == _PUBLIC_REMOTE:
-        return None
-    _run(["git", "remote", "set-url", "origin", _PUBLIC_REMOTE], root)
-    return url
-
-
 def repo_root() -> Path | None:
     """Корень git-репозитория, из которого запущен Ёжик (где лежит пакет
     hedgehog). None — если это не git-установка (обновление недоступно)."""
@@ -134,10 +112,6 @@ def pull_latest() -> UpdateResult:
     req = _requirements(root)
     req_before = req.read_bytes() if req else b""
 
-    # «Ссылаться только на публичный»: перецеливаем origin на публичный github,
-    # если он смотрел на приватный источник (старый провижининг).
-    repointed = _ensure_public_origin(root)
-
     # fetch + hard reset — работает и на shallow (--depth 1) клоне. _fetch тянет
     # АНОНИМНО (без stored-токена), с HTTP/1.1 и ретраями.
     code, out = _fetch(root, branch)
@@ -159,8 +133,6 @@ def pull_latest() -> UpdateResult:
                                 message=f"pip install: {out[-300:]}")
 
     msg = f"обновлено {old} → {new}" if changed else f"уже актуально ({old})"
-    if repointed:
-        msg += " · origin → публичный github"
     return UpdateResult(ok=True, changed=changed, old=old, new=new, message=msg)
 
 
