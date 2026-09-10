@@ -24,6 +24,7 @@ def ensure_cert(cert_path: Path, key_path: Path) -> str:
     Возврат — SHA-256 отпечаток DER-сертификата (hex), его пинит клиент.
     """
     cert_path.parent.mkdir(parents=True, exist_ok=True)
+    cert_path.parent.chmod(0o700)  # приватный ключ рядом — каталог только владельцу
     if not (cert_path.exists() and key_path.exists()):
         key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
         name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "hedgehog")])
@@ -59,5 +60,21 @@ def fingerprint(cert_path: Path) -> str:
 
 def make_ssl_context(cert_path: Path, key_path: Path) -> ssl.SSLContext:
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2  # без древних версий
     ctx.load_cert_chain(str(cert_path), str(key_path))
     return ctx
+
+
+if __name__ == "__main__":
+    # Out-of-band сверка отпечатка человеком: `python -m hedgehog.tls fingerprint`
+    # (генерит серт при отсутствии, печатает SHA-256 DER-отпечаток).
+    import sys
+    from .config import Config
+
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "fingerprint"
+    if cmd == "fingerprint":
+        cfg = Config()
+        print(ensure_cert(cfg.tls_cert_file, cfg.tls_key_file))
+    else:
+        print(f"unknown command: {cmd}", file=sys.stderr)
+        sys.exit(2)

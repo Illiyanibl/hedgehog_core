@@ -13,6 +13,7 @@ from .config import Config
 from .wss.server import HedgehogServer
 from .scheduler import SchedulerService
 from . import fileserver
+from . import tls
 
 
 def _setup_logging():
@@ -34,6 +35,12 @@ async def _amain():
 
     config = Config()
     config.data_dir.mkdir(parents=True, exist_ok=True)
+    # §tls: серт нужен ОБОИМ портам (8765 WS + 8767 файлы) и одному отпечатку.
+    # WS-сервер стартует раньше файл-сервера, поэтому гарантируем серт здесь,
+    # до старта приёма соединений (ensure_cert идемпотентна).
+    if config.tls_enabled:
+        fp = tls.ensure_cert(config.tls_cert_file, config.tls_key_file)
+        log.info("tls.cert_ready", fingerprint=fp)
     server = HedgehogServer(config)
     # §sched: планировщик задач + блэкборд. Колбэки замкнуты на сервер (инъекция
     # текста / уведомление в чат). Ставим ДО старта приёма соединений.

@@ -188,3 +188,14 @@ class Config:
         self.token_file.write_text(token + "\n")
         self.token_file.chmod(0o600)
         return token
+
+    def rotate_token(self) -> str:
+        """§tls-migration: выпустить НОВЫЙ bearer (старый инвалидируется).
+        Зовётся при включении TLS — прежний токен ходил по plain ws и мог
+        утечь. ВНИМАНИЕ: env HEDGEHOG_TOKEN перекрывает файл (load_token) —
+        при деплое через env токен ротируется на стороне env, не здесь."""
+        token = secrets.token_urlsafe(32)
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.token_file.write_text(token + "\n")
+        self.token_file.chmod(0o600)
+        return token

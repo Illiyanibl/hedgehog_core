@@ -23,6 +23,8 @@ import structlog
 import websockets
 from websockets.asyncio.server import Request, Response, ServerConnection, serve
 
+from .. import tls
+
 from ..bus.hub import Hub
 from ..config import Config
 from ..core.auth import AuthManager
@@ -102,15 +104,22 @@ class HedgehogServer:
     # ---------- запуск ----------
 
     async def serve_forever(self):
+        # §tls: тот же self-signed серт, что у файл-сервера (один отпечаток на
+        # оба порта). TLS терминируется ДО upgrade → Bearer/hello поверх TLS.
+        ssl_ctx = (tls.make_ssl_context(self.config.tls_cert_file,
+                                        self.config.tls_key_file)
+                   if self.config.tls_enabled else None)
         async with serve(
             self._handler,
             self.config.host,
             self.config.port,
             process_request=self._process_request,
             max_size=4 * 1024 * 1024,
+            ssl=ssl_ctx,
         ):
             log.info("server.listening", host=self.config.host,
-                     port=self.config.port, path=WS_PATH)
+                     port=self.config.port, path=WS_PATH,
+                     tls=self.config.tls_enabled)
             await asyncio.get_running_loop().create_future()  # до отмены
 
     async def shutdown(self):
