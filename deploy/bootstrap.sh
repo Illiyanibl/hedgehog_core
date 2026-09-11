@@ -28,8 +28,58 @@ NET=hedgehog-net
 # Готовый образ из реестра (собирается в GitHub Actions) — на сервере не
 # билдим, только pull. Переопределяется env HEDGEHOG_IMAGE (напр. для форка).
 IMAGE="${HEDGEHOG_IMAGE:-ghcr.io/illiyanibl/hedgehog:latest}"
+# §image-mirror: запасной источник образа (тарбол по HTTPS) на случай, когда
+# ghcr для VPS медленный/флапает (инцидент: шаг image падал на docker pull).
+MIRROR_URL="${HEDGEHOG_MIRROR_URL:-https://resource.ecorp.red/hedgehog-latest.tar.gz}"
 
 log(){ echo "[bootstrap] $*"; }
+
+# §image: docker pull с ретраями и экспоненциальным backoff — медленный/
+# флапающий ghcr не должен ронять установку с первой попытки. Слои докачиваются
+# между попытками (docker кэширует завершённые).
+pull_image_with_retry(){ # <image>
+  local img="$1" i delay=5
+  for i in 1 2 3 4 5; do
+    if docker pull "$img"; then return 0; fi
+    log "pull попытка $i/5 не удалась; повтор через ${delay}с"
+    sleep "$delay"; delay=$(( delay * 2 ))
+  done
+  return 1
+}
+
+# §image-mirror: запасной путь — тарбол образа с зеркала (resource.ecorp.red).
+# Резюмируемая докачка (curl -C -), сверка sha256 (если .sha256 доступен),
+# docker load. `docker save` сохраняет repo:tag → последующий `docker run
+# "$IMAGE"` берёт образ из локального кэша без пула.
+load_image_from_mirror(){ # <url> <image>
+  local url="$1" img="$2" tgz="/tmp/hedgehog-image.tar.gz" want got
+  log "фолбэк на зеркало образа: $url"
+  rm -f "$tgz"   # чистый старт: не резюмируем чужой партиал прошлого запуска
+  if ! curl -fL --retry 5 --retry-delay 5 --connect-timeout 20 -C - -o "$tgz" "$url"; then
+    log "докачка тарбола не удалась"; rm -f "$tgz"; return 1
+  fi
+  # Зеркало ВСЕГДА публикует .sha256 → fail-closed: нет файла целостности либо
+  # несовпадение → отбрасываем (не грузим непроверенный образ). `|| want=""` —
+  # чтобы сбой curl под активным errexit (тут set -E не задан) не убил шелл
+  # молча, без fail-маркера, а ушёл в явный return 1 (ERR-trap пометит image).
+  want="$(curl -fsSL --connect-timeout 20 "${url}.sha256" 2>/dev/null | awk '{print $1}')" || want=""
+  if [ -z "$want" ]; then
+    log "файл целостности зеркала (.sha256) недоступен — прерываю фолбэк"
+    rm -f "$tgz"; return 1
+  fi
+  got="$(sha256sum "$tgz" | awk '{print $1}')" || got=""
+  if [ "$want" != "$got" ]; then
+    log "sha256 не совпал ($got != $want) — отбрасываю"; rm -f "$tgz"; return 1
+  fi
+  log "sha256 ок"
+  if ! gunzip -c "$tgz" | docker load; then
+    log "docker load не удался"; rm -f "$tgz"; return 1
+  fi
+  rm -f "$tgz"
+  docker image inspect "$img" >/dev/null 2>&1 || {
+    log "образ $img не появился после load"; return 1; }
+  return 0
+}
 
 # --- прогресс установки (§install-progress) --------------------------------
 # Пишем ход в файлы, чтобы клиент опрашивал установку даже после разрыва SSH.
@@ -123,10 +173,11 @@ for v in hedgehog-data hedgehog-apps hedgehog-caddy-data hedgehog-caddy-config; 
 done
 mark network ok
 
-# 6) получение образа Ёжика (готовый из реестра, без сборки) ----------------
+# 6) получение образа Ёжика: реестр (с ретраями) → при провале зеркало --------
 mark image begin
-log "получение образа: $IMAGE"
-docker pull "$IMAGE"
+log "получение образа: $IMAGE (реестр → при провале зеркало $MIRROR_URL)"
+# Оба провалились → компаунд вернёт non-zero → ERR-trap пометит шаг image:fail.
+pull_image_with_retry "$IMAGE" || load_image_from_mirror "$MIRROR_URL" "$IMAGE"
 mark image ok
 
 # 7) контейнеры (пересоздаём идемпотентно) ----------------------------------
