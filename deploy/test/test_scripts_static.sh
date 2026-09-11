@@ -8,6 +8,8 @@ set -uo pipefail
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
 BOOT="$DIR/bootstrap.sh"
 CONT="$DIR/install-in-container.sh"
+SELF="$DIR/selfsetup.sh"
+LIB="$DIR/lib/core.sh"
 FAILED=0
 
 check(){ # <файл> <regex> <описание>
@@ -16,7 +18,7 @@ check(){ # <файл> <regex> <описание>
 }
 
 echo "== bash -n (синтаксис) =="
-for f in "$BOOT" "$CONT"; do
+for f in "$BOOT" "$CONT" "$SELF" "$LIB"; do
   if bash -n "$f"; then echo "  ✅ $(basename "$f") синтаксис ок";
   else echo "  ❌ $(basename "$f") синтаксическая ошибка"; FAILED=1; fi
 done
@@ -43,6 +45,15 @@ done
 check "$CONT" '8\.8\.8\.8' "публичные резолверы"
 check "$CONT" 'result\.json' "пишет result.json"
 check "$CONT" 'echo ok > "\$STATE/status"' "финальный status=ok"
+
+echo "== selfsetup.sh (self-setup + файл-конфиг клиента) =="
+# У self-setup НЕТ прогресс-контракта (STATE/result.json) — не проверяем его.
+check "$SELF" 'lib/core\.sh' "source общего ядра"
+check "$SELF" 'devolution-hedgehog-server' "эмитит kind формата импорта клиента"
+check "$SELF" 'json\.dump' "JSON собирается python-ом (числа/bool/экранирование)"
+check "$SELF" 'chmod 600 "\$OUT"' "файл-конфиг 600 (Bearer+отпечаток)"
+check "$SELF" 'HH_TLS" = "1"' "tls — сквозной флаг (отпечаток только при tls)"
+check "$LIB"  'chmod 600 "\$src/run-loop.sh"' "run-loop.sh 600 (токен внутри)"
 
 echo "== Итог =="
 if [ "$FAILED" = "0" ]; then echo "PASS ✅"; exit 0; else echo "FAIL ❌"; exit 1; fi

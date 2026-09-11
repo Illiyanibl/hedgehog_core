@@ -1,0 +1,31 @@
+{
+  "kind": "devolution-hedgehog-setup",
+  "version": 1,
+
+  "host": "",
+  "domain": null,
+  "tls": true,
+  "token": null,
+
+  "data_dir": "/opt/hedgehog-data",
+  "browse_root": "/",
+  "default_cwd": null,
+  "out_file": null,
+
+  "ports": {
+    "hedgehog": 8765,
+    "file": 8767
+  },
+
+  "neko": {
+    "note": "Зарезервировано. Neko поднимает приложение через docker; в чистом контейнере без docker не используется — эти значения ни на что не влияют, пока в контейнере нет docker.",
+    "enabled": false,
+    "https": 8766,
+    "udpmux": 59000,
+    "tcpmux": 59000,
+    "mcp": 9250,
+    "image": "ghcr.io/illiyanibl/devolution-neko:latest",
+    "screen": "1280x800@30",
+    "swap_mb": 1024
+  }
+}
