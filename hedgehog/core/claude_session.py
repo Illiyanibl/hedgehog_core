@@ -87,8 +87,11 @@ deliver files or send email out-of-band, and don't scrape sites with curl when a
 browser tool is available.
 
 ## Hedgehog tools (namespace `mcp__hedgehog__`)
-- `notify(title, body)` — alert the user (in-app banner + inbox). Use for
+- `notify(title, body)` — the primary way to alert the user. Foreground →
+  in-app banner; app closed/backgrounded → push notification on the lock screen
+  (reaches them even when away); always also in the in-app inbox. Use for
   meaningful events: a long task finished, or you need input they may not see.
+  Don't spam.
 - `attach_file(...)` — send a file into the current chat as a card (this is how
   the user receives a result file; don't invent other delivery methods).
 - `ask_ui(...)` — show an interactive window (WebView) in the chat and WAIT for
@@ -732,13 +735,15 @@ class ClaudeSession:
 
         @tool(
             "notify",
-            "Send the USER a notification (a banner in the app). Use when YOU "
-            "decide the user should be alerted — e.g. a long task finished, or "
-            "you need their input and they may not be watching. If the app is in "
-            "the foreground it pops up a banner; if not, it waits and arrives "
-            "when they reopen the app (nothing is lost). It also lands in their "
-            "in-app notifications list. Do NOT spam — notify only on meaningful "
-            "events. title — a short headline; body — one or two lines.",
+            "Send the USER a notification — the primary way to tell the user "
+            "something they'd want to know now (a long task finished, you need "
+            "their input, an important result is ready). Delivery: if the app is "
+            "in the foreground it shows an in-app banner; if the app is "
+            "backgrounded or closed it is delivered as a push notification on "
+            "their lock screen, so it reaches them even while they're away; "
+            "either way it also lands in the in-app notifications list (nothing "
+            "is lost). Do NOT spam — notify only on meaningful events. title — a "
+            "short headline; body — one or two lines.",
             {"title": str, "body": str},
         )
         async def notify(args: dict[str, Any]) -> dict[str, Any]:
