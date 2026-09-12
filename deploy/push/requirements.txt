@@ -1,0 +1,5 @@
+aiohttp>=3.10
+aiosqlite>=0.20
+httpx[http2]>=0.27
+PyJWT>=2.9
+cryptography>=42.0

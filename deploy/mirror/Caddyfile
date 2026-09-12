@@ -7,3 +7,9 @@ resource.ecorp.red {
 	# Тарбол обновляется ежечасно — не даём кэшам залипнуть на старой копии.
 	header /hedgehog-latest.tar.gz* Cache-Control "no-cache"
 }
+
+# §push: релей APNs. Caddy терминирует TLS (авто-сертификат Let's Encrypt) и
+# проксирует на контейнер релея в общей docker-сети hedgehog-edge.
+push.ecorp.red {
+	reverse_proxy hedgehog-push:8080
+}
