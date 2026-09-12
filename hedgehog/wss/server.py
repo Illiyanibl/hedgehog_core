@@ -49,6 +49,7 @@ from ..store.skill_sources import SkillSources, SkillInstallError
 from .. import fileserver
 from .. import authlog
 from .. import updater
+from .. import push
 
 log = structlog.get_logger("wss")
 
@@ -70,6 +71,11 @@ class HedgehogServer:
         self.hub = Hub(self.store)
         self.sessions: dict[str, ClaudeSession | PtySession] = {}
         self.auth = AuthManager(config, self._auth_broadcast)
+        # §push: notifyKey'и устройств (для APNs-пуша при оффлайн-клиенте).
+        self.push_keys = push.PushKeys(config.push_keys_file)
+        # Сильные ссылки на fire-and-forget задачи пуша: asyncio держит задачи
+        # лишь слабо, без ссылки их может собрать GC до завершения.
+        self._push_tasks: set[asyncio.Task] = set()
         # §sched: планировщик задач + блэкборд. Ставится из main.py после
         # конструктора (нужны колбэки inject/notify, замкнутые на этот сервер).
         self.scheduler = None
@@ -100,6 +106,24 @@ class HedgehogServer:
             return
         await self.hub.publish(chat_id, "notification",
                                {"title": title or "", "body": body or ""})
+        self._push_offline(chat_id, title or "", body or "")
+
+    def _push_offline(self, chat_id: str, title: str, body: str) -> None:
+        """§push: если клиент не получит notification по WS (нет ПОДПИСЧИКА на
+        этот чат — свёрнут/закрыт/открыт другой чат) — попросить релей отправить
+        APNs-пуш на все запомненные устройства. Подписчик этого чата уже получил
+        событие по WS, пуш ему не нужен. Fire-and-forget.
+
+        Важно: критерий — подписка именно на ЭТОТ chat_id, а не «есть ли вообще
+        соединение»: иначе notify для чата B при открытом чате A не дошёл бы
+        никак (ни по WS — нет подписки, ни пушем — соединение-то есть)."""
+        if not self.config.push_enabled or self.hub.has_subscribers(chat_id):
+            return
+        for key in self.push_keys.keys():
+            task = asyncio.create_task(push.send(
+                self.config.push_relay_url, key, title, body, chat_id))
+            self._push_tasks.add(task)
+            task.add_done_callback(self._push_tasks.discard)
 
     # ---------- запуск ----------
 
@@ -248,6 +272,11 @@ class HedgehogServer:
             return
         if ftype == "client_log":
             self._append_client_log(p.text)
+            return
+        if ftype == "register_push":
+            # §push: запомнить notifyKey устройства (секрет отправки) — по нему
+            # попросим релей отправить APNs-пуш, когда клиент будет оффлайн.
+            self.push_keys.remember(p.notifyKey)
             return
         if ftype == "update_self":
             # §15: git pull своего исходника + перезапуск. Авторизация — тем же
@@ -964,7 +993,12 @@ class HedgehogServer:
             return session
 
         async def publish(ftype: str, payload: dict) -> dict:
-            return await self.hub.publish(meta.chatId, ftype, payload)
+            result = await self.hub.publish(meta.chatId, ftype, payload)
+            # §push: агентский notify при оффлайн-клиенте → APNs-пуш через релей.
+            if ftype == "notification":
+                self._push_offline(meta.chatId, payload.get("title", ""),
+                                   payload.get("body", ""))
+            return result
 
         if meta.addressee == "claude":
             async def chat_error(code: str, message: str):

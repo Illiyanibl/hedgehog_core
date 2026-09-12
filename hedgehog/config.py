@@ -88,6 +88,13 @@ class Config:
     # Лог приложения-клиента (§14 client_log): накопительный файл, лимит.
     client_log_cap: int = 512 * 1024 * 1024  # 512 МБ
 
+    # §push: релей APNs (push.ecorp.red). Ёžik сам в APNs не ходит — при
+    # агентском notify с оффлайн-клиентом просит релей отправить пуш.
+    push_relay_url: str = field(default_factory=lambda: os.environ.get(
+        "HEDGEHOG_PUSH_RELAY", "https://push.ecorp.red"))
+    push_enabled: bool = field(default_factory=lambda: os.environ.get(
+        "HEDGEHOG_PUSH_ENABLED", "1").lower() in ("1", "true", "yes", "on"))
+
     @property
     def chats_dir(self) -> Path:
         return self.data_dir / "chats"
@@ -104,6 +111,12 @@ class Config:
     @property
     def client_log_file(self) -> Path:
         return self.data_dir / "client.log"
+
+    @property
+    def push_keys_file(self) -> Path:
+        """§push: notifyKey'и устройств (секреты отправки), полученные фреймом
+        register_push. Нужны, чтобы пушить, когда клиент уже отключился."""
+        return self.data_dir / "push_keys.json"
 
     @property
     def oauth_token_file(self) -> Path:

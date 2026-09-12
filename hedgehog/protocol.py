@@ -258,6 +258,13 @@ class RemoveMcpPayload(_Payload):
     name: str = Field(min_length=1)
 
 
+class RegisterPushPayload(_Payload):
+    """§push: клиент сообщает свой notifyKey (секрет ОТПРАВКИ) — Ёžik запоминает
+    его и при агентском notify с ОФФЛАЙН-клиентом просит релей push.ecorp.red
+    отправить APNs-пуш. accountId (секрет регистрации) сюда НЕ передаётся."""
+    notifyKey: str = Field(min_length=1, max_length=200)
+
+
 # type → (payload-модель, нужен ли chatId в обёртке)
 CLIENT_FRAME_TYPES: dict[str, tuple[type[_Payload], bool]] = {
     "user_msg": (UserMsgPayload, True),
@@ -304,6 +311,8 @@ CLIENT_FRAME_TYPES: dict[str, tuple[type[_Payload], bool]] = {
     "logout": (EmptyPayload, False),
     # §14: лог приложения-клиента (глобальный, без chatId)
     "client_log": (ClientLogPayload, False),
+    # §push: клиент сообщает notifyKey для APNs-пушей (глобальный, без chatId)
+    "register_push": (RegisterPushPayload, False),
     # §15: самообновление Ёжика (git pull + рестарт; глобальный, без chatId)
     "update_self": (EmptyPayload, False),
     # §17: Neko-браузер (провижининг/статус/снос; глобальные, без chatId)
