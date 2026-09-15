@@ -44,7 +44,7 @@ APNS_HOST = {
 }
 
 # MVP-квота: пушей в сутки на accountId по тиру подписки (тир — от клиента).
-TIER_DAILY = {"free": 5, "lite": 30, "full": 200}
+TIER_DAILY = {"free": 5, "lite": 30, "full": 200, "sponsor": 200}
 DEFAULT_DAILY = 5
 
 EXPIRATION_SECS = 6 * 3600   # apns-expiration: протухший пуш не прилетит сутки спустя
