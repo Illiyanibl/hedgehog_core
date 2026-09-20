@@ -29,6 +29,9 @@ class Hub:
         self._store = store
         # conn_id → (send, множество подписанных chatId)
         self._conns: dict[int, tuple[SendFn, set[str]]] = {}
+        # conn_id → deviceId (§push: несекретный id устройства, для per-device
+        # маршрутизации пуша). Отдельный dict, чтобы не менять кортеж _conns.
+        self._conn_device: dict[int, str] = {}
         self._next_conn_id = 1
 
     # ---------- соединения ----------
@@ -42,7 +45,13 @@ class Hub:
 
     def unregister(self, conn_id: int):
         self._conns.pop(conn_id, None)
+        self._conn_device.pop(conn_id, None)
         log.info("conn.unregister", conn_id=conn_id, total=len(self._conns))
+
+    def set_device(self, conn_id: int, device_id: str):
+        """§push: привязать deviceId к соединению (из фрейма register_push)."""
+        if conn_id in self._conns and device_id:
+            self._conn_device[conn_id] = device_id
 
     def subscribe(self, conn_id: int, chat_id: str):
         if conn_id in self._conns:
@@ -54,6 +63,18 @@ class Hub:
 
     def has_subscribers(self, chat_id: str) -> bool:
         return any(chat_id in subs for _, subs in self._conns.values())
+
+    def devices_subscribed(self, chat_id: str) -> set[str]:
+        """§push: deviceId устройств с живым соединением, ПОДПИСАННЫМ на этот чат
+        (т.е. получат событие напрямую по WS). Соединения без известного deviceId
+        не попадают — им пуш не адресуется (у них нет notifyKey в реестре)."""
+        out: set[str] = set()
+        for conn_id, (_, subs) in self._conns.items():
+            if chat_id in subs:
+                dev = self._conn_device.get(conn_id)
+                if dev:
+                    out.add(dev)
+        return out
 
     # ---------- публикация ----------
 

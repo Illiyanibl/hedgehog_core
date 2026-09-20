@@ -1,9 +1,12 @@
 """§push: клиентская сторона APNs-релея на Ёžike.
 
-Ёžik сам в APNs не ходит. При агентском `notify` с ОФФЛАЙН-клиентом (нет
-активных WS-соединений) Ёžik просит релей push.hedgehog.devolution.dev отправить пуш на
-устройства, чьи notifyKey он запомнил (фрейм register_push). accountId (секрет
-регистрации) Ёžik'у не выдаётся — только notifyKey (секрет отправки).
+Ёžik сам в APNs не ходит. При агентском `notify` Ёžik доставляет каждому
+известному устройству ровно один раз: подписанным на этот чат — напрямую по WS,
+а ОФФЛАЙН-устройствам (нет живого соединения на чат) просит релей
+push.hedgehog.devolution.dev прислать APNs-пуш (по notifyKey, запомненному
+фреймом register_push). Один Apple-аккаунт может иметь несколько устройств —
+маршрутизация per-device по deviceId. accountId (секрет регистрации) Ёžik'у не
+выдаётся — только notifyKey (секрет отправки).
 """
 from __future__ import annotations
 
@@ -25,54 +28,88 @@ MAX_KEYS = 20
 
 
 class PushKeys:
-    """Персистентный набор notifyKey → last_seen (переживает отключение клиента)."""
+    """Персистентно: deviceId → (notifyKey, last_seen). Один Apple-аккаунт может
+    иметь НЕСКОЛЬКО устройств — храним каждое отдельно, чтобы пушить ровно тем,
+    кто оффлайн. Перерегистрация устройства обновляет его notifyKey/last_seen.
+
+    Устройства СТАРОГО клиента (без deviceId) кладём под синтетический ключ =
+    сам notifyKey: он никогда не совпадёт с реальным deviceId живого соединения
+    → такое устройство всегда считается оффлайн и пуш ему уходит (совместимость).
+    """
 
     def __init__(self, path: Path):
         self._path = path
-        self._keys: dict[str, float] = {}
+        # device_id -> {"notifyKey": str, "ts": float}
+        self._devs: dict[str, dict] = {}
         self._load()
 
     def _load(self) -> None:
         try:
             data = json.loads(self._path.read_text())
-            if isinstance(data, dict):
-                self._keys = {str(k): float(v) for k, v in data.items()}
         except (OSError, ValueError, TypeError):
-            # Битый/чужой формат (в т.ч. float(None) → TypeError) не должен
-            # ронять старт сервера — просто начинаем с пустого набора.
-            self._keys = {}
+            data = None
+        out: dict[str, dict] = {}
+        if isinstance(data, dict):
+            for k, v in data.items():
+                try:
+                    if isinstance(v, dict) and v.get("notifyKey"):
+                        # Новый формат: deviceId → {notifyKey, ts}.
+                        out[str(k)] = {"notifyKey": str(v["notifyKey"]),
+                                       "ts": float(v.get("ts") or 0)}
+                    else:
+                        # Старый формат {notifyKey: ts}: ключ И есть notifyKey,
+                        # используем его же как синтетический deviceId.
+                        out[str(k)] = {"notifyKey": str(k), "ts": float(v)}
+                except (ValueError, TypeError):
+                    continue  # битую запись пропускаем, старт не роняем
+        self._devs = out
 
     def _save(self) -> None:
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
             # Атомарно: tmp + replace — обрыв на середине не обнулит файл.
             tmp = self._path.with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(self._keys))
+            tmp.write_text(json.dumps(self._devs))
             tmp.replace(self._path)
         except OSError as e:
             log.warning("push.keys_save_failed", err=str(e))
 
     def _prune(self) -> None:
         cutoff = time.time() - KEY_TTL
-        self._keys = {k: t for k, t in self._keys.items() if t >= cutoff}
-        # Кап: если после отсева всё равно больше потолка — оставляем хвост dict
-        # (самые недавно перезаписанные — remember двигает ключ в конец).
-        if len(self._keys) > MAX_KEYS:
-            tail = list(self._keys.items())[-MAX_KEYS:]
-            self._keys = dict(tail)
+        self._devs = {d: r for d, r in self._devs.items()
+                      if r.get("ts", 0) >= cutoff}
+        # Кап: если после отсева больше потолка — оставляем хвост dict (самые
+        # недавно перезаписанные — remember двигает запись в конец).
+        if len(self._devs) > MAX_KEYS:
+            tail = list(self._devs.items())[-MAX_KEYS:]
+            self._devs = dict(tail)
 
-    def remember(self, notify_key: str) -> None:
+    def remember(self, notify_key: str, device_id: str = "") -> None:
         if not notify_key:
             return
-        # Переставляем ключ в хвост (метка «самый свежий»), обновляя last_seen.
-        self._keys.pop(notify_key, None)
-        self._keys[notify_key] = time.time()
+        # Без deviceId (старый клиент) — синтетический ключ = notifyKey.
+        dev = device_id or notify_key
+        # Апгрейд клиента: раньше устройство регистрировалось БЕЗ deviceId
+        # (синтетический ключ = notifyKey), теперь пришёл реальный deviceId с тем
+        # же notifyKey — убираем старую синтетическую запись, иначе устройство
+        # задвоится в реестре и получит пуш дважды (до KEY_TTL).
+        if device_id and device_id != notify_key:
+            self._devs.pop(notify_key, None)
+        # Переставляем в хвост (метка «самый свежий»), обновляя last_seen.
+        self._devs.pop(dev, None)
+        self._devs[dev] = {"notifyKey": notify_key, "ts": time.time()}
         self._prune()
         self._save()
 
-    def keys(self) -> list[str]:
+    def devices(self) -> list[tuple[str, str]]:
+        """Список (deviceId, notifyKey) живых (не протухших) устройств."""
         self._prune()
-        return list(self._keys.keys())
+        return [(d, r["notifyKey"]) for d, r in self._devs.items()]
+
+    def keys(self) -> list[str]:
+        """Только notifyKey'и (совместимость)."""
+        self._prune()
+        return [r["notifyKey"] for r in self._devs.values()]
 
 
 def _ordered(relay_urls: list[str], notify_key: str) -> list[str]:

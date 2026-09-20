@@ -109,17 +109,22 @@ class HedgehogServer:
         self._push_offline(chat_id, title or "", body or "")
 
     def _push_offline(self, chat_id: str, title: str, body: str) -> None:
-        """§push: если клиент не получит notification по WS (нет ПОДПИСЧИКА на
-        этот чат — свёрнут/закрыт/открыт другой чат) — попросить релей отправить
-        APNs-пуш на все запомненные устройства. Подписчик этого чата уже получил
-        событие по WS, пуш ему не нужен. Fire-and-forget.
+        """§push: доставить уведомление КАЖДОМУ известному устройству ровно один
+        раз. Устройство, подписанное на ЭТОТ чат живым соединением, уже получило
+        событие по WS — пуш ему не шлём. Всем остальным (закрыто ИЛИ открыт
+        другой чат — по WS не дойдёт) просим релей прислать APNs-пуш. Один
+        Apple-аккаунт = несколько устройств: маршрутизируем per-device по
+        deviceId. Fire-and-forget.
 
-        Важно: критерий — подписка именно на ЭТОТ chat_id, а не «есть ли вообще
-        соединение»: иначе notify для чата B при открытом чате A не дошёл бы
-        никак (ни по WS — нет подписки, ни пушем — соединение-то есть)."""
-        if not self.config.push_enabled or self.hub.has_subscribers(chat_id):
+        Критерий «онлайн» — именно подписка на ЭТОТ chat_id (устройство реально
+        получит по WS), а не «есть ли вообще соединение»: иначе устройство с
+        открытым чатом A не получило бы notify для чата B никак."""
+        if not self.config.push_enabled:
             return
-        for key in self.push_keys.keys():
+        online = self.hub.devices_subscribed(chat_id)   # получат напрямую по WS
+        for device_id, key in self.push_keys.devices():
+            if device_id in online:
+                continue                                # уже доставлено по WS
             task = asyncio.create_task(push.send(
                 list(self.config.push_relay_urls), key, title, body, chat_id))
             self._push_tasks.add(task)
@@ -275,8 +280,11 @@ class HedgehogServer:
             return
         if ftype == "register_push":
             # §push: запомнить notifyKey устройства (секрет отправки) — по нему
-            # попросим релей отправить APNs-пуш, когда клиент будет оффлайн.
-            self.push_keys.remember(p.notifyKey)
+            # попросим релей отправить APNs-пуш, когда устройство будет оффлайн.
+            # deviceId привязываем к соединению → знаем, какие устройства онлайн
+            # (получат напрямую по WS) и каким нужен пуш (per-device маршрутизация).
+            self.push_keys.remember(p.notifyKey, p.deviceId)
+            self.hub.set_device(conn_id, p.deviceId)
             return
         if ftype == "update_self":
             # §15: git pull своего исходника + перезапуск. Авторизация — тем же

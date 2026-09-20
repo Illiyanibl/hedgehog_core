@@ -260,9 +260,15 @@ class RemoveMcpPayload(_Payload):
 
 class RegisterPushPayload(_Payload):
     """§push: клиент сообщает свой notifyKey (секрет ОТПРАВКИ) — Ёžik запоминает
-    его и при агентском notify с ОФФЛАЙН-клиентом просит релей push.hedgehog.devolution.dev
-    отправить APNs-пуш. accountId (секрет регистрации) сюда НЕ передаётся."""
+    его и при агентском notify с ОФФЛАЙН-устройством просит релей push.hedgehog.devolution.dev
+    отправить APNs-пуш. accountId (секрет регистрации) сюда НЕ передаётся.
+
+    deviceId — несекретный стабильный id устройства (per-install UUID): по нему
+    маршрутизируем per-device (один аккаунт = несколько устройств; онлайн получат
+    напрямую по WS, оффлайн — пушем). Опционален (старый клиент — без него)."""
     notifyKey: str = Field(min_length=1, max_length=200)
+    deviceId: str = Field(default="", max_length=200,
+                          pattern=r"^[A-Za-z0-9._-]*$")
 
 
 # type → (payload-модель, нужен ли chatId в обёртке)
