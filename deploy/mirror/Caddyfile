@@ -10,6 +10,10 @@ resource.hedgehog.devolution.dev {
 
 # §push: релей APNs. Caddy терминирует TLS (авто-сертификат Let's Encrypt) и
 # проксирует на контейнер релея в общей docker-сети hedgehog-edge.
+# header_up X-Real-IP {remote_host}: ПЕРЕЗАПИСЫВАЕМ реальным IP клиента —
+# релей доверяет только ему (клиентский X-Forwarded-For подделываем, не читаем).
 push.hedgehog.devolution.dev {
-	reverse_proxy hedgehog-push:8080
+	reverse_proxy hedgehog-push:8080 {
+		header_up X-Real-IP {remote_host}
+	}
 }

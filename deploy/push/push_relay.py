@@ -20,14 +20,23 @@ APNs: HTTP/2, ES256-JWT (kid=Key ID, iss=Team ID), apns-topic=bundle id.
 """
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import os
+import re
 import time
+from collections import deque
+from datetime import datetime, timezone
 
 import aiosqlite
 import httpx
 import jwt  # PyJWT
 from aiohttp import web
+
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s %(levelname)s push %(message)s")
+log = logging.getLogger("push")
 
 # --- конфиг (идентификаторы не секретны; секрет — только .p8) ----------------
 KEY_PATH = os.environ.get("APNS_KEY_PATH", "/secrets/AuthKey.p8")
@@ -48,7 +57,90 @@ TIER_DAILY = {"free": 5, "lite": 30, "full": 200, "sponsor": 200}
 DEFAULT_DAILY = 5
 
 EXPIRATION_SECS = 6 * 3600   # apns-expiration: протухший пуш не прилетит сутки спустя
-MAX_TEXT = 512               # защитная обрезка (payload APNs ≤ 4KB)
+
+# §contract: защита от модифицированного/злого Ёžика (крутится у пользователя).
+# Enforced ЗДЕСЬ (не доверяем клиенту). БАН (5 мин, silent-TCP-drop) — только за
+# СТРУКТУРНОЕ злоупотребление: флуд (rate), битый JSON, битый формат id, тело
+# >MAX_BODY. Длинный текст НЕ банится — ОБРЕЗАется. Квота (сверх лимита пуш не
+# уходит) — анти-спам; rate-limit — анти-ддос. Бан in-memory на каждом релее.
+MAX_TEXT = 512              # обрезка title/body (символы; payload APNs ≤ 4KB)
+MAX_BODY = 8192            # raw-тело запроса (байты); больше → 413 → бан
+BAN_SECS = 300            # бан за структурное нарушение, сек
+# Раздельные лимиты: notify (Ёžик, выделенный IP — строже) vs register (телефон,
+# может быть за CGNAT — мягче, иначе забаним общий NAT-IP офиса/оператора).
+REQ_LIMIT_NOTIFY = 60      # notify-запросов с IP за окно
+REQ_LIMIT_REGISTER = 120   # register-запросов с IP за окно (CGNAT-запас)
+REQ_WINDOW = 60           # окно рейт-лимита, сек
+STATE_SWEEP = 120         # период чистки bans/hits, сек
+_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,200}$")   # accountId/notifyKey/apnsToken
+
+
+def _iso(ts: float) -> str:
+    """Стандартизированное время (ISO-8601 UTC, секундная точность)."""
+    return datetime.fromtimestamp(int(ts), timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _client_ip(request: web.Request) -> str:
+    """Реальный IP Ёžика из X-Real-IP, который ВЫСТАВЛЯЕТ доверенный Caddy
+    (header_up X-Real-IP {remote_host} — перезаписывает клиентское значение).
+    Клиентский X-Forwarded-For НЕ доверяем (его можно подделать). Fallback —
+    peername (Caddy) на случай прямого обращения."""
+    rip = request.headers.get("X-Real-IP", "").strip()
+    if rip:
+        return rip
+    peer = request.transport.get_extra_info("peername") if request.transport else None
+    return peer[0] if peer else "?"
+
+
+def _ban(app: web.Application, ip: str, now: float, why: str) -> None:
+    app["bans"][ip] = now + BAN_SECS
+    log.warning("ban ip=%s why=%s for=%ds", ip, why, BAN_SECS)
+
+
+def _banned(app: web.Application, ip: str, now: float) -> bool:
+    until = app["bans"].get(ip)
+    if until is None:
+        return False
+    if now < until:
+        return True
+    app["bans"].pop(ip, None)   # бан истёк
+    return False
+
+
+def _rate_ok(app: web.Application, ip: str, now: float, limit: int) -> bool:
+    dq = app["hits"].get(ip)
+    if dq is None:
+        dq = deque()
+        app["hits"][ip] = dq
+    cutoff = now - REQ_WINDOW
+    while dq and dq[0] < cutoff:
+        dq.popleft()
+    dq.append(now)
+    return len(dq) <= limit
+
+
+def _drop(request: web.Request) -> web.Response:
+    """Ответ на забаненный/нарушивший запрос: ПУСТОЙ 429, без тела и деталей.
+    Раньше рвали TCP (transport.abort), но за reverse-proxy Caddy это даёт
+    клиенту 502 и провоцирует РЕТРАИ upstream (двойная обработка). Пустой 429 —
+    атакующему бесполезен (нет reason/retry/ban-инфо), без 502/ретраев/лог-спама."""
+    return web.Response(status=429)
+
+
+async def _sweeper(app: web.Application):
+    """Периодическая чистка in-memory состояния (иначе рост при спрее IP → OOM)."""
+    while True:
+        await asyncio.sleep(STATE_SWEEP)
+        now = _now()
+        for ip in [k for k, until in app["bans"].items() if until <= now]:
+            app["bans"].pop(ip, None)
+        cutoff = now - REQ_WINDOW
+        for ip in list(app["hits"].keys()):
+            dq = app["hits"][ip]
+            while dq and dq[0] < cutoff:
+                dq.popleft()
+            if not dq:
+                app["hits"].pop(ip, None)
 
 
 def _now() -> int:
@@ -94,18 +186,46 @@ def _bad(msg: str, code: int = 400):
     return web.json_response({"ok": False, "error": msg}, status=code)
 
 
+@web.middleware
+async def guard(request: web.Request, handler):
+    """§contract: сетевой заслон перед всеми ручками (кроме health).
+    Бан-чек → рейт-лимит → размер тела. Нарушение → бан IP + silent-drop."""
+    if request.path == "/v1/health":
+        return await handler(request)
+    ip = _client_ip(request)
+    now = _now()
+    if _banned(request.app, ip, now):
+        return _drop(request)                       # молчим весь бан
+    limit = REQ_LIMIT_REGISTER if request.path == "/v1/register" else REQ_LIMIT_NOTIFY
+    if not _rate_ok(request.app, ip, now, limit):
+        _ban(request.app, ip, now, "rate")          # флуд/ддос
+        return _drop(request)
+    try:
+        return await handler(request)
+    except web.HTTPRequestEntityTooLarge:
+        _ban(request.app, ip, now, "body_too_large")   # тело > MAX_BODY (структурное)
+        return _drop(request)
+
+
 async def handle_register(request: web.Request) -> web.Response:
+    ip = _client_ip(request)
+    now = _now()
     try:
         d = await request.json()
+    except web.HTTPException:
+        raise                                        # 413 → ловит guard (бан)
     except Exception:
-        return _bad("bad json")
+        _ban(request.app, ip, now, "bad_json")
+        return _drop(request)
     acc = (d.get("accountId") or "").strip()
     nkey = (d.get("notifyKey") or "").strip()
     tok = (d.get("apnsToken") or "").strip()
     tier = (d.get("tier") or "free").strip().lower()
     env = (d.get("env") or DEFAULT_ENV).strip().lower()
-    if not acc or not nkey or not tok:
-        return _bad("accountId, notifyKey and apnsToken required")
+    # §contract: битые/нестандартные id — нарушение → бан.
+    if not (_ID_RE.match(acc) and _ID_RE.match(nkey) and _ID_RE.match(tok)):
+        _ban(request.app, ip, now, "bad_ids")
+        return _drop(request)
     if env not in APNS_HOST:
         env = DEFAULT_ENV
     if tier not in TIER_DAILY:
@@ -113,14 +233,21 @@ async def handle_register(request: web.Request) -> web.Response:
     db = request.app["db"]
     # accountId — ключ владельца; notifyKey привязан к нему (UNIQUE). Перезапись
     # возможна только знающим accountId (клиентом), не сервером.
-    await db.execute(
-        """INSERT INTO devices(account_id, notify_key, apns_token, tier, env, updated)
-           VALUES(?,?,?,?,?,?)
-           ON CONFLICT(account_id) DO UPDATE SET
-             notify_key=excluded.notify_key, apns_token=excluded.apns_token,
-             tier=excluded.tier, env=excluded.env, updated=excluded.updated""",
-        (acc, nkey, tok, tier, env, _now()))
-    await db.commit()
+    try:
+        await db.execute(
+            """INSERT INTO devices(account_id, notify_key, apns_token, tier, env, updated)
+               VALUES(?,?,?,?,?,?)
+               ON CONFLICT(account_id) DO UPDATE SET
+                 notify_key=excluded.notify_key, apns_token=excluded.apns_token,
+                 tier=excluded.tier, env=excluded.env, updated=excluded.updated""",
+            (acc, nkey, tok, tier, env, _now()))
+        await db.commit()
+    except aiosqlite.IntegrityError:
+        # notifyKey уже привязан к ДРУГОМу accountId (UNIQUE) — попытка занять
+        # чужой notifyKey. Split-secret держит (нужен и accountId), просто
+        # отказываем без 500.
+        await db.rollback()
+        return web.json_response({"ok": False, "error": "conflict"}, status=409)
     return web.json_response({"ok": True})
 
 
@@ -136,30 +263,63 @@ async def _quota_left(db: aiosqlite.Connection, acc: str, tier: str) -> int:
     return max(0, limit - used)
 
 
+async def _reset_at(db: aiosqlite.Connection, acc: str) -> float:
+    """Когда освободится слот суточного окна = самый старый пуш в окне + 24ч."""
+    since = _now() - 86400
+    async with db.execute(
+            "SELECT MIN(ts) FROM pushes WHERE account_id=? AND ts>=?",
+            (acc, since)) as cur:
+        (oldest,) = await cur.fetchone()
+    return (oldest + 86400) if oldest else (_now() + 86400)
+
+
+def _quota_resp(reset: float, now: float, sent: bool) -> web.Response:
+    """Ответ с стандартизированным временем сброса лимита (+ Retry-After)."""
+    retry = max(1, int(reset - now))
+    body = {"ok": True, "sent": sent, "reset_at": _iso(reset), "retry_after": retry}
+    if not sent:
+        body["reason"] = "quota"
+    r = web.json_response(body)
+    r.headers["Retry-After"] = str(retry)
+    return r
+
+
 async def handle_notify(request: web.Request) -> web.Response:
+    ip = _client_ip(request)
+    now = _now()
     try:
         d = await request.json()
+    except web.HTTPException:
+        raise                                        # 413 → guard (бан)
     except Exception:
-        return _bad("bad json")
+        _ban(request.app, ip, now, "bad_json")
+        return _drop(request)
     nkey = (d.get("notifyKey") or "").strip()
+    # §contract: битый notifyKey — структурное нарушение → бан. Текст НЕ баним,
+    # а обрезаем (кириллица/эмодзи не должны валить легитимного отправителя).
+    if not _ID_RE.match(nkey):
+        _ban(request.app, ip, now, "bad_notifyKey")
+        return _drop(request)
     title = (d.get("title") or "").strip()[:MAX_TEXT]
     body = (d.get("body") or "").strip()[:MAX_TEXT]
-    if not nkey:
-        return _bad("notifyKey required")
+    chat_id = (d.get("chatId") or "").strip()
     db = request.app["db"]
     async with db.execute(
             "SELECT account_id, apns_token, tier, env FROM devices WHERE notify_key=?",
             (nkey,)) as cur:
         row = await cur.fetchone()
     if row is None:
+        # Не бан: устройство просто не на этом релее (валидный failover связки).
         return web.json_response({"ok": True, "sent": False, "reason": "unregistered"})
     acc, apns_token, tier, env = row
-    if await _quota_left(db, acc, tier) <= 0:
-        return web.json_response({"ok": True, "sent": False, "reason": "quota"})
+    left = await _quota_left(db, acc, tier)
+    if left <= 0:
+        # Лимит исчерпан → сообщаем время сброса (информационно; гейта/бана нет —
+        # злоупотребление ловит rate-limit, а квота не даёт пушу уйти).
+        return _quota_resp(await _reset_at(db, acc), now, sent=False)
 
     payload = {"aps": {"alert": {"title": title or "Hedgehog", "body": body},
                        "sound": "default"}}
-    chat_id = (d.get("chatId") or "").strip()
     if chat_id:
         payload["chatId"] = chat_id
         payload["aps"]["thread-id"] = chat_id   # группировка пушей по чату
@@ -179,23 +339,29 @@ async def handle_notify(request: web.Request) -> web.Response:
             f"{host}/3/device/{apns_token}",
             headers=headers, content=json.dumps(payload), timeout=10)
     except Exception as e:
-        return _bad(f"apns unreachable: {e}", 502)
+        log.warning("apns unreachable: %s", e)       # детали — в лог, не клиенту
+        return web.json_response({"ok": True, "sent": False, "reason": "apns_error"})
     if resp.status_code == 200:
         await db.execute("INSERT INTO pushes(account_id, ts) VALUES(?,?)", (acc, _now()))
         await db.commit()
+        if left <= 1:
+            # Последний разрешённый пуш — сообщаем reset_at (информационно).
+            return _quota_resp(await _reset_at(db, acc), now, sent=True)
         return web.json_response({"ok": True, "sent": True})
     reason = ""
     try:
         reason = resp.json().get("reason", "")
     except Exception:
-        reason = resp.text[:120]
+        reason = ""
     # Unregistered (410) — Apple предписывает удалить токен (мёртвое устройство).
     # BadDeviceToken (400) НЕ удаляем: частая причина — рассинхрон env, снесёт живое.
     if resp.status_code == 410 or reason == "Unregistered":
         await db.execute("DELETE FROM devices WHERE notify_key=?", (nkey,))
         await db.commit()
+    # Клиенту отдаём apns_status (нужен для failover-логики связки: 410=мёртвый
+    # токен), но НЕ сырой текст Apple (минимизируем рекон для хостильного Ёžika).
     return web.json_response(
-        {"ok": True, "sent": False, "reason": reason, "apns_status": resp.status_code})
+        {"ok": True, "sent": False, "reason": "apns", "apns_status": resp.status_code})
 
 
 async def handle_health(_: web.Request) -> web.Response:
@@ -208,15 +374,23 @@ async def on_startup(app: web.Application):
     app["http"] = httpx.AsyncClient(http2=True)
     app["db"] = await aiosqlite.connect(DB_PATH)
     await init_db(app["db"])
+    app["sweeper"] = asyncio.create_task(_sweeper(app))   # чистка bans/hits
 
 
 async def on_cleanup(app: web.Application):
+    sweeper = app.get("sweeper")
+    if sweeper is not None:
+        sweeper.cancel()
     await app["http"].aclose()
     await app["db"].close()
 
 
 def make_app() -> web.Application:
-    app = web.Application()
+    # client_max_size = MAX_BODY: тело больше → aiohttp 413 → guard банит IP.
+    app = web.Application(client_max_size=MAX_BODY, middlewares=[guard])
+    # §contract state (in-memory на релее): баны и рейт-хиты (чистятся _sweeper).
+    app["bans"] = {}
+    app["hits"] = {}
     app.add_routes([
         web.post("/v1/register", handle_register),
         web.post("/v1/notify", handle_notify),
