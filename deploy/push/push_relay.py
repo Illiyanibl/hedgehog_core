@@ -59,7 +59,7 @@ DEFAULT_DAILY = 5
 EXPIRATION_SECS = 6 * 3600   # apns-expiration: протухший пуш не прилетит сутки спустя
 
 # §contract: защита от модифицированного/злого Ёžика (крутится у пользователя).
-# Enforced ЗДЕСЬ (не доверяем клиенту). БАН (5 мин, silent-TCP-drop) — только за
+# Enforced ЗДЕСЬ (не доверяем клиенту). БАН (5 мин, пустой 429 без деталей) — за
 # СТРУКТУРНОЕ злоупотребление: флуд (rate), битый JSON, битый формат id, тело
 # >MAX_BODY. Длинный текст НЕ банится — ОБРЕЗАется. Квота (сверх лимита пуш не
 # уходит) — анти-спам; rate-limit — анти-ддос. Бан in-memory на каждом релее.
@@ -72,7 +72,12 @@ REQ_LIMIT_NOTIFY = 60      # notify-запросов с IP за окно
 REQ_LIMIT_REGISTER = 120   # register-запросов с IP за окно (CGNAT-запас)
 REQ_WINDOW = 60           # окно рейт-лимита, сек
 STATE_SWEEP = 120         # период чистки bans/hits, сек
-_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,200}$")   # accountId/notifyKey/apnsToken
+# TTL устройства: строка удаляется, если не обновлялась дольше (легит-устройство
+# рефрешит `updated` на каждом запуске/tier-change). Иначе register случайными id
+# копит devices без конца → disk-DoS. Согласовано с Ёžik KEY_TTL=30д.
+DEVICE_TTL = 45 * 86400
+_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,200}$")   # accountId/notifyKey
+_TOKEN_RE = re.compile(r"^[a-fA-F0-9]{64}$")       # apnsToken — ровно 64 hex
 
 
 def _iso(ts: float) -> str:
@@ -128,7 +133,8 @@ def _drop(request: web.Request) -> web.Response:
 
 
 async def _sweeper(app: web.Application):
-    """Периодическая чистка in-memory состояния (иначе рост при спрее IP → OOM)."""
+    """Периодическая чистка: in-memory (bans/hits) + БД (протухшие devices/pushes,
+    иначе register случайными id / брошенные аккаунты копят строки → disk-DoS)."""
     while True:
         await asyncio.sleep(STATE_SWEEP)
         now = _now()
@@ -141,6 +147,16 @@ async def _sweeper(app: web.Application):
                 dq.popleft()
             if not dq:
                 app["hits"].pop(ip, None)
+        # БД: удаляем устройства без рефреша дольше TTL и все пуши старше суток.
+        try:
+            db = app.get("db")
+            if db is not None:
+                await db.execute("DELETE FROM devices WHERE updated < ?",
+                                 (now - DEVICE_TTL,))
+                await db.execute("DELETE FROM pushes WHERE ts < ?", (now - 86400,))
+                await db.commit()
+        except Exception as e:  # noqa: BLE001 — чистка не должна ронять релей
+            log.warning("sweep db prune failed: %s", e)
 
 
 def _now() -> int:
@@ -217,13 +233,17 @@ async def handle_register(request: web.Request) -> web.Response:
     except Exception:
         _ban(request.app, ip, now, "bad_json")
         return _drop(request)
-    acc = (d.get("accountId") or "").strip()
-    nkey = (d.get("notifyKey") or "").strip()
-    tok = (d.get("apnsToken") or "").strip()
-    tier = (d.get("tier") or "free").strip().lower()
-    env = (d.get("env") or DEFAULT_ENV).strip().lower()
-    # §contract: битые/нестандартные id — нарушение → бан.
-    if not (_ID_RE.match(acc) and _ID_RE.match(nkey) and _ID_RE.match(tok)):
+    if not isinstance(d, dict):                      # не-объект → бан
+        _ban(request.app, ip, now, "bad_json")
+        return _drop(request)
+    acc = str(d.get("accountId") or "").strip()      # coerce: не-строки не роняют
+    nkey = str(d.get("notifyKey") or "").strip()
+    tok = str(d.get("apnsToken") or "").strip()
+    tier = str(d.get("tier") or "free").strip().lower()
+    env = str(d.get("env") or DEFAULT_ENV).strip().lower()
+    # §contract: битые/нестандартные id — нарушение → бан. apnsToken строго 64 hex
+    # (defense-in-depth: сужает разнообразие мусора и «чужой токен под своим acc»).
+    if not (_ID_RE.match(acc) and _ID_RE.match(nkey) and _TOKEN_RE.match(tok)):
         _ban(request.app, ip, now, "bad_ids")
         return _drop(request)
     if env not in APNS_HOST:
@@ -251,16 +271,36 @@ async def handle_register(request: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
 
-async def _quota_left(db: aiosqlite.Connection, acc: str, tier: str) -> int:
+async def _reserve(db: aiosqlite.Connection, acc: str, tier: str) -> tuple[int, int] | None:
+    """§quota: АТОМАРНО занять слот суточной квоты — единым INSERT…SELECT WHERE
+    count<limit (одно SQL-выражение → нет гонки read-then-insert между count и
+    insert, даже при конкурентных notify). Возвращает (остаток слотов, rowid
+    вставленной строки), или None если лимит исчерпан. Резерв ДО отправки в APNs
+    → квота ограничивает число обращений к Apple (а не только успехи)."""
     limit = TIER_DAILY.get(tier, DEFAULT_DAILY)
     since = _now() - 86400
-    # Оппортунистическая чистка старых записей этого accountId (лог не растёт).
-    await db.execute("DELETE FROM pushes WHERE account_id=? AND ts<?", (acc, since))
+    cur = await db.execute(
+        "INSERT INTO pushes(account_id, ts) SELECT ?, ? WHERE "
+        "(SELECT COUNT(*) FROM pushes WHERE account_id=? AND ts>=?) < ?",
+        (acc, _now(), acc, since, limit))
+    await db.commit()
+    if cur.rowcount == 0:
+        return None                      # квота исчерпана — слот не выдан
+    rowid = cur.lastrowid
     async with db.execute(
             "SELECT COUNT(*) FROM pushes WHERE account_id=? AND ts>=?",
-            (acc, since)) as cur:
-        (used,) = await cur.fetchone()
-    return max(0, limit - used)
+            (acc, since)) as c:
+        (used,) = await c.fetchone()
+    return (max(0, limit - used), rowid)
+
+
+async def _refund(db: aiosqlite.Connection, rowid: int, acc: str) -> None:
+    """Вернуть слот по ТОЧНОМУ rowid (не MAX — иначе при конкуренции того же
+    аккаунта можно снять чужую свежую бронь). Скоуп по account_id — belt-and-
+    suspenders: даже при баге логики нельзя удалить строку чужого аккаунта.
+    Только если до APNs не дошли."""
+    await db.execute("DELETE FROM pushes WHERE rowid=? AND account_id=?", (rowid, acc))
+    await db.commit()
 
 
 async def _reset_at(db: aiosqlite.Connection, acc: str) -> float:
@@ -294,15 +334,22 @@ async def handle_notify(request: web.Request) -> web.Response:
     except Exception:
         _ban(request.app, ip, now, "bad_json")
         return _drop(request)
-    nkey = (d.get("notifyKey") or "").strip()
+    if not isinstance(d, dict):                      # не-объект (список/строка) → бан
+        _ban(request.app, ip, now, "bad_json")
+        return _drop(request)
+    nkey = str(d.get("notifyKey") or "").strip()     # coerce: не-строки не роняют
     # §contract: битый notifyKey — структурное нарушение → бан. Текст НЕ баним,
     # а обрезаем (кириллица/эмодзи не должны валить легитимного отправителя).
     if not _ID_RE.match(nkey):
         _ban(request.app, ip, now, "bad_notifyKey")
         return _drop(request)
-    title = (d.get("title") or "").strip()[:MAX_TEXT]
-    body = (d.get("body") or "").strip()[:MAX_TEXT]
-    chat_id = (d.get("chatId") or "").strip()
+    title = str(d.get("title") or "").strip()[:MAX_TEXT]
+    body = str(d.get("body") or "").strip()[:MAX_TEXT]
+    # chatId идёт в HTTP-заголовок (collapse-id) и payload → строго валидируем/
+    # обрезаем (иначе control-байты = header-injection, длинный = раздув payload).
+    chat_id = str(d.get("chatId") or "").strip()[:128]
+    if chat_id and not _ID_RE.match(chat_id):
+        chat_id = ""                                 # битый chatId — просто игнор
     db = request.app["db"]
     async with db.execute(
             "SELECT account_id, apns_token, tier, env FROM devices WHERE notify_key=?",
@@ -312,11 +359,12 @@ async def handle_notify(request: web.Request) -> web.Response:
         # Не бан: устройство просто не на этом релее (валидный failover связки).
         return web.json_response({"ok": True, "sent": False, "reason": "unregistered"})
     acc, apns_token, tier, env = row
-    left = await _quota_left(db, acc, tier)
-    if left <= 0:
-        # Лимит исчерпан → сообщаем время сброса (информационно; гейта/бана нет —
-        # злоупотребление ловит rate-limit, а квота не даёт пушу уйти).
+    # §quota: АТОМАРНО резервируем слот ДО отправки (устраняет гонку + ограничивает
+    # обращения к APNs, не только успехи). remaining=None → лимит исчерпан.
+    res = await _reserve(db, acc, tier)
+    if res is None:
         return _quota_resp(await _reset_at(db, acc), now, sent=False)
+    remaining, slot_rowid = res
 
     payload = {"aps": {"alert": {"title": title or "Hedgehog", "body": body},
                        "sound": "default"}}
@@ -339,12 +387,11 @@ async def handle_notify(request: web.Request) -> web.Response:
             f"{host}/3/device/{apns_token}",
             headers=headers, content=json.dumps(payload), timeout=10)
     except Exception as e:
+        await _refund(db, slot_rowid, acc)            # до Apple не дошли → вернём точный слот
         log.warning("apns unreachable: %s", e)       # детали — в лог, не клиенту
         return web.json_response({"ok": True, "sent": False, "reason": "apns_error"})
     if resp.status_code == 200:
-        await db.execute("INSERT INTO pushes(account_id, ts) VALUES(?,?)", (acc, _now()))
-        await db.commit()
-        if left <= 1:
+        if remaining <= 0:
             # Последний разрешённый пуш — сообщаем reset_at (информационно).
             return _quota_resp(await _reset_at(db, acc), now, sent=True)
         return web.json_response({"ok": True, "sent": True})

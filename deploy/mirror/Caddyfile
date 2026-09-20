@@ -1,3 +1,16 @@
+# §contract: таймауты на трасте-границе (Caddy) — анти-slowloris. Рейт-лимит
+# релея видит только ПОЛНОСТЬЮ прочитанный запрос; медленные/недочитанные
+# режем здесь, до релея.
+{
+	servers {
+		timeouts {
+			read_header 10s
+			read_body 15s
+			idle 60s
+		}
+	}
+}
+
 # §mirror: Caddy отдаёт тарбол образа по HTTPS (авто-TLS Let's Encrypt).
 # Монтируется в контейнер hedgehog-mirror; webroot зеркала (OUT_DIR sync-image.sh)
 # смонтирован в /srv :ro. Файл уже gzip — повторное сжатие не включаем.
