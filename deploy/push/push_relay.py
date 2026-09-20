@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""§push: релей APNs для Ёžika (push.ecorp.red).
+"""§push: релей APNs для Ёžika (push.hedgehog.devolution.dev).
 
 Единственное место, где живёт Apple-ключ .p8. Клиент регистрирует device-token,
 Ёžik при агентском уведомлении и оффлайн-клиенте просит релей отправить пуш.
@@ -10,7 +10,7 @@
 Скомпрометированный сервер знает лишь notifyKey → максимум спам в пределах
 квоты; НЕ может перерегистрировать/перехватить токен (нужен accountId).
 
-Endpoints (за TLS Caddy, домен push.ecorp.red, штатный LE-серт — CA-валидация):
+Endpoints (за TLS Caddy, домен push.hedgehog.devolution.dev, штатный LE-серт — CA-валидация):
   POST /v1/register  {accountId, notifyKey, apnsToken, tier, env}
   POST /v1/notify    {notifyKey, title, body, chatId?}
   GET  /v1/health

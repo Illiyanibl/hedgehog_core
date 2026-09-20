@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # §mirror: раз в час тянем актуальный образ Ёžika из ghcr и публикуем его
-# тарболом (docker save|gzip) в webroot зеркала resource.ecorp.red. bootstrap.sh
+# тарболом (docker save|gzip) в webroot зеркала resource.hedgehog.devolution.dev. bootstrap.sh
 # устанавливаемого сервера при недоступности ghcr берёт образ отсюда
 # (curl -C - | docker load), sha256 — для сверки целостности.
 #

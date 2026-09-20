@@ -260,7 +260,7 @@ class RemoveMcpPayload(_Payload):
 
 class RegisterPushPayload(_Payload):
     """§push: клиент сообщает свой notifyKey (секрет ОТПРАВКИ) — Ёžik запоминает
-    его и при агентском notify с ОФФЛАЙН-клиентом просит релей push.ecorp.red
+    его и при агентском notify с ОФФЛАЙН-клиентом просит релей push.hedgehog.devolution.dev
     отправить APNs-пуш. accountId (секрет регистрации) сюда НЕ передаётся."""
     notifyKey: str = Field(min_length=1, max_length=200)
 

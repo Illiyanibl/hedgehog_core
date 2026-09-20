@@ -30,7 +30,7 @@ NET=hedgehog-net
 IMAGE="${HEDGEHOG_IMAGE:-ghcr.io/illiyanibl/hedgehog:latest}"
 # §image-mirror: запасной источник образа (тарбол по HTTPS) на случай, когда
 # ghcr для VPS медленный/флапает (инцидент: шаг image падал на docker pull).
-MIRROR_URL="${HEDGEHOG_MIRROR_URL:-https://resource.ecorp.red/hedgehog-latest.tar.gz}"
+MIRROR_URL="${HEDGEHOG_MIRROR_URL:-https://resource.hedgehog.devolution.dev/hedgehog-latest.tar.gz}"
 
 log(){ echo "[bootstrap] $*"; }
 
@@ -47,7 +47,7 @@ pull_image_with_retry(){ # <image>
   return 1
 }
 
-# §image-mirror: запасной путь — тарбол образа с зеркала (resource.ecorp.red).
+# §image-mirror: запасной путь — тарбол образа с зеркала (resource.hedgehog.devolution.dev).
 # Резюмируемая докачка (curl -C -), сверка sha256 (если .sha256 доступен),
 # docker load. `docker save` сохраняет repo:tag → последующий `docker run
 # "$IMAGE"` берёт образ из локального кэша без пула.

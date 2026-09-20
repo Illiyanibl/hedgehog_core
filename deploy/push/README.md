@@ -1,4 +1,4 @@
-# §push — релей APNs (push.ecorp.red)
+# §push — релей APNs (push.hedgehog.devolution.dev)
 
 Единственное место, где живёт Apple-ключ `.p8`. Ёžik сам в APNs не ходит —
 шлёт запрос сюда по TLS (штатная CA-валидация LE-серта, **не** пиннинг —
@@ -43,7 +43,7 @@ Sign in with Apple.
 Суточный лимит пушей: free=5, lite=30, full=200 (`TIER_DAILY` в push_relay.py).
 Лог `pushes` чистится оппортунистически (записи старше 24ч).
 
-## Развёртывание (на хосте push.ecorp.red)
+## Развёртывание (на хосте push.hedgehog.devolution.dev)
 
 ```
 # .p8 положить в /opt/hedgehog-push/secrets/AuthKey.p8 (chmod 600), НЕ в git
@@ -57,7 +57,7 @@ docker run -d --name hedgehog-push --restart unless-stopped \
   hedgehog-push
 # ВАЖНО: без -p — наружу порт НЕ публикуем, доступ только через Caddy.
 # Caddy (hedgehog-mirror) должен быть в сети hedgehog-edge и проксировать
-# push.ecorp.red → hedgehog-push:8080 (см. deploy/mirror/Caddyfile).
+# push.hedgehog.devolution.dev → hedgehog-push:8080 (см. deploy/mirror/Caddyfile).
 ```
 
 ## Окружение APNs (sandbox/production)

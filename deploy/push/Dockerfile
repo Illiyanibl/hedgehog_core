@@ -1,4 +1,4 @@
-# §push: контейнер релея APNs (push.ecorp.red). Секрет .p8 НЕ в образе —
+# §push: контейнер релея APNs (push.hedgehog.devolution.dev). Секрет .p8 НЕ в образе —
 # монтируется томом (/secrets/AuthKey.p8, chmod 600 на хосте). БД — том /data.
 FROM python:3.12-slim
 WORKDIR /app

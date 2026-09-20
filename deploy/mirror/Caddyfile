@@ -1,7 +1,7 @@
 # §mirror: Caddy отдаёт тарбол образа по HTTPS (авто-TLS Let's Encrypt).
 # Монтируется в контейнер hedgehog-mirror; webroot зеркала (OUT_DIR sync-image.sh)
 # смонтирован в /srv :ro. Файл уже gzip — повторное сжатие не включаем.
-resource.ecorp.red {
+resource.hedgehog.devolution.dev {
 	root * /srv
 	file_server
 	# Тарбол обновляется ежечасно — не даём кэшам залипнуть на старой копии.
@@ -10,6 +10,6 @@ resource.ecorp.red {
 
 # §push: релей APNs. Caddy терминирует TLS (авто-сертификат Let's Encrypt) и
 # проксирует на контейнер релея в общей docker-сети hedgehog-edge.
-push.ecorp.red {
+push.hedgehog.devolution.dev {
 	reverse_proxy hedgehog-push:8080
 }
