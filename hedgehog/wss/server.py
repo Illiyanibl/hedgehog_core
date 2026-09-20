@@ -121,7 +121,7 @@ class HedgehogServer:
             return
         for key in self.push_keys.keys():
             task = asyncio.create_task(push.send(
-                self.config.push_relay_url, key, title, body, chat_id))
+                list(self.config.push_relay_urls), key, title, body, chat_id))
             self._push_tasks.add(task)
             task.add_done_callback(self._push_tasks.discard)
 

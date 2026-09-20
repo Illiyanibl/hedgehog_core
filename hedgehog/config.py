@@ -88,10 +88,18 @@ class Config:
     # Лог приложения-клиента (§14 client_log): накопительный файл, лимит.
     client_log_cap: int = 512 * 1024 * 1024  # 512 МБ
 
-    # §push: релей APNs (push.hedgehog.devolution.dev). Ёžik сам в APNs не ходит — при
-    # агентском notify с оффлайн-клиентом просит релей отправить пуш.
-    push_relay_url: str = field(default_factory=lambda: os.environ.get(
-        "HEDGEHOG_PUSH_RELAY", "https://push.hedgehog.devolution.dev"))
+    # §push: СВЯЗКА релеев APNs (active-active, разные хостеры EU). Ёžik сам в
+    # APNs не ходит — при агентском notify с оффлайн-клиентом просит релей(и)
+    # отправить пуш; список = failover (push.send идёт по нему до первого,
+    # кто отправил). Env HEDGEHOG_PUSH_RELAY — через запятую/пробел (список из
+    # одного = обратная совместимость).
+    push_relay_urls: tuple[str, ...] = field(default_factory=lambda: tuple(
+        u.strip() for u in os.environ.get(
+            "HEDGEHOG_PUSH_RELAY",
+            "https://eupush.hedgehog.devolution.dev,"
+            "https://eupush2.hedgehog.devolution.dev,"
+            "https://eupush3.hedgehog.devolution.dev",
+        ).replace(" ", ",").split(",") if u.strip()))
     push_enabled: bool = field(default_factory=lambda: os.environ.get(
         "HEDGEHOG_PUSH_ENABLED", "1").lower() in ("1", "true", "yes", "on"))
 

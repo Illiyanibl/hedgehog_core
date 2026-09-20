@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 from pathlib import Path
@@ -74,21 +75,62 @@ class PushKeys:
         return list(self._keys.keys())
 
 
-async def send(relay_url: str, notify_key: str, title: str, body: str,
-               chat_id: str | None = None) -> None:
-    """Fire-and-forget: попросить релей отправить один пуш. Ошибки — в лог,
-    не пробрасываем (пуш не должен ломать основной notify-путь)."""
+def _ordered(relay_urls: list[str], notify_key: str) -> list[str]:
+    """Порядок обхода связки для устройства: ротируем список по стабильному
+    хешу notify_key (hashlib, не встроенный hash — тот солёный per-process).
+    Даёт «домашний» релей на устройство + равномерное распределение нагрузки."""
+    urls = [u for u in relay_urls if u]
+    if len(urls) <= 1:
+        return urls
+    h = int(hashlib.sha256(notify_key.encode()).hexdigest(), 16)
+    i = h % len(urls)
+    return urls[i:] + urls[:i]
+
+
+async def send(relay_urls: list[str], notify_key: str, title: str, body: str,
+               chat_id: str | None = None) -> bool:
+    """Fire-and-forget с FAILOVER по связке релеев. Идём по списку (ротирован по
+    notify_key), пока какой-то не отправит. Правила перехода к следующему:
+      • sent:true            → успех, стоп (True);
+      • reason == "quota"    → лимит юзера, стоп (False) — не обходим квоту
+        (ПРИМ.: квота у каждого релея своя (per-node sqlite) — при падении
+        домашнего релея failover на соседа даёт СВОЮ квоту, т.е. в окне отказа
+        суточный лимит эффективно множится до ~N×. Устранимо только общим
+        состоянием — вне scope; для best-effort пуша приемлемо);
+      • apns_status == 410   → токен мёртв (Unregistered) — на всех релеях он
+        одинаков (клиент регает один apnsToken всем), перебор бессмыслен → стоп;
+      • unregistered(row miss)/sent:false, не-2xx, таймаут, ошибка → следующий.
+    Ошибки не пробрасываем (пуш не должен ломать основной notify-путь)."""
     payload: dict[str, str] = {
         "notifyKey": notify_key, "title": title, "body": body,
     }
     if chat_id:
         payload["chatId"] = chat_id
-    url = relay_url.rstrip("/") + "/v1/notify"
-    try:
-        timeout = aiohttp.ClientTimeout(total=10)
-        async with aiohttp.ClientSession(timeout=timeout) as s:
-            async with s.post(url, json=payload) as r:
-                txt = (await r.text())[:120]
-                log.info("push.sent", status=r.status, resp=txt)
-    except Exception as e:  # noqa: BLE001 — сеть/таймаут не должны падать наверх
-        log.warning("push.send_failed", err=str(e))
+    timeout = aiohttp.ClientTimeout(total=10)
+    for base in _ordered(relay_urls, notify_key):
+        url = base.rstrip("/") + "/v1/notify"
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as s:
+                async with s.post(url, json=payload) as r:
+                    data = {}
+                    try:
+                        data = await r.json(content_type=None)
+                    except Exception:  # noqa: BLE001
+                        data = {}
+                    if r.status == 200 and data.get("sent"):
+                        log.info("push.sent", url=base)
+                        return True
+                    reason = str(data.get("reason", "")) if isinstance(data, dict) else ""
+                    if reason == "quota":
+                        log.info("push.quota", url=base)
+                        return False
+                    if isinstance(data, dict) and data.get("apns_status") == 410:
+                        # Мёртвый токен (Unregistered) — идентичен на всех релеях.
+                        log.info("push.token_dead", url=base)
+                        return False
+                    log.info("push.relay_skip", url=base, status=r.status,
+                             reason=reason)
+        except Exception as e:  # noqa: BLE001 — сеть/таймаут → следующий релей
+            log.warning("push.relay_failed", url=base, err=str(e))
+    log.warning("push.all_relays_failed", key=notify_key[-6:])
+    return False
