@@ -71,6 +71,9 @@ class ChatMeta:
     # opts["model"] и перекрывает дефолт тира. None → дефолт CLI. Меняется
     # фреймом set_model; переживает рестарт/set_mode (persist в meta.json).
     model: str | None = None
+    # §cli-types: тип CLI-агента чата (claude сейчас; задел под codex и др.).
+    # Для broker_shell не используется. Старые meta.json без поля → "claude".
+    cliType: str = "claude"
 
 
 class ChatStore:
@@ -94,6 +97,7 @@ class ChatStore:
                permission_mode: str = "default",
                log_kb: int | None = None,
                skills: list[str] | None = None,
+               cli_type: str = "claude",
                projects_base: str | None = None) -> ChatMeta:
         chat_id = new_ulid()
         chat_dir = self._chat_dir(chat_id)
@@ -110,7 +114,7 @@ class ChatStore:
         meta = ChatMeta(chatId=chat_id, name=name, addressee=addressee,
                         cwd=cwd, created_at=time.time(),
                         mcp=mcp or [], permission_mode=permission_mode,
-                        log_kb=log_kb, skills=skills)
+                        log_kb=log_kb, skills=skills, cliType=cli_type)
         (chat_dir / "meta.json").write_text(
             json.dumps(asdict(meta), ensure_ascii=False, indent=1))
         return meta

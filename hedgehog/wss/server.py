@@ -227,36 +227,43 @@ class HedgehogServer:
             return self._MODELS_MIN_INTERVAL - since
         self._last_probe_ts = time.time()
 
-        # Проба — отдельной таской, чтобы входящий user_msg мог её отменить
-        # (M1: не держим второй процесс во время хода).
-        self._models_probe_task = asyncio.create_task(
-            models.probe_models(self.config, str(self.config.data_dir)))
-        try:
-            data = await self._models_probe_task
-        except asyncio.CancelledError:
-            # Различаем отмену САМОГО рефрешера (shutdown отменил _models_task —
-            # у текущей таски есть pending-cancel) от отмены только пробы
-            # (user_msg → _cancel_models_probe отменил лишь дочернюю таску).
-            # Не полагаемся на флаг: он мог бы «проглотить» отмену рефрешера.
-            cur = asyncio.current_task()
-            if cur is not None and cur.cancelling() > 0:
-                raise                           # отменяют рефрешер (shutdown)
-            log.info("models.probe_cancelled_busy")
-            return self._MODELS_RETRY           # отменили пробу из-за хода
-        finally:
-            self._models_probe_task = None
+        # §cli-types: обновляем кэш КАЖДОГО известного типа CLI (сейчас один —
+        # claude). Каждый тип — своя проба/кэш/бродкаст.
+        for cli_type in models.KNOWN_CLI_TYPES:
+            # Проба — отдельной таской, чтобы входящий user_msg мог её отменить
+            # (M1: не держим второй процесс во время хода).
+            self._models_probe_task = asyncio.create_task(
+                models.probe_models(self.config, str(self.config.data_dir),
+                                    cli_type))
+            try:
+                data = await self._models_probe_task
+            except asyncio.CancelledError:
+                # Различаем отмену САМОГО рефрешера (shutdown отменил
+                # _models_task — у текущей таски есть pending-cancel) от отмены
+                # только пробы (user_msg → _cancel_models_probe отменил лишь
+                # дочернюю таску). Не полагаемся на флаг: он мог бы «проглотить»
+                # отмену рефрешера.
+                cur = asyncio.current_task()
+                if cur is not None and cur.cancelling() > 0:
+                    raise                       # отменяют рефрешер (shutdown)
+                log.info("models.probe_cancelled_busy", cli=cli_type)
+                return self._MODELS_RETRY       # отменили пробу из-за хода
+            finally:
+                self._models_probe_task = None
 
-        if data.get("auth_state") == "OK" and data.get("models"):
-            data["updated_at"] = time.time()
-            models.save_cache(self.config, data)
-            log.info("models.refreshed", n=len(data["models"]),
-                     current=data.get("current"))
-            # §models L1: клиенты, застрявшие на PENDING, узнают о готовности.
-            await self.hub.broadcast_global(make_frame("models_list", data))
-        else:
-            # Не затираем последний хороший кэш (auth протух / нет CLI / ошибка).
-            log.info("models.refresh_skip", auth=data.get("auth_state"),
-                     cli=data.get("cli_present"))
+            if data.get("auth_state") == "OK" and data.get("models"):
+                data["updated_at"] = time.time()
+                models.save_cache(self.config, data, cli_type)
+                log.info("models.refreshed", cli=cli_type,
+                         n=len(data["models"]), current=data.get("current"))
+                # §models L1: клиенты на PENDING узнают о готовности.
+                await self.hub.broadcast_global(
+                    make_frame("models_list", data))
+            else:
+                # Не затираем последний хороший кэш (auth/нет CLI/ошибка).
+                log.info("models.refresh_skip", cli=cli_type,
+                         auth=data.get("auth_state"),
+                         present=data.get("cli_present"))
         return self._MODELS_TTL
 
     def _cancel_models_probe(self) -> None:
@@ -315,6 +322,9 @@ class HedgehogServer:
                 "server_commit": _SERVER_COMMIT,   # §update: HEAD для сверки с репо
                 "supported_v": list(self.config.protocol_versions),
                 "capabilities": list(self.config.capabilities),
+                # §cli-types: какие типы CLI-агентов умеет этот Ёžik (клиент
+                # покажет выбор только из них; старый клиент поле игнорит).
+                "cliTypes": list(models.KNOWN_CLI_TYPES),
             }))
             async for raw in ws:
                 await self._dispatch(conn_id, raw)
@@ -494,14 +504,21 @@ class HedgehogServer:
             await self.hub.send_global(conn_id, make_frame("chat_list", {"chats": chats}))
             return
         if ftype == "list_models":
-            # §models: отдаём кэш МГНОВЕННО (CLI не дёргаем). Нет кэша —
-            # отвечаем PENDING и будим фоновый рефрешер.
-            data = models.load_cache(self.config)
-            if data is None:
-                data = {"models": [], "current": None, "raw": "",
-                        "auth_state": "PENDING", "cli_present": None,
-                        "updated_at": 0}
-                self._models_refresh_now.set()
+            # §models/§cli-types: отдаём кэш нужного типа CLI МГНОВЕННО (CLI не
+            # дёргаем). Неизвестный тип → UNSUPPORTED; нет кэша → PENDING + будим
+            # фоновый рефрешер.
+            cli_type = p.cliType
+            if cli_type not in models.KNOWN_CLI_TYPES:
+                data = {"cliType": cli_type, "models": [], "current": None,
+                        "raw": "", "auth_state": "UNSUPPORTED",
+                        "cli_present": False, "updated_at": 0}
+            else:
+                data = models.load_cache(self.config, cli_type)
+                if data is None:
+                    data = {"cliType": cli_type, "models": [], "current": None,
+                            "raw": "", "auth_state": "PENDING",
+                            "cli_present": None, "updated_at": 0}
+                    self._models_refresh_now.set()
             await self.hub.send_global(
                 conn_id, make_frame("models_list", data))
             return
@@ -515,10 +532,18 @@ class HedgehogServer:
             seed_skills = None
             if p.addressee == "claude":
                 seed_skills = self.skill_sources.new_chat_skill_names() or None
+            # §cli-types: неизвестный тип клампим к дефолту — meta не должна
+            # врать о типе (сессию по нему поднимаем; сейчас всегда claude).
+            cli_type = (p.cliType if p.cliType in models.KNOWN_CLI_TYPES
+                        else models.DEFAULT_CLI_TYPE)
+            if cli_type != p.cliType:
+                log.warning("chat.clitype_unknown", requested=p.cliType,
+                            fallback=cli_type)
             meta = self.store.create(
                 p.name, p.addressee, p.cwd,
                 mcp=p.mcp, permission_mode=p.permission_mode,
                 log_kb=p.log_kb, skills=seed_skills,
+                cli_type=cli_type,
                 projects_base=self.config.default_cwd)
             log.info("chat.created", chat=meta.chatId, name=meta.name,
                      addressee=meta.addressee, cwd=meta.cwd, mcp=meta.mcp,

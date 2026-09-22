@@ -150,6 +150,10 @@ class EmptyPayload(_Payload):
 class CreateChatPayload(_Payload):
     name: str
     addressee: Literal["claude", "broker_shell"]
+    # §cli-types: тип CLI-агента для agent-чатов (addressee="claude").
+    # Дефолт "claude"; задел под codex и др. Игнорируется для broker_shell.
+    # Неизвестный тип сервер клампит к дефолту (см. create_chat).
+    cliType: str = Field(default="claude", max_length=40)
     cwd: str | None = None
     # §3.7 (non-breaking): MCP по именам из реестра + пресет прав.
     mcp: list[str] = Field(default_factory=list)
@@ -169,6 +173,12 @@ class SetModelPayload(_Payload):
     # Значение — алиас (sonnet/opus/…) или полный id; не валидируем против
     # списка (CLI сам принимает и алиасы, и полные имена).
     model: str = Field(default="", max_length=200)
+
+
+class ListModelsPayload(_Payload):
+    # §cli-types: запрос списка моделей для конкретного типа CLI. Дефолт
+    # "claude" (старый клиент без поля). Сервер отдаёт кэш этого типа.
+    cliType: str = Field(default="claude", max_length=40)
 
 
 class InstallSkillPayload(_Payload):
@@ -305,7 +315,7 @@ CLIENT_FRAME_TYPES: dict[str, tuple[type[_Payload], bool]] = {
     "create_chat": (CreateChatPayload, False),
     "set_mode": (SetModePayload, True),
     "set_model": (SetModelPayload, True),
-    "list_models": (EmptyPayload, False),
+    "list_models": (ListModelsPayload, False),
     "list_skills": (EmptyPayload, True),
     "install_skill": (InstallSkillPayload, False),
     "set_skill_group": (SetSkillGroupPayload, True),

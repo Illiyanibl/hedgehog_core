@@ -3,9 +3,10 @@
 Источник правды — сам CLI: пустой `/model` печатает строку вида
     Usage: /model <name>. Available: sonnet, opus, haiku, …, or a full model ID.
     Current model: <name> …
-Парсим её и кэшируем на диск (data/models.json). Клиенту список отдаётся из
-кэша МГНОВЕННО (фрейм list_models); кэш обновляет ФОНОВЫЙ рефрешер раз в сутки
-(см. wss.server) — на клиентский запрос CLI не дёргается.
+Парсим её и кэшируем на диск ПО ТИПУ CLI (data/models.<cliType>.json). Клиенту
+список отдаётся из кэша МГНОВЕННО (фрейм list_models с cliType); кэш обновляет
+ФОНОВЫЙ рефрешер раз в сутки (см. wss.server) — на клиентский запрос CLI не
+дёргается. §cli-types: сейчас единственный тип — claude; задел под codex и др.
 
 Проба изолированная: one-shot claude_agent_sdk.query() под тем же режимом
 авторизации (build_auth_env). Токен только ЧИТАЕТСЯ (read-only) — `/model` не
@@ -39,6 +40,13 @@ _AVAILABLE_RE = re.compile(r"Available:\s*(.+)", re.IGNORECASE)
 _CURRENT_RE = re.compile(r"Current model:\s*(.+)", re.IGNORECASE)
 _PROBE_TIMEOUT = 60.0
 
+# §cli-types: типы CLI-агентов, которые Ёžik умеет обслуживать. Сейчас только
+# Claude; задел под Codex и др. — добавление сюда + ветка пробы в probe_models
+# + (для реальной работы) своя session-реализация в wss-слое. Клиент шлёт
+# cliType в list_models/create_chat; сервер отдаёт данные нужного типа.
+DEFAULT_CLI_TYPE = "claude"
+KNOWN_CLI_TYPES: tuple[str, ...] = ("claude",)
+
 
 def parse_model_line(text: str) -> dict[str, Any]:
     """Из текста ответа `/model` достать список моделей и текущую.
@@ -67,15 +75,26 @@ def parse_model_line(text: str) -> dict[str, Any]:
     return {"models": models, "current": current}
 
 
-async def probe_models(config, cwd: str) -> dict[str, Any]:
-    """One-shot проба `/model` в изолированном процессе CLI.
+def _unsupported(cli_type: str) -> dict[str, Any]:
+    return {"cliType": cli_type, "models": [], "current": None, "raw": "",
+            "auth_state": "UNSUPPORTED", "cli_present": False}
 
-    Возвращает {"models", "current", "raw", "auth_state", "cli_present"}.
+
+async def probe_models(config, cwd: str,
+                       cli_type: str = DEFAULT_CLI_TYPE) -> dict[str, Any]:
+    """One-shot проба списка моделей в изолированном процессе CLI типа cli_type.
+
+    Возвращает {"cliType","models","current","raw","auth_state","cli_present"}.
     Ошибки/отсутствие CLI НЕ кидаем — возвращаем состояние (вызывающий решает,
-    затирать ли кэш). auth_state: "OK" | "AUTH_REQUIRED" | "NO_CLI" | "ERROR".
+    затирать ли кэш). auth_state: "OK"|"AUTH_REQUIRED"|"NO_CLI"|"ERROR"|"UNSUPPORTED".
+    Сейчас реализован только claude (проба `/model`); прочие типы → UNSUPPORTED.
     """
+    if cli_type not in KNOWN_CLI_TYPES:
+        return _unsupported(cli_type)
+    # §cli-types: пока единственная ветка — claude. Codex/др. добавляются здесь
+    # своей командой/парсером.
     if shutil.which("claude") is None:
-        return {"models": [], "current": None, "raw": "",
+        return {"cliType": cli_type, "models": [], "current": None, "raw": "",
                 "auth_state": "NO_CLI", "cli_present": False}
 
     env, model_override = build_auth_env(config)
@@ -115,31 +134,38 @@ async def probe_models(config, cwd: str) -> dict[str, Any]:
         auth_state = "AUTH_REQUIRED"
 
     if auth_state != "OK":
-        return {"models": [], "current": None, "raw": raw,
+        return {"cliType": cli_type, "models": [], "current": None, "raw": raw,
                 "auth_state": auth_state, "cli_present": True}
 
     parsed = parse_model_line(raw)
-    return {"models": parsed["models"], "current": parsed["current"],
-            "raw": raw, "auth_state": "OK", "cli_present": True}
+    return {"cliType": cli_type, "models": parsed["models"],
+            "current": parsed["current"], "raw": raw,
+            "auth_state": "OK", "cli_present": True}
 
 
-# ---------- дисковый кэш (data/models.json) ----------
+# ---------- дисковый кэш (data/models.<cliType>.json) ----------
 
-def cache_path(config) -> Path:
-    return config.data_dir / "models.json"
+_SAFE_CLI_RE = re.compile(r"[^a-z0-9_-]+")
 
 
-def load_cache(config) -> dict[str, Any] | None:
+def cache_path(config, cli_type: str = DEFAULT_CLI_TYPE) -> Path:
+    # Имя файла из cli_type санитизируем (тип приходит из протокола).
+    safe = _SAFE_CLI_RE.sub("_", cli_type.lower()) or "unknown"
+    return config.data_dir / f"models.{safe}.json"
+
+
+def load_cache(config, cli_type: str = DEFAULT_CLI_TYPE) -> dict[str, Any] | None:
     try:
-        data = json.loads(cache_path(config).read_text())
+        data = json.loads(cache_path(config, cli_type).read_text())
         return data if isinstance(data, dict) else None
     except (OSError, ValueError):
         return None
 
 
-def save_cache(config, data: dict[str, Any]) -> None:
+def save_cache(config, data: dict[str, Any],
+               cli_type: str = DEFAULT_CLI_TYPE) -> None:
     config.data_dir.mkdir(parents=True, exist_ok=True)
-    p = cache_path(config)
+    p = cache_path(config, cli_type)
     tmp = p.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(data, ensure_ascii=False))
     tmp.replace(p)
