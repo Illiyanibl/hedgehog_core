@@ -125,6 +125,12 @@ _AUTH_ERROR_MARKERS = (
     "oauth token has expired",
     "oauth token is invalid",
     "not logged in",
+    # SDK при протухшей подписке отдаёт ОШИБОЧНЫЙ ResultMessage с этим текстом
+    # (проверено вживую: "Failed to authenticate: OAuth session expired and
+    # could not be refreshed"). subtype при этом остаётся "success" — ловим по
+    # тексту (только у is_error-результата, см. _dispatch).
+    "failed to authenticate",
+    "oauth session expired",
 )
 
 
@@ -1203,22 +1209,30 @@ class ClaudeSession:
         self._awaiting_result += 1     # ждём ResultMessage этого хода (BUG2-диаг)
         await client.query(prompt)
         await self._turn_done.wait()
-        # Ридер упал (крах/закрытие потока) — пробрасываем, _run разберёт
-        # auth/crash и поднимет свежий коннект.
-        if self._reader_error is not None:
-            raise self._reader_error
-        # Неавторизованный CLI не кидает исключение, а отдаёт ResultMessage с
-        # «Not logged in» — диспетчер выставил флаг, обрабатываем тут.
+        # Настоящий слёт авторизации приходит ОШИБОЧНЫМ ResultMessage
+        # (is_error=True) — диспетчер выставил _turn_auth_needed. Проверяем ДО
+        # _reader_error: на ошибочном результате труба SDK ещё и кидает
+        # исключение (receive_messages), иначе auth-слёт ушёл бы в AGENT_CRASH.
         if self._turn_auth_needed:
             log.warning("agent.auth_required_result", chat=self.meta.chatId)
-            await self._send_chat_error(
-                Err.AUTH_REQUIRED,
-                "Claude на сервере не авторизован — открой ссылку "
-                "авторизации и пришли код (auth_code)")
-            if self._on_auth_required is not None:
-                await self._on_auth_required()
-            # Клиент бесполезен без логина; свежий — на следующий user_msg.
-            await self._disconnect()
+            # Уведомления оборачиваем в try/finally: если _send_chat_error или
+            # on_auth_required кинут (сокет умер и т.п.), клиент всё равно
+            # сбрасывается — иначе висел бы мёртвый коннект без логина.
+            try:
+                await self._send_chat_error(
+                    Err.AUTH_REQUIRED,
+                    "Claude на сервере не авторизован — открой ссылку "
+                    "авторизации и пришли код (auth_code)")
+                if self._on_auth_required is not None:
+                    await self._on_auth_required()
+            finally:
+                # Клиент бесполезен без логина; свежий — на следующий user_msg.
+                await self._disconnect()
+            return
+        # Ридер упал (крах/закрытие потока) без auth-признака — пробрасываем,
+        # _run разберёт crash и поднимет свежий коннект.
+        if self._reader_error is not None:
+            raise self._reader_error
 
     async def _reader_loop(self, client) -> None:
         """§reader: ЕДИНСТВЕННЫЙ потребитель трубы клиента. Непрерывно читает
@@ -1309,7 +1323,13 @@ class ClaudeSession:
                          subtype=getattr(msg, "subtype", None),
                          num_turns=getattr(msg, "num_turns", None),
                          session=msg.session_id)
-            if is_auth_error(msg.result or ""):
+            # §auth-falsepos: маркеры auth проверяем ТОЛЬКО у ОШИБОЧНОГО
+            # результата (is_error=True). Раньше подстрока «not logged in»/«oauth
+            # token has expired» ловилась и в УСПЕШНОМ ответе агента (когда сам
+            # разговор про авторизацию) → ложный AUTH_REQUIRED + дисконнект на
+            # КАЖДОМ ходе. Настоящий слёт приходит is_error=True (subtype при
+            # этом может оставаться "success" — на него гейтить нельзя).
+            if msg.is_error and is_auth_error(msg.result or ""):
                 self._turn_auth_needed = True
             if msg.session_id:
                 self._set_session_id(msg.session_id)
