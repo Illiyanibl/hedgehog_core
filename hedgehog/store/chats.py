@@ -67,6 +67,10 @@ class ChatMeta:
     # как раньше), список имён — allowlist включённых. Прокидывается в
     # ClaudeAgentOptions.skills. Имена сверяются со skills_registry.discover.
     skills: list[str] | None = None
+    # §models: выбранная в чате модель (алиас CLI или полный id) — уходит в
+    # opts["model"] и перекрывает дефолт тира. None → дефолт CLI. Меняется
+    # фреймом set_model; переживает рестарт/set_mode (persist в meta.json).
+    model: str | None = None
 
 
 class ChatStore:

@@ -153,6 +153,35 @@ def is_resume_error(err_text: str) -> bool:
     return any(marker in low for marker in _RESUME_ERROR_MARKERS)
 
 
+def build_auth_env(config: Config) -> tuple[dict[str, str], str | None]:
+    """Собрать env для запуска Claude CLI под текущим режимом авторизации
+    (data/auth.json). Возвращает (env, model_override): model_override — алиас
+    тира для omniroute (opts["model"]), иначе None. env кладётся ТОЛЬКО для
+    выбранного режима — активный способ заменяет прошлый. Общая точка для
+    ClaudeSession и one-shot-пробы списка моделей (§models)."""
+    auth = config.load_auth_config()
+    mode = auth.get("mode", "oauth")
+    env: dict[str, str] = {}
+    model_override: str | None = None
+    if mode == "apikey":
+        env["ANTHROPIC_API_KEY"] = auth.get("api_key", "")
+        if auth.get("base_url"):
+            env["ANTHROPIC_BASE_URL"] = auth["base_url"]
+    elif mode == "omniroute":
+        env["ANTHROPIC_API_KEY"] = auth.get("api_key", "")
+        env["ANTHROPIC_BASE_URL"] = auth.get("base_url", "")
+        env["ANTHROPIC_DEFAULT_OPUS_MODEL"] = auth.get("opus_model", "")
+        env["ANTHROPIC_DEFAULT_SONNET_MODEL"] = auth.get("sonnet_model", "")
+        env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = auth.get("haiku_model", "")
+        model_override = auth.get("default_tier") or "haiku"
+    else:  # oauth (по умолчанию) — setup-token не пишет creds-файл, поэтому
+        # подкладываем его CLI через env; нет файла → базовые креды.
+        oauth = config.load_oauth_token()
+        if oauth:
+            env["CLAUDE_CODE_OAUTH_TOKEN"] = oauth
+    return env, model_override
+
+
 class ClaudeSession:
     def __init__(self, meta: ChatMeta, publish: PublishFn,
                  send_chat_error, config: Config,
@@ -1113,25 +1142,12 @@ class ClaudeSession:
             #                дефолтный тир алиасом в opts["model"].
             # env кладём ТОЛЬКО для выбранного режима (SDK мержит его поверх
             # окружения процесса) — так активный способ заменяет прошлый.
-            auth = self._config.load_auth_config()
-            mode = auth.get("mode", "oauth")
-            env: dict[str, str] = {}
-            if mode == "apikey":
-                env["ANTHROPIC_API_KEY"] = auth.get("api_key", "")
-                if auth.get("base_url"):
-                    env["ANTHROPIC_BASE_URL"] = auth["base_url"]
-            elif mode == "omniroute":
-                env["ANTHROPIC_API_KEY"] = auth.get("api_key", "")
-                env["ANTHROPIC_BASE_URL"] = auth.get("base_url", "")
-                env["ANTHROPIC_DEFAULT_OPUS_MODEL"] = auth.get("opus_model", "")
-                env["ANTHROPIC_DEFAULT_SONNET_MODEL"] = auth.get("sonnet_model", "")
-                env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = auth.get("haiku_model", "")
-                opts["model"] = auth.get("default_tier") or "haiku"
-            else:  # oauth (по умолчанию) — setup-token не пишет creds-файл,
-                # поэтому подкладываем его CLI через env; нет файла → базовые креды.
-                oauth = self._config.load_oauth_token()
-                if oauth:
-                    env["CLAUDE_CODE_OAUTH_TOKEN"] = oauth
+            env, model_override = build_auth_env(self._config)
+            if model_override is not None:
+                opts["model"] = model_override
+            # §models: явно выбранная в чате модель перекрывает дефолт тира.
+            if self.meta.model:
+                opts["model"] = self.meta.model
             # §tool-search (progressive disclosure): при большом числе MCP-тулов
             # (напр. чат с браузером neko ~40 тулов) CLI откладывает их схемы из
             # начального списка и подгружает по требованию через tool-search —

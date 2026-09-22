@@ -164,6 +164,13 @@ class SetModePayload(_Payload):
     permission_mode: Literal["default", "acceptEdits", "bypassPermissions"]
 
 
+class SetModelPayload(_Payload):
+    # §models: выбор модели чата. Пустая строка → сброс к дефолту CLI.
+    # Значение — алиас (sonnet/opus/…) или полный id; не валидируем против
+    # списка (CLI сам принимает и алиасы, и полные имена).
+    model: str = Field(default="", max_length=200)
+
+
 class InstallSkillPayload(_Payload):
     # §skills v2: ссылка на git-репозиторий (github). default_for_new —
     # сразу пометить группу «по умолчанию для новых чатов».
@@ -297,6 +304,8 @@ CLIENT_FRAME_TYPES: dict[str, tuple[type[_Payload], bool]] = {
     "unsubscribe_chat": (EmptyPayload, True),
     "create_chat": (CreateChatPayload, False),
     "set_mode": (SetModePayload, True),
+    "set_model": (SetModelPayload, True),
+    "list_models": (EmptyPayload, False),
     "list_skills": (EmptyPayload, True),
     "install_skill": (InstallSkillPayload, False),
     "set_skill_group": (SetSkillGroupPayload, True),

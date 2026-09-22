@@ -30,6 +30,7 @@ from ..config import Config
 from ..core.auth import AuthManager
 from ..core.claude_session import ClaudeSession
 from ..core.pty_session import PtySession
+from ..core import models
 from ..protocol import (
     BadFrame,
     ClientFrame,
@@ -79,6 +80,14 @@ class HedgehogServer:
         # §sched: планировщик задач + блэкборд. Ставится из main.py после
         # конструктора (нужны колбэки inject/notify, замкнутые на этот сервер).
         self.scheduler = None
+        # §models: фоновый рефрешер списка моделей. Событие взводится при смене
+        # авторизации (и при пустом кэше) → немедленное обновление вне суток.
+        self._models_refresh_now = asyncio.Event()
+        self._models_task: asyncio.Task | None = None
+        # Текущая one-shot проба (для отмены при входящем user_msg — не держим
+        # второй CLI-процесс во время хода, §models M1) + троттлинг проб (M2).
+        self._models_probe_task: asyncio.Task | None = None
+        self._last_probe_ts = 0.0
 
     # ---------- §sched: точки входа для планировщика ----------
 
@@ -93,6 +102,10 @@ class HedgehogServer:
             log.warning("sched.inject_skip", chat=chat_id,
                         reason="no meta or not claude")
             return
+        # §models M1: cron/планировщик стартует ход в обход WS-хендлера
+        # user_msg — гасим фоновую пробу тут же, иначе рядом с единственной
+        # авторизацией окажутся два CLI-процесса.
+        self._cancel_models_probe()
         session = await self._ensure_session(meta)
         await self.hub.publish(chat_id, "user_msg_echo", {
             "content": text, "sender": "cron", "related": None,
@@ -149,15 +162,126 @@ class HedgehogServer:
             log.info("server.listening", host=self.config.host,
                      port=self.config.port, path=WS_PATH,
                      tls=self.config.tls_enabled)
+            # §models: фоновый рефрешер кэша моделей (раз в сутки + по событию).
+            if self._models_task is None:
+                self._models_task = asyncio.create_task(
+                    self._models_refresh_loop(), name="models-refresh")
             await asyncio.get_running_loop().create_future()  # до отмены
 
     async def shutdown(self):
         await self.auth.stop()
+        probe = self._models_probe_task   # захватываем ДО отмены (её обнулит finally)
+        self._cancel_models_probe()       # осиротевшую пробу тоже гасим
+        if self._models_task is not None:
+            self._models_task.cancel()
+            try:
+                await self._models_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._models_task = None
+        if probe is not None:             # дожать отменённую пробу (без warning)
+            await asyncio.gather(probe, return_exceptions=True)
         if self.scheduler is not None:
             await self.scheduler.stop()
         for session in list(self.sessions.values()):
             await session.stop()
         self.sessions.clear()
+
+    # ---------- §models: фоновый рефрешер списка моделей ----------
+
+    _MODELS_TTL = 24 * 3600      # штатный интервал обновления кэша
+    _MODELS_RETRY = 120          # переспрос, если проба отложена (агент занят)
+    _MODELS_MIN_INTERVAL = 60    # троттлинг: не чаще одной пробы CLI в минуту
+
+    async def _models_refresh_loop(self) -> None:
+        """Раз в сутки (и по событию смены авторизации) обновляет кэш моделей.
+        Клиентский list_models кэш только ЧИТАЕТ — CLI тут не на его пути."""
+        while True:
+            delay = self._MODELS_TTL
+            try:
+                delay = await self._refresh_models_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001 — рефрешер не должен падать
+                log.warning("models.refresh_error", err=repr(e))
+            try:
+                await asyncio.wait_for(self._models_refresh_now.wait(),
+                                       timeout=delay)
+            except asyncio.TimeoutError:
+                pass
+            self._models_refresh_now.clear()
+
+    async def _refresh_models_once(self) -> float:
+        """Одна попытка обновить кэш. Возвращает СЛЕДУЮЩУЮ задержку (сек):
+        занят агент → скоро (RETRY); проба недавно (троттл M2) → дождаться окна;
+        успех/скип → сутки. Клиентский спам list_models так не плодит процессы."""
+        # Не поднимаем второй CLI-процесс во время активного хода (§models M1).
+        if any(isinstance(s, ClaudeSession) and s.status == "busy"
+               for s in self.sessions.values()):
+            log.info("models.refresh_deferred_busy")
+            return self._MODELS_RETRY
+        # Троттлинг: между реальными пробами не меньше _MODELS_MIN_INTERVAL —
+        # иначе клиент, поллящий PENDING, гнал бы процессы спина к спине (M2).
+        since = time.time() - self._last_probe_ts
+        if since < self._MODELS_MIN_INTERVAL:
+            return self._MODELS_MIN_INTERVAL - since
+        self._last_probe_ts = time.time()
+
+        # Проба — отдельной таской, чтобы входящий user_msg мог её отменить
+        # (M1: не держим второй процесс во время хода).
+        self._models_probe_task = asyncio.create_task(
+            models.probe_models(self.config, str(self.config.data_dir)))
+        try:
+            data = await self._models_probe_task
+        except asyncio.CancelledError:
+            # Различаем отмену САМОГО рефрешера (shutdown отменил _models_task —
+            # у текущей таски есть pending-cancel) от отмены только пробы
+            # (user_msg → _cancel_models_probe отменил лишь дочернюю таску).
+            # Не полагаемся на флаг: он мог бы «проглотить» отмену рефрешера.
+            cur = asyncio.current_task()
+            if cur is not None and cur.cancelling() > 0:
+                raise                           # отменяют рефрешер (shutdown)
+            log.info("models.probe_cancelled_busy")
+            return self._MODELS_RETRY           # отменили пробу из-за хода
+        finally:
+            self._models_probe_task = None
+
+        if data.get("auth_state") == "OK" and data.get("models"):
+            data["updated_at"] = time.time()
+            models.save_cache(self.config, data)
+            log.info("models.refreshed", n=len(data["models"]),
+                     current=data.get("current"))
+            # §models L1: клиенты, застрявшие на PENDING, узнают о готовности.
+            await self.hub.broadcast_global(make_frame("models_list", data))
+        else:
+            # Не затираем последний хороший кэш (auth протух / нет CLI / ошибка).
+            log.info("models.refresh_skip", auth=data.get("auth_state"),
+                     cli=data.get("cli_present"))
+        return self._MODELS_TTL
+
+    def _cancel_models_probe(self) -> None:
+        """§models M1: отменить фоновую пробу `/model` (пришёл user_msg — не
+        держим второй CLI-процесс рядом с ходом). Проба толерантна к отмене;
+        _refresh_models_once отличит эту отмену от отмены рефрешера по
+        current_task().cancelling()."""
+        t = self._models_probe_task
+        if t is not None and not t.done():
+            t.cancel()
+
+    def _invalidate_models_cache(self) -> None:
+        """Смена авторизации: список моделей мог смениться. Гасим пробу в
+        полёте (она под СТАРЫМИ кредами — иначе разослала бы стейл-список) и
+        будим рефрешер на свежую пробу."""
+        self._cancel_models_probe()
+        self._models_refresh_now.set()
+
+    def _reset_all_chat_models(self) -> None:
+        """§models L2: смена режима авторизации → per-chat выбор модели может
+        стать невалидным (напр. полный id из oauth не существует в шлюзе).
+        Сбрасываем meta.model во всех чатах — пользователь выберет заново."""
+        for m in self.store.list():
+            if getattr(m, "model", None):
+                self.store.update_meta(m.chatId, model=None)
 
     # ---------- HTTP-этап (§1.1) ----------
 
@@ -270,9 +394,11 @@ class HedgehogServer:
                 log.warning("auth.logout_unlink_failed", err=str(e))
             # §altauth: разлогин сбрасывает и альт-способ (API-ключ/OmniRoute).
             self.config.clear_auth_config()
+            self._reset_all_chat_models()    # §models L2: выбор мог протухнуть
             for chat_id, session in list(self.sessions.items()):
                 if isinstance(session, ClaudeSession):
                     await self._stop_session(chat_id)
+            self._invalidate_models_cache()   # §models: сбросить/переобновить
             log.info("auth.logout")
             return
         if ftype == "client_log":
@@ -367,6 +493,18 @@ class HedgehogServer:
                 chats.append(entry)
             await self.hub.send_global(conn_id, make_frame("chat_list", {"chats": chats}))
             return
+        if ftype == "list_models":
+            # §models: отдаём кэш МГНОВЕННО (CLI не дёргаем). Нет кэша —
+            # отвечаем PENDING и будим фоновый рефрешер.
+            data = models.load_cache(self.config)
+            if data is None:
+                data = {"models": [], "current": None, "raw": "",
+                        "auth_state": "PENDING", "cli_present": None,
+                        "updated_at": 0}
+                self._models_refresh_now.set()
+            await self.hub.send_global(
+                conn_id, make_frame("models_list", data))
+            return
         if ftype == "create_chat":
             # cwd задан клиентом → используем его. Иначе, если сервер знает
             # базу проектов (default_cwd, напр. /root/projects), заводим
@@ -424,6 +562,21 @@ class HedgehogServer:
             await self._stop_session(frame.chatId)
             log.info("chat.mode_changed", chat=frame.chatId,
                      permission_mode=p.permission_mode)
+            await self.hub.broadcast_global(
+                make_frame("chat_updated", vars(updated)))
+            return
+
+        if ftype == "set_model":
+            # §models: пустая строка → сброс к дефолту CLI (None). Как set_mode:
+            # стоп сессии → применится opts["model"] на следующем user_msg
+            # (resume сохранит контекст), затем broadcast обновлённой meta.
+            # N1: отсекаем непечатаемые символы (уедут в argv --model мусором).
+            new_model = "".join(
+                ch for ch in (p.model or "").strip() if ch.isprintable()
+            ) or None
+            updated = self.store.update_meta(frame.chatId, model=new_model)
+            await self._stop_session(frame.chatId)
+            log.info("chat.model_changed", chat=frame.chatId, model=new_model)
             await self.hub.broadcast_global(
                 make_frame("chat_updated", vars(updated)))
             return
@@ -600,6 +753,9 @@ class HedgehogServer:
             return
 
         if ftype == "user_msg":
+            # §models M1: пришёл ход → гасим фоновую пробу /model, чтобы не
+            # держать второй CLI-процесс рядом с единственной авторизацией.
+            self._cancel_models_probe()
             # Эхо (§4.15): в чат пишут несколько писателей (устройства
             # пользователя, менеджер-агент, cron) — журналим и рассылаем
             # входящее ДО исполнения, чтобы все клиенты видели полную ленту.
@@ -885,6 +1041,7 @@ class HedgehogServer:
             for chat_id, session in list(self.sessions.items()):
                 if isinstance(session, ClaudeSession):
                     await self._stop_session(chat_id)
+            self._invalidate_models_cache()   # §models: список мог смениться
 
     # ---------- статус чата (§3.7c) ----------
 
@@ -1090,7 +1247,9 @@ class HedgehogServer:
             return False, err
         self.config.save_auth_config({
             "mode": "apikey", "api_key": api_key, "base_url": base_url or None})
+        self._reset_all_chat_models()    # §models L2: выбор мог протухнуть
         await self._restart_claude_sessions()
+        self._invalidate_models_cache()   # §models: список зависит от ключа
         log.info("auth.apikey_activated", base_url=base_url or "anthropic")
         return True, None
 
@@ -1107,7 +1266,9 @@ class HedgehogServer:
             "opus_model": p.opus_model, "sonnet_model": p.sonnet_model,
             "haiku_model": p.haiku_model,
             "default_tier": p.default_tier or "haiku"})
+        self._reset_all_chat_models()    # §models L2: выбор мог протухнуть
         await self._restart_claude_sessions()
+        self._invalidate_models_cache()   # §models: список зависит от шлюза
         log.info("auth.omniroute_activated", base_url=p.base_url,
                  default_tier=p.default_tier)
         return True, None
