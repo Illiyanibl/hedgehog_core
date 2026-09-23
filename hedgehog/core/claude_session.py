@@ -154,6 +154,57 @@ def is_resume_error(err_text: str) -> bool:
     return any(marker in low for marker in _RESUME_ERROR_MARKERS)
 
 
+# §ratelimit-text: иногда CLI отдаёт упор в 5ч-лимит НЕ ошибкой (api_error_status
+# 429 / RateLimitEvent), а обычным УСПЕШНЫМ результатом с текстом
+# «You've hit your session limit · resets 6:40pm (UTC)». Ловим и это. Матч ТОЛЬКО
+# с начала строки (это самостоятельное сообщение CLI, а не упоминание «лимита» в
+# обычном ответе агента — иначе ложняк, как в §auth-falsepos).
+_SESSION_LIMIT_RE = re.compile(
+    r"^\s*you['’]ve hit your (?:session|usage|\w+) limit", re.IGNORECASE)
+_LIMIT_RESET_RE = re.compile(
+    r"resets?\s+(\d{1,2}):(\d{2})\s*([ap]m)?", re.IGNORECASE)
+
+
+def is_session_limit_text(text: str) -> bool:
+    """Является ли текст самостоятельным сообщением CLI об упоре в лимит.
+    Гейт однострочности/краткости: настоящее сообщение CLI — одна короткая
+    строка; ответ агента, НАЧАВШИЙСЯ с этой фразы, почти всегда длиннее и
+    многострочный → так режем ложняк (агент диагностирует чей-то лимит)."""
+    t = text or ""
+    if "\n" in t or len(t) > 200:
+        return False
+    return bool(_SESSION_LIMIT_RE.match(t))
+
+
+def parse_session_limit_reset(text: str) -> float | None:
+    """Из «… resets 6:40pm (UTC)» достать unix-ts сброса. None — не разобрали.
+    Время в прошлом (сегодняшнее уже прошло) → переносим на завтра.
+    Доверяем ТОЛЬКО явному UTC (в тексте есть «utc»): иначе трактовка как UTC
+    может уехать на часы (CLI мог показать локальное время) → None, клиент
+    добьёт точный reset через get_limits."""
+    import datetime as _dt
+    low = (text or "").lower()
+    if "utc" not in low:
+        return None
+    m = _LIMIT_RESET_RE.search(text or "")
+    if not m:
+        return None
+    hh, mm = int(m.group(1)), int(m.group(2))
+    ap = (m.group(3) or "").lower()
+    if ap == "pm" and hh != 12:
+        hh += 12
+    elif ap == "am" and hh == 12:
+        hh = 0
+    if not (0 <= hh <= 23 and 0 <= mm <= 59):
+        return None
+    now = _dt.datetime.now(_dt.timezone.utc)
+    cand = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    ts = cand.timestamp()
+    if ts <= now.timestamp():
+        ts += 86400.0
+    return ts
+
+
 def build_auth_env(config: Config) -> tuple[dict[str, str], str | None]:
     """Собрать env для запуска Claude CLI под текущим режимом авторизации
     (data/auth.json). Возвращает (env, model_override): model_override — алиас
@@ -1400,6 +1451,14 @@ class ClaudeSession:
             # api_error_status==429 (с v2.1.110). _turn разберёт после пробуждения.
             if msg.is_error and getattr(msg, "api_error_status", None) == 429:
                 self._turn_rate_limited = True
+            # §ratelimit-text: иногда лимит приходит УСПЕШНЫМ результатом с
+            # текстом «You've hit your session limit · resets …» (без 429/event).
+            # Ловим по тексту (только с начала строки) и парсим время сброса.
+            elif is_session_limit_text(msg.result or ""):
+                self._turn_rate_limited = True
+                parsed = parse_session_limit_reset(msg.result or "")
+                if parsed is not None:
+                    self._rate_limit_reset = parsed
             if msg.session_id:
                 self._set_session_id(msg.session_id)
             usage = msg.usage or {}
