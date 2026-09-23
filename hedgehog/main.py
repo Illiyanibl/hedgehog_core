@@ -49,6 +49,7 @@ async def _amain():
         artifacts_dir=config.data_dir / "artifacts",
         inject_cb=server.inject_message,
         notify_cb=server.notify_chat,
+        inject_user_cb=server.inject_user_message,   # §defer
     )
     server.scheduler = scheduler
     await scheduler.start()

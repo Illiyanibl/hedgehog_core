@@ -32,6 +32,7 @@ from ..core.claude_session import ClaudeSession
 from ..core.pty_session import PtySession
 from ..core import models
 from ..protocol import (
+    Attachment,
     BadFrame,
     ClientFrame,
     Err,
@@ -40,6 +41,7 @@ from ..protocol import (
     make_frame,
     parse_client_frame,
 )
+from ..scheduler import DeferPendingExists
 from ..store.chats import ChatMeta, ChatStore
 from ..store.mcp_registry import McpRegistry
 from ..store import skills_registry
@@ -112,6 +114,37 @@ class HedgehogServer:
             "attachments": [], "btw": False,
         })
         await session.handle_user_msg(text)
+
+    async def inject_user_message(self, chat_id: str, text: str,
+                                  attachments: list, job_id: str) -> None:
+        """§defer: отложенное сообщение пользователя сработало по таймеру.
+        Эхо в ленту (sender=deferred + jobId — клиент снимет pending-чип на всех
+        устройствах) + промпт с вложениями. interrupt=False — НЕ прерываем
+        возможный живой ход пользователя. Плюс notify (оффлайн-курьер)."""
+        meta = self.store.get(chat_id)
+        if meta is None or meta.addressee != "claude":
+            log.warning("defer.inject_skip", chat=chat_id,
+                        reason="no meta or not claude")
+            return
+        self._cancel_models_probe()
+        atts = [Attachment(fileId=str(a.get("fileId", "")),
+                           mime=str(a.get("mime", "")),
+                           name=str(a.get("name", "")))
+                for a in attachments if isinstance(a, dict)]
+        session = await self._ensure_session(meta)
+        await self.hub.publish(chat_id, "user_msg_echo", {
+            "content": text, "sender": "deferred", "related": None,
+            "attachments": [a.model_dump() for a in atts], "btw": False,
+            "jobId": job_id,
+        })
+        resolved = fileserver.resolve_attachment_paths(
+            self.config.chats_dir, chat_id, atts)
+        prompt = fileserver.compose_prompt(text, resolved)
+        await session.handle_user_msg(prompt, interrupt=False)
+        log.info("defer.fired", chat=chat_id, job=job_id, atts=len(atts))
+        # Оффлайн-курьер: устройства узнают, что отложенное ушло агенту.
+        await self.notify_chat(chat_id, "Отложенное сообщение",
+                               "Отправлено агенту после сброса лимита")
 
     async def notify_chat(self, chat_id: str, title: str, body: str) -> None:
         """Уведомление (баннер/инбокс) в чат по расписанию — журналируемый фрейм."""
@@ -567,6 +600,8 @@ class HedgehogServer:
                               projects_base=self.config.default_cwd)
             views_registry.clear_chat(self.config.data_dir, frame.chatId)  # §views
             handlers_registry.clear_chat(self.config.data_dir, frame.chatId)  # §handlers
+            if self.scheduler is not None:   # §defer: не оставляем осиротевшие jobs
+                await self.scheduler.purge_chat(frame.chatId)
             log.info("chat.deleted", chat=frame.chatId, delete_cwd=p.delete_cwd)
             await self.hub.broadcast_global(
                 make_frame("chat_deleted", {"chatId": frame.chatId}))
@@ -604,6 +639,81 @@ class HedgehogServer:
             log.info("chat.model_changed", chat=frame.chatId, model=new_model)
             await self.hub.broadcast_global(
                 make_frame("chat_updated", vars(updated)))
+            return
+
+        if ftype == "schedule_message":
+            # §defer: отложить сообщение до сброса лимита. fireAt клампим (не
+            # доверяем клиентскому времени). Лимит «1 на чат» enforce'ит
+            # планировщик под локом (DeferPendingExists).
+            if self.scheduler is None:
+                await self.hub.send_global(conn_id, make_error(
+                    Err.INTERNAL, "scheduler unavailable",
+                    chat_id=frame.chatId, related=frame.id))
+                return
+            now = time.time()
+            fire_at = max(now + 1, min(float(p.fireAt), now + 7 * 24 * 3600))
+            atts = [a.model_dump() for a in p.attachments]
+            try:
+                jid = await self.scheduler.add_job(
+                    chat_id=frame.chatId, kind="once", spec=str(fire_at),
+                    action="inject_user",
+                    payload={"text": p.text, "attachments": atts},
+                    created_by="user")
+            except DeferPendingExists:
+                await self.hub.send_global(conn_id, make_error(
+                    Err.RATE_LIMITED,
+                    "В этом чате уже есть отложенное сообщение (лимит 1)",
+                    chat_id=frame.chatId, related=frame.id))
+                return
+            except Exception as e:  # noqa: BLE001
+                await self.hub.send_global(conn_id, make_error(
+                    Err.INTERNAL, f"schedule failed: {e}",
+                    chat_id=frame.chatId, related=frame.id))
+                return
+            # Журналируемое событие → pending-чип восстановится на resume и
+            # появится на других устройствах сразу.
+            await self.hub.publish(frame.chatId, "scheduled", {
+                "jobId": jid, "text": p.text, "attachments": atts,
+                "fireAt": fire_at})
+            log.info("defer.scheduled", chat=frame.chatId, job=jid,
+                     fire_at=fire_at)
+            return
+
+        if ftype == "cancel_scheduled":
+            ok = (await self.scheduler.cancel_job(
+                    p.jobId, frame.chatId, action="inject_user")
+                  if self.scheduler else False)
+            if ok:
+                # Журналируемо → чип снимется на всех устройствах и на resume.
+                await self.hub.publish(frame.chatId, "scheduled_cancelled",
+                                       {"jobId": p.jobId})
+                log.info("defer.cancelled", chat=frame.chatId, job=p.jobId)
+            else:
+                # Уже сработало/не найдено (гонка D) — сообщаем инициатору.
+                await self.hub.send_global(conn_id, make_frame(
+                    "scheduled_cancel_failed", {"jobId": p.jobId}, frame.chatId))
+            return
+
+        if ftype == "list_scheduled":
+            jobs = (await self.scheduler.list_jobs(frame.chatId)
+                    if self.scheduler else [])
+            pending = []
+            for j in jobs:
+                if j.get("action") != "inject_user" or j.get("enabled") != 1:
+                    continue
+                pl = {}
+                try:
+                    pl = json.loads(j.get("payload") or "{}")
+                except ValueError:
+                    pl = {}
+                pending.append({
+                    "jobId": j["id"],
+                    "fireAt": j.get("next_run"),
+                    "text": pl.get("text", ""),
+                    "attachments": pl.get("attachments", []),
+                })
+            await self.hub.send_global(conn_id, make_frame(
+                "scheduled_list", {"jobs": pending}, frame.chatId))
             return
 
         if ftype == "list_skills":

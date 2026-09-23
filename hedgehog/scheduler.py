@@ -174,15 +174,24 @@ def _initial_next(kind: str, spec: str, now_ts: float) -> float:
 
 InjectCb = Callable[[str, str], Awaitable[None]]
 NotifyCb = Callable[[str, str, str], Awaitable[None]]
+# §defer: отложенное сообщение пользователя (chat, text, attachments, job_id).
+# job_id уходит в эхо — клиент снимает по нему pending-чип на всех устройствах.
+InjectUserCb = Callable[[str, str, list, str], Awaitable[None]]
+
+
+class DeferPendingExists(Exception):
+    """§defer: в чате уже есть отложенное сообщение (лимит 1)."""
 
 
 class SchedulerService:
     def __init__(self, db_path: Path, artifacts_dir: Path,
-                 inject_cb: InjectCb, notify_cb: NotifyCb):
+                 inject_cb: InjectCb, notify_cb: NotifyCb,
+                 inject_user_cb: InjectUserCb | None = None):
         self._db_path = Path(db_path)
         self._artifacts_dir = Path(artifacts_dir)
         self._inject = inject_cb
         self._notify = notify_cb
+        self._inject_user = inject_user_cb
         self._conn: sqlite3.Connection | None = None
         self._dblock = threading.Lock()          # сериализуем доступ к соединению
         self._loop_task: asyncio.Task | None = None
@@ -290,6 +299,14 @@ class SchedulerService:
             chat_id = job["chat_id"]
             if action == "inject_text":
                 await self._inject(chat_id, str(payload.get("text", "")))
+            elif action == "inject_user":
+                # §defer: отложенное сообщение пользователя (текст + вложения).
+                if self._inject_user is None:
+                    raise ValueError("inject_user callback not configured")
+                atts = payload.get("attachments") or []
+                await self._inject_user(chat_id, str(payload.get("text", "")),
+                                        atts if isinstance(atts, list) else [],
+                                        jid)
             elif action in ("notify", "remind"):
                 await self._notify(chat_id, str(payload.get("title", "")),
                                    str(payload.get("body", "")))
@@ -323,8 +340,8 @@ class SchedulerService:
                       created_by) -> str:
         if kind not in ("cron", "interval", "once"):
             raise ValueError("kind must be cron|interval|once")
-        if action not in ("inject_text", "notify", "remind"):
-            raise ValueError("action must be inject_text|notify|remind")
+        if action not in ("inject_text", "notify", "remind", "inject_user"):
+            raise ValueError("action must be inject_text|notify|remind|inject_user")
         now = time.time()
         next_run = _initial_next(kind, spec, now)   # валидирует spec
         jid = new_ulid()
@@ -334,6 +351,16 @@ class SchedulerService:
                 (chat_id,)).fetchone()
             if cnt >= _MAX_JOBS_PER_CHAT:
                 raise ValueError(f"job limit reached ({_MAX_JOBS_PER_CHAT} per chat)")
+            # §defer: лимит 1 отложенное сообщение на чат — проверка ПОД локом
+            # (иначе два устройства пролезут одновременно). Спец-исключение —
+            # wss-слой маппит его в отдельный ответ клиенту.
+            if action == "inject_user":
+                (pend,) = self._conn.execute(
+                    "SELECT COUNT(*) FROM jobs WHERE chat_id=? AND "
+                    "action='inject_user' AND enabled=1", (chat_id,)).fetchone()
+                if pend > 0:
+                    raise DeferPendingExists(
+                        "one deferred message per chat already pending")
             self._conn.execute(
                 "INSERT INTO jobs(id, chat_id, created_by, created_at, kind, spec, "
                 "action, payload, enabled, catch_up, next_run, last_run) "
@@ -353,13 +380,39 @@ class SchedulerService:
                 "FROM jobs WHERE chat_id=? ORDER BY next_run", (chat_id,)).fetchall()
         return [dict(r) for r in rows]
 
-    async def cancel_job(self, job_id: str, chat_id: str) -> bool:
-        return await asyncio.to_thread(self._cancel_job_sync, job_id, chat_id)
+    async def cancel_job(self, job_id: str, chat_id: str,
+                         action: str | None = None) -> bool:
+        return await asyncio.to_thread(
+            self._cancel_job_sync, job_id, chat_id, action)
 
-    def _cancel_job_sync(self, job_id: str, chat_id: str) -> bool:
+    async def purge_chat(self, chat_id: str) -> int:
+        """Удалить ВСЕ задания чата (при delete_chat) — иначе осиротевший job
+        выстрелит в несуществующий чат. Возвращает число удалённых."""
+        return await asyncio.to_thread(self._purge_chat_sync, chat_id)
+
+    def _purge_chat_sync(self, chat_id: str) -> int:
         with self._dblock:
             cur = self._conn.execute(
-                "DELETE FROM jobs WHERE id=? AND chat_id=?", (job_id, chat_id))
+                "DELETE FROM jobs WHERE chat_id=?", (chat_id,))
+            self._conn.commit()
+            return cur.rowcount
+
+    def _cancel_job_sync(self, job_id: str, chat_id: str,
+                         action: str | None = None) -> bool:
+        with self._dblock:
+            # §defer гонка D: только ещё НЕ сработавшее (enabled=1). Если
+            # планировщик уже заклеймил задание (_claim_due → enabled=0), отмена
+            # вернёт False — «поздно, уже отправляется», ход не оборвать.
+            # action-фильтр: клиентский cancel_scheduled удаляет ТОЛЬКО свои
+            # inject_user-задания, не агентские cron/interval.
+            if action is not None:
+                cur = self._conn.execute(
+                    "DELETE FROM jobs WHERE id=? AND chat_id=? AND enabled=1 "
+                    "AND action=?", (job_id, chat_id, action))
+            else:
+                cur = self._conn.execute(
+                    "DELETE FROM jobs WHERE id=? AND chat_id=? AND enabled=1",
+                    (job_id, chat_id))
             self._conn.commit()
             return cur.rowcount > 0
 

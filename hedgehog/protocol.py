@@ -181,6 +181,19 @@ class ListModelsPayload(_Payload):
     cliType: str = Field(default="claude", max_length=40)
 
 
+class ScheduleMessagePayload(_Payload):
+    # §defer: отложить сообщение до сброса лимита. fireAt — целевой unix-ts
+    # (сервер клампит now+1…now+7д). Вложения — как у user_msg (fileId).
+    text: str = Field(default="", max_length=100_000)
+    attachments: list[Attachment] = Field(default_factory=list)
+    fireAt: float
+
+
+class CancelScheduledPayload(_Payload):
+    # §defer: отменить отложенное сообщение по id задания (крестик до отправки).
+    jobId: str = Field(min_length=1, max_length=64)
+
+
 class InstallSkillPayload(_Payload):
     # §skills v2: ссылка на git-репозиторий (github). default_for_new —
     # сразу пометить группу «по умолчанию для новых чатов».
@@ -316,6 +329,9 @@ CLIENT_FRAME_TYPES: dict[str, tuple[type[_Payload], bool]] = {
     "set_mode": (SetModePayload, True),
     "set_model": (SetModelPayload, True),
     "list_models": (ListModelsPayload, False),
+    "schedule_message": (ScheduleMessagePayload, True),
+    "cancel_scheduled": (CancelScheduledPayload, True),
+    "list_scheduled": (EmptyPayload, True),
     "list_skills": (EmptyPayload, True),
     "install_skill": (InstallSkillPayload, False),
     "set_skill_group": (SetSkillGroupPayload, True),

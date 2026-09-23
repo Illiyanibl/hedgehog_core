@@ -78,7 +78,10 @@ async def fetch_limits(config: Config) -> dict:
                 if resp.status in (401, 403):
                     log.warning("limits.auth_rejected", status=resp.status)
                     return {"error": "auth", "message": "Токен не принят API"}
-                if resp.status >= 400:
+                # §ratelimit: 429 (сам probe упёрся в лимит) — заголовки лимитов
+                # ВСЁ РАВНО приходят (в т.ч. -5h-reset). Парсим их, а не отдаём
+                # ошибку: это основной фолбэк для reset, когда агент упёрся.
+                if resp.status >= 400 and resp.status != 429:
                     log.warning("limits.http_error", status=resp.status)
                     return {"error": "http", "message": f"HTTP {resp.status}"}
                 result = parse_limits(resp.headers)

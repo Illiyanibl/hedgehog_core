@@ -46,6 +46,7 @@ from claude_agent_sdk import (
     ClaudeSDKClient,
     PermissionResultAllow,
     PermissionResultDeny,
+    RateLimitEvent,
     ResultMessage,
     SystemMessage,
     TextBlock,
@@ -237,6 +238,12 @@ class ClaudeSession:
         # ResultMessage хода отдал auth-ошибку (CLI не залогинен) — ставит
         # диспетчер, разбирает _turn после пробуждения.
         self._turn_auth_needed = False
+        # §ratelimit: последний resets_at/тип из RateLimitEvent SDK (кэш —
+        # событие приходит ДО ошибочного ResultMessage). На 429-ResultMessage
+        # диспетчер ставит _turn_rate_limited, _turn шлёт RATE_LIMITED с reset.
+        self._rate_limit_reset: float | None = None
+        self._rate_limit_type: str | None = None
+        self._turn_rate_limited = False
         # Группирует text_delta ОДНОГО ответа (§4.2). Ридер обновляет его после
         # каждого ResultMessage — следующий ответ (в т.ч. фоновый хвост) идёт
         # своей группой.
@@ -294,7 +301,7 @@ class ClaudeSession:
 
     # ---------- входящие фреймы ----------
 
-    async def handle_user_msg(self, content: str) -> bool:
+    async def handle_user_msg(self, content: str, interrupt: bool = True) -> bool:
         """Поставить сообщение в очередь. Всегда возвращает False.
 
         Каждое сообщение — отдельный ход строго по очереди: воркер ждёт
@@ -307,11 +314,15 @@ class ClaudeSession:
         ходом с полным контекстом (та же сессия). Так «стой»/уточнение доходят
         сразу, а не ждут конца длинного хода. Ходы остаются раздельными:
         прерванный отдаёт свой ResultMessage, воркер берёт из очереди наше.
+
+        §defer: interrupt=False — НЕ прерывать живой ход (отложенное сообщение
+        сработало по таймеру: если пользователь как раз ведёт диалог, оно должно
+        встать в очередь, а не оборвать его ход).
         """
         await self.start()
         await self._queue.put(content)
-        # A1: любое сообщение при занятом агенте прерывает текущий ход.
-        if self._busy and self._client is not None:
+        # A1: сообщение при занятом агенте прерывает текущий ход (кроме §defer).
+        if interrupt and self._busy and self._client is not None:
             await self._interrupt_current()
         await self._emit_status()  # idle→busy при первом сообщении
         return False
@@ -1221,6 +1232,7 @@ class ClaudeSession:
         # при подъёме нового ридера. Сброс тут стёр бы причину смерти ридера
         # раньше, чем проверка живости успеет её увидеть.
         self._turn_auth_needed = False
+        self._turn_rate_limited = False
         self._turn_done.clear()
         self._awaiting_result += 1     # ждём ResultMessage этого хода (BUG2-диаг)
         await client.query(prompt)
@@ -1243,6 +1255,30 @@ class ClaudeSession:
                     await self._on_auth_required()
             finally:
                 # Клиент бесполезен без логина; свежий — на следующий user_msg.
+                await self._disconnect()
+            return
+        # §ratelimit: упор в лимит подписки — ОШИБОЧНЫЙ ResultMessage с
+        # api_error_status==429 (диспетчер выставил флаг + кэш resets_at из
+        # RateLimitEvent). Шлём RATE_LIMITED с reset — клиент предложит отложить
+        # сообщение до сброса. reset=None → клиент добьёт через get_limits.
+        if self._turn_rate_limited:
+            # Кэш reset мог протухнуть (429 нового окна без свежего
+            # RateLimitEvent) — не отдаём прошедший reset, иначе клиент
+            # запланирует «на сейчас» и снова упрётся. None → клиент добьёт
+            # через get_limits.
+            reset = self._rate_limit_reset
+            if reset is not None and reset <= time.time():
+                reset = None
+            log.warning("agent.rate_limited", chat=self.meta.chatId,
+                        reset=reset, type=self._rate_limit_type)
+            try:
+                await self._publish("error", {
+                    "code": Err.RATE_LIMITED,
+                    "message": "Достигнут лимит подписки Claude",
+                    "reset": reset,
+                    "resetType": self._rate_limit_type,
+                })
+            finally:
                 await self._disconnect()
             return
         # Ридер упал (крах/закрытие потока) без auth-признака — пробрасываем,
@@ -1328,6 +1364,19 @@ class ClaudeSession:
                         "output": _result_text(block.content),
                         "is_error": bool(block.is_error),
                     })
+        elif isinstance(msg, RateLimitEvent):
+            # §ratelimit: CLI шлёт это событие при смене статуса лимита — кэшируем
+            # resets_at/тип, чтобы отдать их с RATE_LIMITED, когда ход упрётся в
+            # 429. В ленту не публикуем (не событие переписки).
+            info = getattr(msg, "rate_limit_info", None)
+            if info is not None:
+                reset = getattr(info, "resets_at", None)
+                if reset is not None:
+                    try:
+                        self._rate_limit_reset = float(reset)
+                    except (TypeError, ValueError):
+                        self._rate_limit_reset = None
+                self._rate_limit_type = getattr(info, "rate_limit_type", None)
         elif isinstance(msg, ResultMessage):
             # BUG2-диагностика: результат без ожидающего query — фоновый хвост
             # (лишний ResultMessage субагента ПОСЛЕ конца хода). Логируем поля,
@@ -1347,6 +1396,10 @@ class ClaudeSession:
             # этом может оставаться "success" — на него гейтить нельзя).
             if msg.is_error and is_auth_error(msg.result or ""):
                 self._turn_auth_needed = True
+            # §ratelimit: упор в лимит подписки — CLI помечает результат
+            # api_error_status==429 (с v2.1.110). _turn разберёт после пробуждения.
+            if msg.is_error and getattr(msg, "api_error_status", None) == 429:
+                self._turn_rate_limited = True
             if msg.session_id:
                 self._set_session_id(msg.session_id)
             usage = msg.usage or {}
