@@ -261,10 +261,18 @@ class AuthOmniRoutePayload(_Payload):
 
 class OmniRouteProbeModelsPayload(_Payload):
     """§omni шаг 1: запросить каталог моделей у шлюза (GET {base}/v1/models).
+    base_url/api_key ОПЦИОНАЛЬНЫ: если пусто и omniroute уже активен — сервер
+    берёт их из auth.json (редактирование списка без повторного ввода ключа).
     cliType — задел под несколько CLI (сейчас claude)."""
-    base_url: str = Field(min_length=1)
-    api_key: str = Field(min_length=1)
+    base_url: str = Field(default="", max_length=500)
+    api_key: str = Field(default="", max_length=500)
     cliType: str = Field(default="claude", max_length=40)
+
+
+class OmniRouteSetKeyPayload(_Payload):
+    """§omni: сменить ТОЛЬКО ключ активного omniroute-подключения (юзер выпустил
+    новый). Модели/active/small_fast/base_url сохраняются, без ре-onboarding'а."""
+    api_key: str = Field(min_length=1, max_length=500)
 
 
 class OmniRouteSetModelsPayload(_Payload):
@@ -387,6 +395,7 @@ CLIENT_FRAME_TYPES: dict[str, tuple[type[_Payload], bool]] = {
     # §omni: каталог моделей шлюза (шаг 1) + сохранение выбора (шаг 1)
     "omniroute_probe_models": (OmniRouteProbeModelsPayload, False),
     "omniroute_set_models": (OmniRouteSetModelsPayload, False),
+    "omniroute_set_key": (OmniRouteSetKeyPayload, False),
     "logout": (EmptyPayload, False),
     # §14: лог приложения-клиента (глобальный, без chatId)
     "client_log": (ClientLogPayload, False),

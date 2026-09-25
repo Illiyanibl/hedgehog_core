@@ -442,11 +442,31 @@ class HedgehogServer:
                 "auth_result", {"ok": ok, "error": err}))
             return
         if ftype == "omniroute_probe_models":
-            # §omni шаг 1: каталог моделей шлюза (сгруппированный, кэш по base_url).
-            data = await self._omniroute_catalog(p.base_url, p.api_key)
+            # §omni шаг 1: каталог моделей шлюза. Ключ пуст → берём сохранённый
+            # (редактирование без ввода ключа), но ТОЛЬКО на сохранённый base_url:
+            # не отправляем секрет на произвольный клиентский URL (Fable SF1).
+            base = (p.base_url or "").strip()
+            key = (p.api_key or "").strip()
+            if not key:
+                auth = self.config.load_auth_config()
+                if auth.get("mode") == "omniroute":
+                    stored_base = auth.get("base_url", "")
+                    if not base or base == stored_base:
+                        base = base or stored_base
+                        key = auth.get("api_key", "")
+            if not base or not key:
+                data = {"ok": False, "error": "нет base_url/ключа", "providers": []}
+            else:
+                data = await self._omniroute_catalog(base, key)
             data["cliType"] = p.cliType
             await self.hub.send_global(
                 conn_id, make_frame("omniroute_catalog", data))
+            return
+        if ftype == "omniroute_set_key":
+            # §omni: сменить только ключ активного omniroute (модели сохраняются).
+            ok, err = await self._set_omniroute_key(p.api_key)
+            await self.hub.send_global(conn_id, make_frame(
+                "omniroute_set_result", {"ok": ok, "error": err}))
             return
         if ftype == "omniroute_set_models":
             # §omni шаг 1: сохранить выбор моделей (без тир-лимита — режет клиент).
@@ -1514,6 +1534,28 @@ class HedgehogServer:
         self.config.save_auth_config(new_auth)   # легаси-поля отброшены
         log.info("omni.models_saved", n=len(ids),
                  active=p.active_id, small=p.small_fast_id)
+        return True, None
+
+    async def _set_omniroute_key(self, api_key: str) -> tuple[bool, str | None]:
+        """§omni: сменить ТОЛЬКО ключ активного omniroute-подключения. Проба по
+        активной модели валидирует именно КЛЮЧ (401/403 = отказ; «unknown model»
+        400/404 = ключ валиден). Модели/active/small_fast/base_url сохраняем."""
+        auth = self.config.load_auth_config()
+        if auth.get("mode") != "omniroute":
+            return False, "OmniRoute не активирован"
+        base = auth.get("base_url", "")
+        # активная модель для пробы: новый вид → active_id; легаси → любой слот.
+        probe = (auth.get("active_id") or auth.get("haiku_model")
+                 or auth.get("sonnet_model") or auth.get("opus_model") or "")
+        if not probe:
+            return False, "нет модели для проверки ключа"
+        ok, err = await self._probe_auth(base, api_key, probe)
+        if not ok:
+            return False, err
+        self.config.save_auth_config({**auth, "api_key": api_key})
+        await self._restart_claude_sessions()   # новый ключ в env новой сессии
+        self._invalidate_models_cache()
+        log.info("omni.key_updated", base_url=base)
         return True, None
 
     def _omniroute_models_list(self, cli_type: str) -> dict | None:
