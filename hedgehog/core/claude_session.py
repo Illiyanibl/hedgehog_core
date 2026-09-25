@@ -222,10 +222,22 @@ def build_auth_env(config: Config) -> tuple[dict[str, str], str | None]:
     elif mode == "omniroute":
         env["ANTHROPIC_API_KEY"] = auth.get("api_key", "")
         env["ANTHROPIC_BASE_URL"] = auth.get("base_url", "")
-        env["ANTHROPIC_DEFAULT_OPUS_MODEL"] = auth.get("opus_model", "")
-        env["ANTHROPIC_DEFAULT_SONNET_MODEL"] = auth.get("sonnet_model", "")
-        env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = auth.get("haiku_model", "")
-        model_override = auth.get("default_tier") or "haiku"
+        active_id = (auth.get("active_id") or "").strip()
+        if active_id:
+            # §omni новый вид: активная модель = ANTHROPIC_MODEL напрямую (без
+            # opus/sonnet/haiku-логики — модели любые), быстрая — small/fast для
+            # фоновых задач Claude Code. Пер-чат переключение перекроет meta.model.
+            small = (auth.get("small_fast_id") or active_id).strip()
+            env["ANTHROPIC_MODEL"] = active_id
+            env["ANTHROPIC_SMALL_FAST_MODEL"] = small
+            env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = small   # совместимость
+            model_override = active_id
+        else:
+            # Легаси-вид: 3 слота + алиас default_tier (как раньше).
+            env["ANTHROPIC_DEFAULT_OPUS_MODEL"] = auth.get("opus_model", "")
+            env["ANTHROPIC_DEFAULT_SONNET_MODEL"] = auth.get("sonnet_model", "")
+            env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = auth.get("haiku_model", "")
+            model_override = auth.get("default_tier") or "haiku"
     else:  # oauth (по умолчанию) — setup-token не пишет creds-файл, поэтому
         # подкладываем его CLI через env; нет файла → базовые креды.
         oauth = config.load_oauth_token()

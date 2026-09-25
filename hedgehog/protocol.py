@@ -229,16 +229,51 @@ class AuthApiKeyPayload(_Payload):
     base_url: str | None = None
 
 
+class OmniModel(_Payload):
+    """§omni: выбранная пользователем модель шлюза. id — полный id шлюза
+    (`cc/claude-opus-4-8`); name — человеческое имя (≤15, клампим защитно —
+    основной лимит на клиенте)."""
+    id: str = Field(min_length=1, max_length=200)
+    name: str = Field(default="", max_length=64)
+
+
 class AuthOmniRoutePayload(_Payload):
-    """§altauth: авторизация через шлюз (OmniRoute и т.п.): ключ + base_url +
-    имена моделей шлюза на 3 тира. default_tier — какой алиас идёт по
-    умолчанию (opus|sonnet|haiku)."""
+    """§altauth/§omni: авторизация через шлюз (OmniRoute и т.п.).
+
+    Новый вид (шаг 1): ключ + base_url + `models` (выбранные + имена) + `active_id`
+    (активная) + `small_fast_id` (быстрая для фоновых задач). Без допущений про
+    Anthropic — модели любые.
+
+    Легаси-вид (совместимость): `opus_model/sonnet_model/haiku_model` + `default_tier`
+    → мигрируется в новый (см. _activate_omniroute / build_auth_env)."""
     api_key: str = Field(min_length=1)
     base_url: str = Field(min_length=1)
-    opus_model: str = Field(min_length=1)
-    sonnet_model: str = Field(min_length=1)
-    haiku_model: str = Field(min_length=1)
+    # новый вид
+    models: list[OmniModel] = Field(default_factory=list, max_length=200)
+    active_id: str = Field(default="", max_length=200)
+    small_fast_id: str = Field(default="", max_length=200)
+    # легаси-вид (опционально — старый клиент)
+    opus_model: str = ""
+    sonnet_model: str = ""
+    haiku_model: str = ""
     default_tier: str = "haiku"
+
+
+class OmniRouteProbeModelsPayload(_Payload):
+    """§omni шаг 1: запросить каталог моделей у шлюза (GET {base}/v1/models).
+    cliType — задел под несколько CLI (сейчас claude)."""
+    base_url: str = Field(min_length=1)
+    api_key: str = Field(min_length=1)
+    cliType: str = Field(default="claude", max_length=40)
+
+
+class OmniRouteSetModelsPayload(_Payload):
+    """§omni шаг 1: сохранить выбор моделей (без лимита — тир режет клиент на
+    шаге 2). Переиспользует api_key/base_url из активного auth-конфига."""
+    cliType: str = Field(default="claude", max_length=40)
+    models: list[OmniModel] = Field(default_factory=list, max_length=200)
+    active_id: str = Field(min_length=1, max_length=200)
+    small_fast_id: str = Field(min_length=1, max_length=200)
 
 
 class ClientLogPayload(_Payload):
@@ -349,6 +384,9 @@ CLIENT_FRAME_TYPES: dict[str, tuple[type[_Payload], bool]] = {
     "auth_code": (AuthCodePayload, False),
     "auth_apikey": (AuthApiKeyPayload, False),
     "auth_omniroute": (AuthOmniRoutePayload, False),
+    # §omni: каталог моделей шлюза (шаг 1) + сохранение выбора (шаг 1)
+    "omniroute_probe_models": (OmniRouteProbeModelsPayload, False),
+    "omniroute_set_models": (OmniRouteSetModelsPayload, False),
     "logout": (EmptyPayload, False),
     # §14: лог приложения-клиента (глобальный, без chatId)
     "client_log": (ClientLogPayload, False),

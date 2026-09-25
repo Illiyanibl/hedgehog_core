@@ -13,6 +13,8 @@ hello. Дальше — диспетчеризация client→server фрей�
 from __future__ import annotations
 
 import asyncio
+import copy
+import hashlib
 import http
 import json
 import time
@@ -31,6 +33,7 @@ from ..core.auth import AuthManager
 from ..core.claude_session import ClaudeSession
 from ..core.pty_session import PtySession
 from ..core import models
+from ..core.gateways import omniroute as omniroute_gw
 from ..protocol import (
     Attachment,
     BadFrame,
@@ -90,6 +93,8 @@ class HedgehogServer:
         # второй CLI-процесс во время хода, §models M1) + троттлинг проб (M2).
         self._models_probe_task: asyncio.Task | None = None
         self._last_probe_ts = 0.0
+        # §omni: кэш каталога шлюза по base_url ({base: (ts, data)}), TTL ниже.
+        self._omni_catalog_cache: dict[str, tuple[float, dict]] = {}
 
     # ---------- §sched: точки входа для планировщика ----------
 
@@ -225,6 +230,7 @@ class HedgehogServer:
     _MODELS_TTL = 24 * 3600      # штатный интервал обновления кэша
     _MODELS_RETRY = 120          # переспрос, если проба отложена (агент занят)
     _MODELS_MIN_INTERVAL = 60    # троттлинг: не чаще одной пробы CLI в минуту
+    _OMNI_CATALOG_TTL = 300      # §omni: кэш каталога шлюза (5 мин)
 
     async def _models_refresh_loop(self) -> None:
         """Раз в сутки (и по событию смены авторизации) обновляет кэш моделей.
@@ -248,6 +254,14 @@ class HedgehogServer:
         """Одна попытка обновить кэш. Возвращает СЛЕДУЮЩУЮ задержку (сек):
         занят агент → скоро (RETRY); проба недавно (троттл M2) → дождаться окна;
         успех/скип → сутки. Клиентский спам list_models так не плодит процессы."""
+        # §omni S1: при активной omniroute-авторизации нового вида список — это
+        # ВЫБРАННЫЕ пользователем модели (не CLI-проба). Не поднимаем CLI и
+        # бродкастим выбранные, иначе рефрешер (проснувшийся на invalidate после
+        # set_models) затёр бы omniroute-пикер CLI-алиасами.
+        omni = self._omniroute_models_list(models.DEFAULT_CLI_TYPE)
+        if omni is not None:
+            await self.hub.broadcast_global(make_frame("models_list", omni))
+            return self._MODELS_TTL
         # Не поднимаем второй CLI-процесс во время активного хода (§models M1).
         if any(isinstance(s, ClaudeSession) and s.status == "busy"
                for s in self.sessions.values()):
@@ -422,10 +436,27 @@ class HedgehogServer:
                 "auth_result", {"ok": ok, "error": err}))
             return
         if ftype == "auth_omniroute":
-            # §altauth: активировать шлюз (ключ + base_url + модели тиров).
+            # §altauth: активировать шлюз (ключ + base_url + выбранные модели).
             ok, err = await self._activate_omniroute(p)
             await self.hub.send_global(conn_id, make_frame(
                 "auth_result", {"ok": ok, "error": err}))
+            return
+        if ftype == "omniroute_probe_models":
+            # §omni шаг 1: каталог моделей шлюза (сгруппированный, кэш по base_url).
+            data = await self._omniroute_catalog(p.base_url, p.api_key)
+            data["cliType"] = p.cliType
+            await self.hub.send_global(
+                conn_id, make_frame("omniroute_catalog", data))
+            return
+        if ftype == "omniroute_set_models":
+            # §omni шаг 1: сохранить выбор моделей (без тир-лимита — режет клиент).
+            ok, err = self._save_omniroute_models(p)
+            if ok:
+                self._reset_all_chat_models()   # выбор мог протухнуть (§models L2)
+                await self._restart_claude_sessions()
+                self._invalidate_models_cache()
+            await self.hub.send_global(conn_id, make_frame(
+                "omniroute_set_result", {"ok": ok, "error": err}))
             return
         if ftype == "logout":
             # §13: разлогин. /logout в SDK не работает (интерактивная
@@ -545,6 +576,10 @@ class HedgehogServer:
                 data = {"cliType": cli_type, "models": [], "current": None,
                         "raw": "", "auth_state": "UNSUPPORTED",
                         "cli_present": False, "updated_at": 0}
+            elif (omni := self._omniroute_models_list(cli_type)) is not None:
+                # §omni: при omniroute-авторизации источник — ВЫБРАННЫЕ модели
+                # (шаг 1), а не CLI-проба. Тир-лимит (первые N) применяет клиент.
+                data = omni
             else:
                 data = models.load_cache(self.config, cli_type)
                 if data is None:
@@ -1388,22 +1423,113 @@ class HedgehogServer:
         log.info("auth.apikey_activated", base_url=base_url or "anthropic")
         return True, None
 
+    @staticmethod
+    def _clean_omni_models(items) -> list[dict]:
+        """OmniModel[] → [{id,name}] с клампом имени ≤15 (защитно; основной
+        лимит длины — на клиенте). Пустое имя → id."""
+        out = []
+        for m in items:
+            name = ((m.name or "").strip() or m.id)[:15]   # fallback тоже ≤15 (N1)
+            out.append({"id": m.id, "name": name})
+        return out
+
     async def _activate_omniroute(self, p) -> tuple[bool, str | None]:
-        # Проверяем моделью дефолтного тира (реальное имя модели шлюза).
-        probe_model = {
-            "opus": p.opus_model, "sonnet": p.sonnet_model,
-        }.get(p.default_tier, p.haiku_model)
-        ok, err = await self._probe_auth(p.base_url, p.api_key, probe_model)
-        if not ok:
-            return False, err
-        self.config.save_auth_config({
-            "mode": "omniroute", "api_key": p.api_key, "base_url": p.base_url,
-            "opus_model": p.opus_model, "sonnet_model": p.sonnet_model,
-            "haiku_model": p.haiku_model,
-            "default_tier": p.default_tier or "haiku"})
+        # §omni новый вид: ключ + base_url + выбранные модели (любые, без
+        # opus/sonnet/haiku-логики). Легаси-вид (3 слота) — совместимость.
+        if p.models:
+            ids = [m.id for m in p.models]
+            idset = set(ids)
+            active = p.active_id if p.active_id in idset else ids[0]
+            small = p.small_fast_id if p.small_fast_id in idset else active
+            ok, err = await self._probe_auth(p.base_url, p.api_key, active)
+            if not ok:
+                return False, err
+            self.config.save_auth_config({
+                "mode": "omniroute", "api_key": p.api_key, "base_url": p.base_url,
+                "models": self._clean_omni_models(p.models),
+                "active_id": active, "small_fast_id": small})
+            log.info("auth.omniroute_activated", base_url=p.base_url,
+                     new=True, n=len(ids), active=active)
+        else:
+            # Легаси-вид: 3 слота + алиас default_tier (как раньше).
+            probe_model = {
+                "opus": p.opus_model, "sonnet": p.sonnet_model,
+            }.get(p.default_tier, p.haiku_model)
+            if not probe_model:
+                return False, "не заданы модели шлюза"
+            ok, err = await self._probe_auth(p.base_url, p.api_key, probe_model)
+            if not ok:
+                return False, err
+            self.config.save_auth_config({
+                "mode": "omniroute", "api_key": p.api_key, "base_url": p.base_url,
+                "opus_model": p.opus_model, "sonnet_model": p.sonnet_model,
+                "haiku_model": p.haiku_model,
+                "default_tier": p.default_tier or "haiku"})
+            log.info("auth.omniroute_activated", base_url=p.base_url,
+                     new=False, default_tier=p.default_tier)
         self._reset_all_chat_models()    # §models L2: выбор мог протухнуть
         await self._restart_claude_sessions()
         self._invalidate_models_cache()   # §models: список зависит от шлюза
-        log.info("auth.omniroute_activated", base_url=p.base_url,
-                 default_tier=p.default_tier)
         return True, None
+
+    async def _omniroute_catalog(self, base_url: str, api_key: str) -> dict:
+        """§omni шаг 1: каталог моделей шлюза (сгруппированный) с кэшем по
+        base_url. Ошибку сети/HTTP отдаём как {ok:False,error,providers:[]}."""
+        # Ключ кэша учитывает и ключ (S3): разные ключи → разные entitlements/
+        # валидность, не переиспользуем чужой каталог.
+        key = (base_url.rstrip("/") + "\0"
+               + hashlib.sha256(api_key.encode()).hexdigest()[:16])
+        now = time.time()
+        hit = self._omni_catalog_cache.get(key)
+        if hit is not None and now - hit[0] < self._OMNI_CATALOG_TTL:
+            return copy.deepcopy(hit[1])   # S4: не отдаём общий изменяемый объект
+        try:
+            cat = await omniroute_gw.fetch_catalog(base_url, api_key)
+        except Exception as e:  # noqa: BLE001 — сетевую ошибку показываем клиенту
+            log.warning("omni.catalog_error", err=repr(e))
+            return {"ok": False, "error": str(e), "providers": []}
+        data = {"ok": True, **cat}
+        self._omni_catalog_cache[key] = (now, data)
+        return copy.deepcopy(data)
+
+    def _save_omniroute_models(self, p) -> tuple[bool, str | None]:
+        """§omni шаг 1: сохранить выбор моделей в активный omniroute-конфиг
+        (переиспользуя api_key/base_url). Без тир-лимита."""
+        auth = self.config.load_auth_config()
+        if auth.get("mode") != "omniroute" or not auth.get("api_key"):
+            return False, "OmniRoute не активирован"
+        ids = [m.id for m in p.models]
+        if not ids:
+            return False, "список моделей пуст"
+        idset = set(ids)
+        if p.active_id not in idset:
+            return False, "active_id вне списка"
+        if p.small_fast_id not in idset:
+            return False, "small_fast_id вне списка"
+        new_auth = {
+            "mode": "omniroute",
+            "api_key": auth["api_key"], "base_url": auth.get("base_url", ""),
+            "models": self._clean_omni_models(p.models),
+            "active_id": p.active_id, "small_fast_id": p.small_fast_id}
+        self.config.save_auth_config(new_auth)   # легаси-поля отброшены
+        log.info("omni.models_saved", n=len(ids),
+                 active=p.active_id, small=p.small_fast_id)
+        return True, None
+
+    def _omniroute_models_list(self, cli_type: str) -> dict | None:
+        """§omni: models_list из ВЫБРАННЫХ моделей (если активна omniroute-авториз.
+        нового вида). Иначе None → обычный источник (CLI-проба). Тир НЕ режем —
+        отдаём всё, первые N покажет клиент."""
+        auth = self.config.load_auth_config()
+        if auth.get("mode") != "omniroute" or not auth.get("active_id"):
+            return None
+        sel = auth.get("models") or []
+        return {
+            "cliType": cli_type,
+            "models": [m["id"] for m in sel],                       # compat: id-строки
+            "names": {m["id"]: (m.get("name") or m["id"]) for m in sel},  # id→label
+            "current": auth.get("active_id"),
+            "source": "omniroute",
+            "raw": "", "auth_state": "OK",
+            "cli_present": True, "updated_at": 0,
+        }
