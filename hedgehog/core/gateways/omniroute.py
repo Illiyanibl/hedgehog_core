@@ -26,6 +26,10 @@ import structlog
 
 log = structlog.get_logger("gateway.omniroute")
 
+# namespace'ы видео-моделей (VEO/Seedance) — отсекаем ПОЛНОСТЬЮ: не для чат-CLI.
+# Часть таких моделей приходит без поля type=video, поэтому режем и по namespace.
+VIDEO_NAMESPACES: frozenset[str] = frozenset({"veo-free", "veoaifree-web"})
+
 # namespace'ы встроенных бесплатных агрегаторов OmniRoute → в «OmniRoute default».
 BUILTIN_NAMESPACES: frozenset[str] = frozenset({
     "auto",            # combo — мета-роутеры (best-coding, pro-reasoning…)
@@ -35,8 +39,6 @@ BUILTIN_NAMESPACES: frozenset[str] = frozenset({
     "ddgw",            # duckduckgo-web
     "pepper",          # chipotle
     "mcode",           # mimocode
-    "veo-free",        # видео (отсекаются type=video, но namespace на всякий)
-    "veoaifree-web",
 })
 
 # Человеческие имена «реальных» провайдеров. Неизвестный реальный namespace →
@@ -107,9 +109,9 @@ def build_catalog(raw_models: list[dict]) -> dict[str, Any]:
         mid = str(m.get("id") or "").strip()
         if not mid:
             continue
-        if m.get("type") == "video":      # не для чат-CLI
-            continue
         ns = _namespace(mid)
+        if m.get("type") == "video" or ns in VIDEO_NAMESPACES:   # не для чат-CLI
+            continue
         base_id, no_think = _strip_nothink(mid)
         is_builtin = ns in BUILTIN_NAMESPACES
         provider_id = DEFAULT_PROVIDER_ID if is_builtin else ns
