@@ -26,11 +26,12 @@ percent-encoded UTF-8 (заголовки HTTP латиница) → серве�
 """
 from __future__ import annotations
 
-import io
+import asyncio
 import mimetypes
 import os
 import re
 import shutil
+import tempfile
 import urllib.parse
 import zipfile
 from pathlib import Path
@@ -404,6 +405,16 @@ async def _attach(request: web.Request) -> web.Response:
 MAX_ZIP_BYTES = 512 * 1024 * 1024  # суммарный лимит на архив (защита памяти)
 
 
+def _build_zip_file(items: list[tuple[Path, str]], path: str) -> None:
+    """Собрать zip в УЖЕ СОЗДАННЫЙ временный файл `path`. Зовётся из
+    asyncio.to_thread (S5-H1: deflate не должен блокировать event loop).
+    Временный файл создаёт и удаляет ВЫЗЫВАЮЩИЙ (M1: иначе при отмене хендлера —
+    обрыв клиента во время сборки — путь никто не получит и файл осиротеет)."""
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for f, arc in items:
+            zf.write(f, arc)
+
+
 def _zip_items(p: Path) -> list[tuple[Path, str]]:
     """Развернуть путь в список (файл, arcname). Папка → рекурсивно (arcname
     с префиксом её имени). Симлинки пропускаем (не выходим наружу архивом)."""
@@ -443,16 +454,36 @@ async def _zip(request: web.Request) -> web.Response:
     if total > MAX_ZIP_BYTES:
         return web.json_response({"error": "archive too large"}, status=413)
 
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for f, arc in items:
-            zf.write(f, arc)
-    data = buf.getvalue()
-    log.info("file.zip", count=len(items), bytes=len(data))
-    return web.Response(body=data, headers={
-        "Content-Type": "application/zip",
-        "Content-Disposition": 'attachment; filename="files.zip"',
-    })
+    # S5-H1: сборку deflate (сотни МБ) выносим в поток — иначе замирает общий
+    # event loop (файл- и WS-сервер в одном loop); стримим с диска, не держим
+    # весь архив в памяти (было io.BytesIO + getvalue = 2× копии, пик ~1 ГБ).
+    # M1: temp создаём ЗДЕСЬ (до to_thread) → finally удалит его даже если клиент
+    # оборвётся во время сборки (os.remove по открытому inode на POSIX безопасен).
+    fd, tmp = tempfile.mkstemp(prefix="hh-zip-", suffix=".zip")
+    os.close(fd)
+    try:
+        await asyncio.to_thread(_build_zip_file, items, tmp)
+        size = os.path.getsize(tmp)
+        log.info("file.zip", count=len(items), bytes=size)
+        resp = web.StreamResponse(headers={
+            "Content-Type": "application/zip",
+            "Content-Disposition": 'attachment; filename="files.zip"',
+        })
+        resp.content_length = size
+        await resp.prepare(request)
+        with open(tmp, "rb") as fh:
+            while True:
+                chunk = await asyncio.to_thread(fh.read, 256 * 1024)
+                if not chunk:
+                    break
+                await resp.write(chunk)
+        await resp.write_eof()
+        return resp
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
 
 
 def make_app(config: Config, token: str) -> web.Application:

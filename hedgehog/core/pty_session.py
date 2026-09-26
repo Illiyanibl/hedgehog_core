@@ -175,6 +175,15 @@ class PtySession:
             except (RuntimeError, OSError):
                 pass
 
+    def current_snapshot(self) -> dict:
+        """Текущее состояние экрана (S5-H2: снапшоты не журналируются в pending;
+        сервер шлёт этот кадр реконнектнувшемуся клиенту при subscribe_chat)."""
+        return {
+            "text": self._grid.render_plain(),
+            "cursor_row": self._grid.cursor_row,
+            "cursor_col": self._grid.cursor_col,
+        }
+
     async def _flush_loop(self):
         """Агрегатор: не чаще одного screen_snapshot в snapshot_interval."""
         while True:

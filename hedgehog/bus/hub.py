@@ -82,17 +82,26 @@ class Hub:
     # перерисовываются десятки раз/сек — это шум для наблюдения задним числом
     # (у shell-чатов уже есть plain-text transcript.log от HistoryWriter).
     _TRANSCRIPT_SKIP = {"screen_snapshot"}
+    # S5-H2: screen_snapshot НЕ кладём в pending. Shell гонит до ~12 снапшотов/с;
+    # оффлайн-клиент раздул бы pending.jsonl (~90 МБ/час) до hard-cap, после чего
+    # каждый append делает shed ~100 МБ синхронно в event loop, а resume реплеит
+    # тысячи устаревших кадров. Клиенту нужен только ПОСЛЕДНИЙ экран: живому — по
+    # fanout ниже; реконнектнувшемуся сервер шлёт текущий снапшот при subscribe
+    # (wss subscribe_chat). transcript и так пропускает snapshot.
+    _PENDING_SKIP = {"screen_snapshot"}
 
     async def publish(self, chat_id: str, ftype: str, payload: dict[str, Any],
                       journal: bool = True) -> dict:
         """Событие чата: журнал + постоянный транскрипт + рассылка подписчикам."""
         frame = make_frame(ftype, payload, chat_id)
         if journal:
-            try:
-                self._store.append_pending(chat_id, frame)
-            except OSError as e:
-                # Чат могли удалить под ногами — событие только в сокеты.
-                log.warning("journal.append_failed", chat_id=chat_id, err=str(e))
+            if ftype not in self._PENDING_SKIP:
+                try:
+                    self._store.append_pending(chat_id, frame)
+                except OSError as e:
+                    # Чат могли удалить под ногами — событие только в сокеты.
+                    log.warning("journal.append_failed", chat_id=chat_id,
+                                err=str(e))
             if ftype not in self._TRANSCRIPT_SKIP:
                 self._store.append_transcript(chat_id, frame)
         delivered = await self._fanout(chat_id, frame)

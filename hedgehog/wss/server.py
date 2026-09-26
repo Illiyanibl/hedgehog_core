@@ -982,7 +982,13 @@ class HedgehogServer:
             log.info("chat.subscribe", conn_id=conn_id, chat_id=frame.chatId)
             # Для shell-чата поднимаем bash сразу — клиент увидит prompt.
             if meta.addressee == "broker_shell":
-                await self._ensure_session(meta)
+                session = await self._ensure_session(meta)
+                # S5-H2: снапшоты не в pending → шлём ТЕКУЩИЙ экран этому
+                # соединению (реконнект к живому shell не увидит его иначе).
+                if isinstance(session, PtySession):
+                    await self.hub.send_global(conn_id, make_frame(
+                        "screen_snapshot", session.current_snapshot(),
+                        frame.chatId))
             # §views авто-возврат: если в чате есть ОТКРЫТОЕ окно (current),
             # ре-пушим его этому соединению — окно переживает рестарт/реконнект
             # (клиент на реконнекте пере-сидит ленту и теряет живое окно).

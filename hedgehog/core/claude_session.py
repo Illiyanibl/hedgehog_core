@@ -336,6 +336,17 @@ class ClaudeSession:
     # ---------- lifecycle ----------
 
     async def start(self):
+        # H1: воскрешаем и МЁРТВЫЙ воркер (task.done()), не только None. Если _run
+        # всё же умер (исключение из обработчика ошибки), очередь иначе никто не
+        # разгребёт → чат «вечно busy» до рестарта процесса. Исключение мёртвого
+        # воркера извлекаем, чтобы не копить «Task exception was never retrieved».
+        if self._worker is not None and self._worker.done():
+            if not self._worker.cancelled():
+                exc = self._worker.exception()
+                if exc is not None:
+                    log.error("worker.died_restart", chat=self.meta.chatId,
+                              err=repr(exc))
+            self._worker = None
         if self._worker is None:
             self._worker = asyncio.create_task(self._run(), name=f"claude:{self.meta.chatId}")
 
@@ -453,25 +464,47 @@ class ClaudeSession:
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                err_text = repr(e) + " " + " ".join(self._stderr_tail)
-                if is_auth_error(err_text):
-                    log.warning("agent.auth_required", chat=self.meta.chatId,
-                                err=err_text[-300:])
-                    await self._send_chat_error(
-                        Err.AUTH_REQUIRED,
-                        "Claude на сервере не авторизован — открой ссылку "
-                        "авторизации и пришли код (auth_code)")
-                    if self._on_auth_required is not None:
-                        await self._on_auth_required()
-                else:
-                    log.error("agent.crash", chat=self.meta.chatId, err=repr(e))
-                    await self._send_chat_error(Err.AGENT_CRASH,
-                                                f"Claude SDK failed: {e}")
-                # Свежее подключение на следующий user_msg.
-                await self._disconnect()
+                # H1: сам обработчик ошибки (send_chat_error/on_auth_required/
+                # disconnect) НЕ должен уронить воркер — иначе _run умрёт, очередь
+                # никто не разгребёт, чат «вечно busy». Всё в try, disconnect в
+                # finally (свежее подключение на следующий user_msg — обязательно).
+                try:
+                    err_text = repr(e) + " " + " ".join(self._stderr_tail)
+                    if is_auth_error(err_text):
+                        log.warning("agent.auth_required", chat=self.meta.chatId,
+                                    err=err_text[-300:])
+                        await self._send_chat_error(
+                            Err.AUTH_REQUIRED,
+                            "Claude на сервере не авторизован — открой ссылку "
+                            "авторизации и пришли код (auth_code)")
+                        if self._on_auth_required is not None:
+                            await self._on_auth_required()
+                    else:
+                        log.error("agent.crash", chat=self.meta.chatId, err=repr(e))
+                        await self._send_chat_error(Err.AGENT_CRASH,
+                                                    f"Claude SDK failed: {e}")
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e2:  # noqa: BLE001 — уведомление не критично
+                    log.error("agent.error_handler_failed", chat=self.meta.chatId,
+                              err=repr(e2))
+                finally:
+                    try:
+                        await self._disconnect()   # свежее подключение
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e3:  # noqa: BLE001
+                        log.warning("agent.disconnect_failed",
+                                    chat=self.meta.chatId, err=repr(e3))
             finally:
                 self._busy = False
-                await self._emit_status()  # busy→idle, когда очередь пуста
+                try:
+                    await self._emit_status()  # busy→idle, когда очередь пуста
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e4:  # noqa: BLE001 — статус не критичен
+                    log.warning("status.emit_failed", chat=self.meta.chatId,
+                                err=repr(e4))
 
     @property
     def status(self) -> str:
@@ -1452,6 +1485,8 @@ class ClaudeSession:
                                 err=repr(e), msg=type(msg).__name__)
                     # Если упала публикация РЕЗУЛЬТАТА — всё равно будим ход,
                     # чтобы он не завис (деградация: без agent_done, но не ханг).
+                    # Безусловно (в обход H2-гейта awaited): анти-ханг важнее, а
+                    # трейлер с упавшим publish тут не различить (декремент уже был).
                     if isinstance(msg, ResultMessage):
                         self._turn_done.set()
         except asyncio.CancelledError:
@@ -1525,7 +1560,8 @@ class ClaudeSession:
             # BUG2-диагностика: результат без ожидающего query — фоновый хвост
             # (лишний ResultMessage субагента ПОСЛЕ конца хода). Логируем поля,
             # чтобы эмпирически найти дискриминатор для будущей корреляции.
-            if self._awaiting_result > 0:
+            awaited = self._awaiting_result > 0
+            if awaited:
                 self._awaiting_result -= 1
             else:
                 log.info("reader.trailer_result", chat=self.meta.chatId,
@@ -1562,7 +1598,16 @@ class ClaudeSession:
                     "output_tokens": usage.get("output_tokens", 0),
                 },
             })
-            self._turn_done.set()          # разбудить ждущий _turn
+            # H2: будим ждущий _turn ТОЛЬКО на ОЖИДАЕМом результате (awaited).
+            # Трейлер (фоновый хвост субагента, когда никто не ждёт, счётчик==0)
+            # раньше тоже звал set() — оставлял «залипший» взвод, а следующий ход
+            # мог проснуться преждевременно. Узкую гонку «трейлер прилетел, пока
+            # ждёт СЛЕДУЮЩИЙ ход» (счётчик==1) различить нельзя — остаётся
+            # известным ограничением (нужна корреляция query↔result в SDK).
+            # Хангов не добавляет: закрытие потока/ошибка ридера взводят
+            # _turn_done в _reader_loop независимо.
+            if awaited:
+                self._turn_done.set()          # разбудить ждущий _turn
             # Следующий ответ (в т.ч. фоновый хвост) — своя группа. Косметика:
             # если ТЕКСТ хвоста прошлого хода придёт вперемешку с текстом
             # следующего хода до первого результата, они разок склеятся в одну
