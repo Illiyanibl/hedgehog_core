@@ -1573,10 +1573,16 @@ class HedgehogServer:
         if auth.get("mode") != "omniroute" or not auth.get("active_id"):
             return None
         sel = auth.get("models") or []
+        # Метка чипа в CLI-view = «алиас/имя» (напр. cc/Opus): алиас = префикс id
+        # (namespace, no-think снят), имя — заданное пользователем.
+        def _label(m: dict) -> str:
+            name = m.get("name") or m["id"]
+            alias = omniroute_gw._namespace(m["id"])
+            return f"{alias}/{name}"
         return {
             "cliType": cli_type,
             "models": [m["id"] for m in sel],                       # compat: id-строки
-            "names": {m["id"]: (m.get("name") or m["id"]) for m in sel},  # id→label
+            "names": {m["id"]: _label(m) for m in sel},             # id→«алиас/имя»
             "current": auth.get("active_id"),
             "source": "omniroute",
             "raw": "", "auth_state": "OK",
