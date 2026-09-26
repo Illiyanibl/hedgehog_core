@@ -1226,6 +1226,13 @@ class HedgehogServer:
         """auth_link / auth_result — глобально всем соединениям, без журнала."""
         await self.hub.broadcast_global(make_frame(ftype, payload))
         if ftype == "auth_result" and payload.get("ok"):
+            # §omni: OAuth-успех = вход по подписке → СТИРАЕМ альт-авторизацию
+            # (auth.json), иначе остался бы mode=omniroute и build_auth_env/
+            # list_models продолжили бы отдавать модели шлюза (баг: после входа
+            # по подписке в CLI-view висели omniroute-модели). Только OAuth идёт
+            # через этот колбэк — apikey/omniroute шлют auth_result напрямую.
+            self.config.clear_auth_config()
+            self._reset_all_chat_models()      # per-chat выбор мог быть omniroute-id
             # Новый OAuth-токен: пересоздаём claude-сессии, чтобы SDK
             # подхватил env CLAUDE_CODE_OAUTH_TOKEN на следующем user_msg.
             for chat_id, session in list(self.sessions.items()):
