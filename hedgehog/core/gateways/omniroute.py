@@ -26,26 +26,29 @@ import structlog
 
 log = structlog.get_logger("gateway.omniroute")
 
-# namespace'ы видео-моделей (VEO/Seedance) — отсекаем ПОЛНОСТЬЮ: не для чат-CLI.
-# Часть таких моделей приходит без поля type=video, поэтому режем и по namespace.
-VIDEO_NAMESPACES: frozenset[str] = frozenset({"veo-free", "veoaifree-web"})
+# Группируем по ПРОВАЙДЕРУ (owned_by), а не по namespace префикса id: у одного
+# провайдера бывает несколько префиксов (Claude: cc/ = Claude Code-протокол +
+# claude/ = OpenAI-формат; Codex: cx/+codex/+codex-auto-review/). Заголовок один
+# на провайдера, а префикс сохраняется у каждой модели (namespace).
 
-# namespace'ы встроенных бесплатных агрегаторов OmniRoute → в «OmniRoute default».
-BUILTIN_NAMESPACES: frozenset[str] = frozenset({
-    "auto",            # combo — мета-роутеры (best-coding, pro-reasoning…)
-    "tllm",            # theoldllm
-    "aug",             # auggie
-    "oc",              # opencode
-    "ddgw",            # duckduckgo-web
-    "pepper",          # chipotle
-    "mcode",           # mimocode
+# owned_by видео-провайдеров (VEO/Seedance) — отсекаем полностью (не для чат-CLI).
+VIDEO_OWNERS: frozenset[str] = frozenset({"veoaifree-web"})
+
+# owned_by встроенных бесплатных агрегаторов OmniRoute → «OmniRoute default».
+BUILTIN_OWNERS: frozenset[str] = frozenset({
+    "combo",           # мета-роутеры auto/*
+    "theoldllm",
+    "auggie",
+    "opencode",
+    "duckduckgo-web",
+    "chipotle",
+    "mimocode",
 })
 
-# Человеческие имена «реальных» провайдеров. Неизвестный реальный namespace →
-# title-case (см. _provider_label).
-NAMESPACE_LABELS: dict[str, str] = {
-    "cc": "Claude Code",
-    "claude": "Claude",
+# Человеческие имена «реальных» провайдеров (по owned_by). Иначе — title-case.
+OWNER_LABELS: dict[str, str] = {
+    "claude": "Claude Code",
+    "codex": "Codex",
 }
 
 DEFAULT_PROVIDER_ID = "omniroute_default"
@@ -67,8 +70,8 @@ def _namespace(model_id: str) -> str:
     return base.split("/", 1)[0] if "/" in base else base
 
 
-def _provider_label(namespace: str) -> str:
-    return NAMESPACE_LABELS.get(namespace) or namespace.replace("-", " ").title()
+def _provider_label(owner: str) -> str:
+    return OWNER_LABELS.get(owner) or owner.replace("-", " ").title()
 
 
 def _clean_name(model: dict, namespace: str) -> str:
@@ -101,7 +104,7 @@ def _caps(model: dict) -> dict:
 def build_catalog(raw_models: list[dict]) -> dict[str, Any]:
     """Сырой список из /v1/models → {providers: [...]}. Реальные провайдеры в
     порядке первого появления, «OmniRoute default» — последним."""
-    order: list[str] = []                 # namespace'ы реальных провайдеров, first-seen
+    order: list[str] = []                 # owned_by реальных провайдеров, first-seen
     groups: dict[str, list[dict]] = {}    # provider_id → models
     seen_ids: set[str] = set()            # дедуп (veo дублируется и т.п.)
 
@@ -109,12 +112,13 @@ def build_catalog(raw_models: list[dict]) -> dict[str, Any]:
         mid = str(m.get("id") or "").strip()
         if not mid:
             continue
-        ns = _namespace(mid)
-        if m.get("type") == "video" or ns in VIDEO_NAMESPACES:   # не для чат-CLI
+        owner = (m.get("owned_by") or "").strip() or "unknown"
+        if m.get("type") == "video" or owner in VIDEO_OWNERS:   # не для чат-CLI
             continue
+        ns = _namespace(mid)              # префикс id (для показа у модели)
         base_id, no_think = _strip_nothink(mid)
-        is_builtin = ns in BUILTIN_NAMESPACES
-        provider_id = DEFAULT_PROVIDER_ID if is_builtin else ns
+        is_builtin = owner in BUILTIN_OWNERS
+        provider_id = DEFAULT_PROVIDER_ID if is_builtin else owner
         if provider_id not in groups:
             groups[provider_id] = []
             if not is_builtin:
