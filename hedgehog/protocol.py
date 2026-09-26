@@ -466,7 +466,15 @@ def parse_client_frame(raw: str | bytes) -> ClientFrame:
         frame = ClientFrame.model_validate(obj)
         frame.payload = payload_model.model_validate(obj.get("payload") or {})
     except ValidationError as e:
-        raise BadFrame(f"payload validation failed for {ftype}: {e}") from e
+        # НЕ включаем input_value/url в сообщение: у auth_apikey/auth_omniroute/
+        # register_push там лежит секрет (api_key/notifyKey), а сообщение эхом
+        # уходит клиенту и в лог. Оставляем только loc+type невалидных полей.
+        detail = "; ".join(
+            f"{'.'.join(str(x) for x in er.get('loc', ())) or '?'}: "
+            f"{er.get('type', '?')}"
+            for er in e.errors(include_input=False, include_url=False))
+        raise BadFrame(
+            f"payload validation failed for {ftype}: {detail}") from e
 
     if needs_chat and not frame.chatId:
         raise BadFrame(f"{ftype} requires chatId")

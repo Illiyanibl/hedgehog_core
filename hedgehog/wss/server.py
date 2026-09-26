@@ -463,9 +463,12 @@ class HedgehogServer:
             frame = parse_client_frame(raw)
         except BadFrame as e:
             # Диагностика рассинхрона версий: старый клиент шлёт снятые типы
-            # (напр. set_skills) → тут видно, что именно прилетело.
-            log.warning("frame.bad", err=str(e), raw=str(raw)[:200])
-            await self.hub.send_global(conn_id, make_error(Err.BAD_FRAME, str(e)))
+            # (напр. set_skills) → в сообщении видно тип и невалидные поля.
+            # raw НЕ логируем — у auth_apikey/omniroute/register_push там секрет
+            # (api_key/notifyKey); сообщение BadFrame уже без значений полей.
+            msg = str(e)[:300]   # кап: гигантский type/детали не раздувают лог
+            log.warning("frame.bad", err=msg)
+            await self.hub.send_global(conn_id, make_error(Err.BAD_FRAME, msg))
             return
 
         try:

@@ -30,12 +30,29 @@ from . import skills_registry
 
 log = structlog.get_logger("skills")
 
-_SAFE_NAME = re.compile(r"^[A-Za-z0-9._-]+$")
+# Требуем хотя бы один [A-Za-z0-9] → отсекаем `.`/`..`/`...` (path-traversal:
+# `name: ..` из недоверенного репо давал dst=~/.claude/skills/..=~/.claude →
+# rmtree(~/.claude)). `/` уже запрещён классом.
+_SAFE_NAME = re.compile(r"^(?=.*[A-Za-z0-9])[A-Za-z0-9._-]+$")
 _GH_RE = re.compile(r"^https?://github\.com/([^/]+)/([^/#?]+)")
 
 
 def _user_skills_dir() -> Path:
     return Path.home() / ".claude" / "skills"
+
+
+def _safe_skill_dst(base: Path, name: str) -> Path | None:
+    """Целевая папка скилла ВНУТРИ base или None (страховка к _SAFE_NAME):
+    имя валидно и итоговый путь не убегает из base через resolve()."""
+    if not name or not _SAFE_NAME.match(name):
+        return None
+    dst = base / name
+    try:
+        if dst.resolve().is_relative_to(base.resolve()):
+            return dst
+    except (OSError, ValueError):
+        pass
+    return None
 
 
 class SkillInstallError(Exception):
@@ -95,9 +112,11 @@ class SkillSources:
         if meta is None:
             return []
         removed = meta.get("skills", [])
+        base = _user_skills_dir()
         for name in removed:
-            if _SAFE_NAME.match(name):
-                shutil.rmtree(_user_skills_dir() / name, ignore_errors=True)
+            dst = _safe_skill_dst(base, name)   # страховка от traversal в реестре
+            if dst is not None:
+                shutil.rmtree(dst, ignore_errors=True)
         self._save(data)
         return removed
 
@@ -126,10 +145,12 @@ class SkillSources:
                 if not fm:
                     continue
                 name = (fm.get("name") or "").strip()
-                if not name or not _SAFE_NAME.match(name) or name in seen:
+                if name in seen:
+                    continue
+                dst = _safe_skill_dst(dest_base, name)   # None → небезопасное имя
+                if dst is None:
                     continue
                 seen.add(name)
-                dst = dest_base / name
                 if dst.exists():
                     shutil.rmtree(dst)
                 shutil.copytree(skill_md.parent, dst)
