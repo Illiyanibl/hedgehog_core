@@ -67,6 +67,38 @@ WS_PATH = "/v1/connect"
 _SERVER_COMMIT = updater.current_sha()
 
 
+class ChatRoster:
+    """§roster: узкий фасад для кросс-чат MCP-тулов (list_chats/send_to_chat).
+    Даёт ClaudeSession снимок чатов и прямой впрыск, НЕ пробрасывая всю ссылку
+    на сервер — поверхность мала и легко подменяется фейком в тестах."""
+
+    def __init__(self, server: "HedgehogServer"):
+        self._srv = server
+
+    def snapshot(self, running_only: bool = False) -> list[dict[str, Any]]:
+        """Все чаты (или только с живой сессией) с флагом running и статусом.
+        Явный набор полей — meta целиком (claude_session_id и пр.) агенту не
+        отдаём (лишний шум/leak в контекст)."""
+        srv = self._srv
+        out: list[dict[str, Any]] = []
+        for m in srv.store.list():
+            running = m.chatId in srv.sessions
+            if running_only and not running:
+                continue
+            st = srv._chat_status(m.chatId)
+            out.append({
+                "chatId": m.chatId, "name": m.name, "addressee": m.addressee,
+                "cwd": m.cwd, "running": running,
+                "status": st["status"], "last_activity": st["last_activity"],
+            })
+        return out
+
+    async def inject(self, chat_id: str, text: str, sender: str,
+                     interrupt: bool = False) -> tuple[bool, Any]:
+        return await self._srv.inject_message(
+            chat_id, text, sender=sender, interrupt=interrupt)
+
+
 class HedgehogServer:
     def __init__(self, config: Config):
         self.config = config
@@ -95,30 +127,46 @@ class HedgehogServer:
         self._last_probe_ts = 0.0
         # §omni: кэш каталога шлюза по base_url ({base: (ts, data)}), TTL ниже.
         self._omni_catalog_cache: dict[str, tuple[float, dict]] = {}
+        # §roster: фасад «список чатов + прямой впрыск» для кросс-чат MCP-тулов
+        # (list_chats / send_to_chat), прокидывается в каждую ClaudeSession.
+        self._roster = ChatRoster(self)
 
     # ---------- §sched: точки входа для планировщика ----------
 
-    async def inject_message(self, chat_id: str, text: str) -> None:
+    async def inject_message(self, chat_id: str, text: str,
+                             sender: str = "cron",
+                             interrupt: bool = True) -> tuple[bool, Any]:
         """Инъекция текста в чат как user-сообщения (агент отвечает штатно).
-        Тот же путь, что WS user_msg: echo в ленту + handle_user_msg."""
+        Тот же путь, что WS user_msg: echo в ленту + handle_user_msg.
+
+        Возвращает (ok, info): при успехе info={"cold_started":bool,"was_busy":bool},
+        при отказе info — строка-причина. Дефолты (sender="cron", interrupt=True)
+        сохраняют историческое поведение планировщика (тот возврат игнорирует).
+        Агентский кросс-чат впрыск (§roster) зовёт с sender="agent:<src>" и
+        interrupt=False — не рвать чужой живой ход."""
         text = (text or "").strip()
         if not text:
-            return
+            return False, "empty text"
         meta = self.store.get(chat_id)
-        if meta is None or meta.addressee != "claude":
-            log.warning("sched.inject_skip", chat=chat_id,
-                        reason="no meta or not claude")
-            return
-        # §models M1: cron/планировщик стартует ход в обход WS-хендлера
+        if meta is None:
+            log.warning("sched.inject_skip", chat=chat_id, reason="no meta")
+            return False, "chat not found"
+        if meta.addressee != "claude":
+            log.warning("sched.inject_skip", chat=chat_id, reason="not claude")
+            return False, "target is not a claude chat"
+        # §models M1: cron/планировщик/roster стартует ход в обход WS-хендлера
         # user_msg — гасим фоновую пробу тут же, иначе рядом с единственной
         # авторизацией окажутся два CLI-процесса.
         self._cancel_models_probe()
+        was_running = chat_id in self.sessions
+        was_busy = self._chat_status(chat_id)["status"] == "busy"
         session = await self._ensure_session(meta)
         await self.hub.publish(chat_id, "user_msg_echo", {
-            "content": text, "sender": "cron", "related": None,
+            "content": text, "sender": sender, "related": None,
             "attachments": [], "btw": False,
         })
-        await session.handle_user_msg(text)
+        await session.handle_user_msg(text, interrupt=interrupt)
+        return True, {"cold_started": not was_running, "was_busy": was_busy}
 
     async def inject_user_message(self, chat_id: str, text: str,
                                   attachments: list, job_id: str) -> None:
@@ -1387,9 +1435,16 @@ class HedgehogServer:
                                     on_auth_required=self.auth.start,
                                     on_session_id=save_session_id,
                                     on_status=self._chat_status_notifier(meta.chatId),
-                                    scheduler=self.scheduler)
+                                    scheduler=self.scheduler,
+                                    roster=self._roster)
         else:
             session = PtySession(meta, publish, self.config)
+        # M6: пока строили сессию (await neko.is_running / build_auth_env), в неё
+        # мог параллельно впрыснуть cron/roster и уже поднять её — не плодим
+        # второй CLI-процесс. re-check→assign без await между ними → атомарно.
+        existing = self.sessions.get(meta.chatId)
+        if existing is not None:
+            return existing
         self.sessions[meta.chatId] = session
         await session.start()
         return session

@@ -172,7 +172,11 @@ def _initial_next(kind: str, spec: str, now_ts: float) -> float:
     raise ValueError(f"unknown kind: {kind}")
 
 
-InjectCb = Callable[[str, str], Awaitable[None]]
+# Планировщик зовёт inject позиционно (chat_id, text); реальный
+# server.inject_message принимает ещё sender=/interrupt= (дефолты сохраняют
+# cron-поведение) и возвращает (ok, info), который планировщик игнорирует
+# (§roster). Аннотация отражает фактический контракт.
+InjectCb = Callable[..., Awaitable[Any]]
 NotifyCb = Callable[[str, str, str], Awaitable[None]]
 # §defer: отложенное сообщение пользователя (chat, text, attachments, job_id).
 # job_id уходит в эхо — клиент снимает по нему pending-чип на всех устройствах.

@@ -70,6 +70,10 @@ from .session_base import PublishFn
 
 log = structlog.get_logger("claude_session")
 
+# §roster: потолок длины кросс-чат впрыска (send_to_chat). Эхо уходит в
+# pending.jsonl + транскрипт целевого чата; у MCP-аргумента своего лимита нет.
+_SEND_TO_CHAT_MAX = 64 * 1024
+
 # §caps: путеводитель по инструментам Ёжика. Дописывается (append) к дефолтному
 # системному промпту Claude Code, НЕ заменяет его. Задача — чтобы агент в
 # ПРИОРИТЕТЕ пользовался встроенными тулами Ёжика (и пользовательскими MCP), а не
@@ -251,11 +255,15 @@ class ClaudeSession:
                  send_chat_error, config: Config,
                  mcp_servers: dict[str, dict] | None = None,
                  on_auth_required=None, on_session_id=None, on_status=None,
-                 scheduler=None):
+                 scheduler=None, roster=None):
         self.meta = meta
         # §sched: сервис планировщика/блэкборда (один на процесс) — для MCP-тулов
         # schedule_*/remind/artifact_*. None в тестах/старых вызовах.
         self._scheduler = scheduler
+        # §roster: фасад «список чатов + прямой впрыск» — для MCP-тулов
+        # list_chats/send_to_chat. None в тестах/старых вызовах (тулы вернут
+        # "roster unavailable").
+        self._roster = roster
         self._publish = publish
         self._send_chat_error = send_chat_error  # (code, message) → journal+fanout
         self._config = config
@@ -997,6 +1005,78 @@ class ClaudeSession:
                 kind=str(args.get("kind", "") or ""))
             return _text(json.dumps(rows, ensure_ascii=False))
 
+        # §roster: кросс-чат координация агентов ------------------------------
+        @tool(
+            "list_chats",
+            "List the chats on THIS Hedgehog server so you can coordinate with "
+            "other agents. Returns for each chat: chatId; name; addressee "
+            "('claude' = an agent you can message, 'broker_shell' = a raw shell, "
+            "NOT a valid target); running (true = a live session is loaded right "
+            "now); status ('busy' = an agent turn is in flight, else 'idle' — "
+            "broker_shell is always 'idle'); last_activity (epoch seconds or null); "
+            "cwd. Pass running_only=true to list only chats with a live session. "
+            "Message one with send_to_chat.",
+            {"running_only": bool},
+        )
+        async def list_chats(args: dict[str, Any]) -> dict[str, Any]:
+            if session._roster is None:
+                return _text("roster unavailable")
+            rows = session._roster.snapshot(
+                running_only=bool(args.get("running_only", False)))
+            return _text(json.dumps(rows, ensure_ascii=False))
+
+        @tool(
+            "send_to_chat",
+            "Inject a message DIRECTLY into ANOTHER chat on this server, right now "
+            "(not scheduled). The target agent receives it as a user message and "
+            "acts on its NEXT turn — this does NOT interrupt a turn already in "
+            "flight; if the target session is cold it is started. Fire-and-forget: "
+            "you get a delivery status, NOT the target's reply. To read the "
+            "target's result later, ask it to store an artifact and use "
+            "artifact_list(chat_id=...). The message is tagged with your chatId as "
+            "its source (sender label + a text prefix) so the other agent knows who "
+            "to answer; if the user must be alerted, the target agent should call "
+            "notify(). Do NOT build auto-reply/auto-forward loops between chats. Get "
+            "chat_id from list_chats. chat_id — target chat id; text — the message.",
+            {"chat_id": str, "text": str},
+        )
+        async def send_to_chat(args: dict[str, Any]) -> dict[str, Any]:
+            if session._roster is None:
+                return _text("roster unavailable")
+            chat_id = str(args.get("chat_id", "") or "").strip()
+            text = str(args.get("text", "") or "")
+            if not chat_id:
+                return _text("chat_id is required")
+            if chat_id == session.meta.chatId:
+                return _text("refusing to send to the current chat (would loop)")
+            if not text.strip():
+                return _text("text is empty")
+            src = session.meta.chatId
+            # L2: имя чата может содержать кавычки/переводы строк — не даём
+            # сломать строку-провенанс (первая строка, кавычки → одинарные).
+            raw_name = (session.meta.name or "").splitlines()
+            src_name = (raw_name[0] if raw_name else "").replace('"', "'")
+            prefixed = (f'[cross-chat message from chat {src} "{src_name}"]\n'
+                        f"{text}")
+            # M1/L1: потолок — по БАЙТАМ итогового сообщения (эхо уходит в
+            # pending.jsonl + транскрипт цели; кириллица в UTF-8 крупнее символа).
+            if len(prefixed.encode("utf-8")) > _SEND_TO_CHAT_MAX:
+                return _text(f"text too long (> {_SEND_TO_CHAT_MAX} bytes)")
+            try:
+                ok, info = await session._roster.inject(
+                    chat_id, prefixed, sender=f"agent:{src}", interrupt=False)
+            except Exception as e:   # noqa: BLE001 — единый UX ошибки для агента
+                return _text(f"send failed: {e!r}")
+            if not ok:
+                return _text(f"send failed: {info}")
+            note = " (queued for its next turn)"
+            if isinstance(info, dict):
+                if info.get("cold_started"):
+                    note = " (target session was cold, started it)"
+                elif info.get("was_busy"):
+                    note = " (target is busy; queued for its next turn)"
+            return _text(f"delivered to {chat_id}{note}")
+
         return create_sdk_mcp_server(
             name="hedgehog",
             tools=[attach_file, ask_ui, ui_open, ui_update, ui_close,
@@ -1004,7 +1084,8 @@ class ClaudeSession:
                    handler_register, handler_list, handler_unregister,
                    handler_call, kv_set, kv_get, notify,
                    schedule_add, remind, schedule_list, schedule_cancel,
-                   artifact_put, artifact_get, artifact_list])
+                   artifact_put, artifact_get, artifact_list,
+                   list_chats, send_to_chat])
 
     # §views: тонкие обёртки над реестром окон (data_dir/views.json). Реестр —
     # источник правды «какое окно запущено» + история явных закрытий; на нём
