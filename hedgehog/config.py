@@ -76,7 +76,9 @@ class Config:
 
     server_version: str = "0.1.0"
     protocol_versions: tuple[int, ...] = (1,)
-    capabilities: tuple[str, ...] = ("claude", "broker_shell", "picker")
+    # netwait (§netwait): сервер шлёт op_slow при долгой операции и принимает
+    # op_abort; клиент включает индикатор/алерт/abort только при этой capability.
+    capabilities: tuple[str, ...] = ("claude", "broker_shell", "picker", "netwait")
 
     # screen_snapshot aggregation window, seconds (broker overflow pattern)
     snapshot_interval: float = 0.08
@@ -84,6 +86,13 @@ class Config:
     permission_timeout: float = 300.0
     # user has this long to open the OAuth link and paste the code back (§13)
     auth_timeout: float = 600.0
+
+    # §netwait: долгая сетевая операция (login-ссылка/обмен кодом/omni/apikey).
+    # Нет ответа за op_slow_after → шлём клиенту op_slow («>10с, прервать?»),
+    # операция продолжается; нет ответа за op_hard_timeout → сервер сам
+    # прерывает и шлёт ошибку. Задел под пользовательские настройки.
+    op_slow_after: float = 10.0
+    op_hard_timeout: float = 30.0
 
     # Лог приложения-клиента (§14 client_log): накопительный файл, лимит.
     client_log_cap: int = 512 * 1024 * 1024  # 512 МБ

@@ -130,6 +130,12 @@ class HedgehogServer:
         # §roster: фасад «список чатов + прямой впрыск» для кросс-чат MCP-тулов
         # (list_chats / send_to_chat), прокидывается в каждую ClaudeSession.
         self._roster = ChatRoster(self)
+        # §netwait: реестр долгих операций (opId → {conn_id,kind,broadcast,
+        # work_task,slow_task,abortable}) для op_slow/op_abort/hard-timeout.
+        self._ops: dict[str, dict[str, Any]] = {}
+        # §netwait: текущая login-операция (single-flight): {op_id,conn_id,phase,
+        # slow_task,hard_task}. Логин глобальный → таймеры отдельно от _ops.
+        self._login_op: dict[str, Any] | None = None
 
     # ---------- §sched: точки входа для планировщика ----------
 
@@ -255,7 +261,22 @@ class HedgehogServer:
             await asyncio.get_running_loop().create_future()  # до отмены
 
     async def shutdown(self):
+        # §netwait H3/L4: сначала гасим login-таймеры (иначе hard-таймер мог бы
+        # выстрелить в зазор до отмены), затем все долгие операции.
+        self._cancel_login_timers()
+        self._login_op = None
         await self.auth.stop()
+        ops = list(self._ops.values())
+        for op in ops:
+            op["slow_task"].cancel()
+            op["work_task"].cancel()
+            if op.get("wrapper") is not None:
+                op["wrapper"].cancel()
+        if ops:
+            tasks = [t for op in ops
+                     for t in (op["work_task"], op.get("wrapper")) if t is not None]
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._ops.clear()
         probe = self._models_probe_task   # захватываем ДО отмены (её обнулит finally)
         self._cancel_models_probe()       # осиротевшую пробу тоже гасим
         if self._models_task is not None:
@@ -467,8 +488,18 @@ class HedgehogServer:
             await self.hub.send_global(
                 conn_id, make_frame("pong", {"server_ts": time.time()}))
             return
+        if ftype == "op_abort":
+            # §netwait: прервать долгую операцию (login/omni/apikey), opId = id
+            # инициировавшего фрейма. Любой клиент (для глобального login).
+            await self._handle_op_abort(p.opId)
+            return
         if ftype == "auth_start":
+            # §netwait: single-flight — если флоу уже идёт, auth.start() лишь
+            # пере-шлёт ссылку; новые таймеры ставим ТОЛЬКО на реально новый флоу.
+            was_running = self.auth.running
             await self.auth.start()
+            if not was_running and self.auth.running:
+                self._start_login_timers(frame.id, conn_id, "start")
             return
         if ftype == "auth_code":
             if not await self.auth.submit_code(p.code):
@@ -476,18 +507,26 @@ class HedgehogServer:
                 await self.hub.send_global(conn_id, make_frame(
                     "auth_result",
                     {"ok": False, "error": "no auth flow in progress"}))
+                return
+            # §netwait: ждём auth_result по коду (обмен кода на токен — сеть).
+            self._start_login_timers(frame.id, conn_id, "code")
             return
         if ftype == "auth_apikey":
             # §altauth: активировать прямой API-ключ (заголовок x-api-key).
-            ok, err = await self._activate_apikey(p.api_key, p.base_url)
-            await self.hub.send_global(conn_id, make_frame(
-                "auth_result", {"ok": ok, "error": err}))
+            async def _op_apikey():
+                ok, err = await self._activate_apikey(
+                    p.api_key, p.base_url, frame.id)
+                return "auth_result", {"ok": ok, "error": err}
+            self._spawn_tracked(
+                conn_id, frame.id, "auth_apikey", _op_apikey())
             return
         if ftype == "auth_omniroute":
             # §altauth: активировать шлюз (ключ + base_url + выбранные модели).
-            ok, err = await self._activate_omniroute(p)
-            await self.hub.send_global(conn_id, make_frame(
-                "auth_result", {"ok": ok, "error": err}))
+            async def _op_omni():
+                ok, err = await self._activate_omniroute(p, frame.id)
+                return "auth_result", {"ok": ok, "error": err}
+            self._spawn_tracked(
+                conn_id, frame.id, "omni_activate", _op_omni())
             return
         if ftype == "omniroute_probe_models":
             # §omni шаг 1: каталог моделей шлюза. Ключ пуст → берём сохранённый
@@ -503,18 +542,29 @@ class HedgehogServer:
                         base = base or stored_base
                         key = auth.get("api_key", "")
             if not base or not key:
-                data = {"ok": False, "error": "нет base_url/ключа", "providers": []}
-            else:
+                # §netwait L2: мгновенный отказ — op не регистрируем.
+                await self.hub.send_global(conn_id, make_frame(
+                    "omniroute_catalog",
+                    {"ok": False, "error": "нет base_url/ключа",
+                     "providers": [], "cliType": p.cliType,
+                     "related": frame.id}))
+                return
+            cli = p.cliType
+
+            async def _op_probe():
                 data = await self._omniroute_catalog(base, key)
-            data["cliType"] = p.cliType
-            await self.hub.send_global(
-                conn_id, make_frame("omniroute_catalog", data))
+                data["cliType"] = cli
+                return "omniroute_catalog", data
+            self._spawn_tracked(
+                conn_id, frame.id, "omni_probe", _op_probe())
             return
         if ftype == "omniroute_set_key":
             # §omni: сменить только ключ активного omniroute (модели сохраняются).
-            ok, err = await self._set_omniroute_key(p.api_key)
-            await self.hub.send_global(conn_id, make_frame(
-                "omniroute_set_result", {"ok": ok, "error": err}))
+            async def _op_setkey():
+                ok, err = await self._set_omniroute_key(p.api_key, frame.id)
+                return "omniroute_set_result", {"ok": ok, "error": err}
+            self._spawn_tracked(
+                conn_id, frame.id, "omni_setkey", _op_setkey())
             return
         if ftype == "omniroute_set_models":
             # §omni шаг 1: сохранить выбор моделей (без тир-лимита — режет клиент).
@@ -1272,6 +1322,7 @@ class HedgehogServer:
 
     async def _auth_broadcast(self, ftype: str, payload: dict):
         """auth_link / auth_result — глобально всем соединениям, без журнала."""
+        self._login_broadcast_hook(ftype)   # §netwait: гасим login-таймеры по шагам
         await self.hub.broadcast_global(make_frame(ftype, payload))
         if ftype == "auth_result" and payload.get("ok"):
             # §omni: OAuth-успех = вход по подписке → СТИРАЕМ альт-авторизацию
@@ -1463,6 +1514,155 @@ class HedgehogServer:
             if isinstance(session, ClaudeSession):
                 await self._stop_session(chat_id)
 
+    # ------------------------- §netwait: долгие операции ----------------------
+
+    async def _emit_op_slow(self, op_id: str, kind: str, conn_id: int,
+                            broadcast: bool):
+        """Через op_slow_after секунд без ответа → op_slow («>10с, прервать?»).
+        Операция продолжает идти. Отмена таймера = ответ пришёл раньше."""
+        try:
+            await asyncio.sleep(self.config.op_slow_after)
+        except asyncio.CancelledError:
+            return
+        frame = make_frame("op_slow", {"opId": op_id, "kind": kind})
+        if broadcast:                       # login глобальный — всем устройствам
+            await self.hub.broadcast_global(frame)
+        else:                               # omni/apikey — адресно инициатору (H1)
+            await self.hub.send_global(conn_id, frame)
+
+    def _mark_committing(self, op_id: str | None):
+        """Сетевая фаза операции прошла → op_abort её больше НЕ рвёт (H2):
+        коммит (save_auth_config + restart) доходит до конца, придёт реальный
+        результат. no-op вне трекинга (op_id=None / уже снят)."""
+        op = self._ops.get(op_id) if op_id else None
+        if op is not None:
+            op["abortable"] = False
+
+    def _spawn_tracked(self, conn_id: int, op_id: str, kind: str, coro,
+                       *, broadcast: bool = False):
+        """§netwait H1: запускаем операцию ОТДЕЛЬНОЙ задачей, не блокируя
+        reader-loop соединения — иначе op_abort/ping этого клиента не читались бы
+        до конца операции (abort не работал бы, ping-timeout → ложный reconnect).
+        _run_tracked самодостаточен (сам шлёт ответ/ошибки).
+
+        Известное (принято, L5/L6): op регистрируется в _ops только при первом
+        запуске _run_tracked — в суб-миллисекундном окне до этого op_abort/shutdown
+        его «не видят». Недостижимо на практике (abort жмут только после op_slow
+        через 10с; shutdown в этот тик — teardown процесса, максимум долетит
+        безвредный save_auth_config)."""
+        asyncio.create_task(
+            self._run_tracked(conn_id, op_id, kind, coro, broadcast=broadcast),
+            name=f"netwait-{kind}")
+
+    async def _run_tracked(self, conn_id: int, op_id: str, kind: str, coro,
+                           *, broadcast: bool = False):
+        """Обёртка долгой операции: slow(op_slow) + hard-timeout + abort.
+        coro → (result_ftype, payload); ответ адресно инициатору с related=opId.
+        Абортится только сетевая фаза (до _mark_committing). Держит сетку
+        исключений (H3): любой сбой → адресный error(related)."""
+        slow = asyncio.create_task(
+            self._emit_op_slow(op_id, kind, conn_id, broadcast))
+        work = asyncio.ensure_future(coro)
+        self._ops[op_id] = {"conn_id": conn_id, "kind": kind,
+                            "broadcast": broadcast, "work_task": work,
+                            "slow_task": slow, "abortable": True,
+                            "wrapper": asyncio.current_task()}
+        try:
+            try:
+                ftype, payload = await asyncio.wait_for(
+                    asyncio.shield(work), self.config.op_hard_timeout)
+            except asyncio.TimeoutError:
+                if not work.done() and self._ops.get(
+                        op_id, {}).get("abortable", False):
+                    work.cancel()
+                    await self.hub.send_global(conn_id, make_error(
+                        Err.OP_TIMEOUT, "operation timed out", related=op_id))
+                    return
+                ftype, payload = await work   # коммит уже идёт — дождёмся итога
+            await self.hub.send_global(conn_id, make_frame(
+                ftype, {**payload, "related": op_id}))
+        except asyncio.CancelledError:
+            if work.cancelled():              # прервано op_abort — штатно
+                await self.hub.send_global(conn_id, make_error(
+                    Err.OP_ABORTED, "operation aborted", related=op_id))
+            else:
+                raise                         # отмена самого _run_tracked (shutdown)
+        except Exception as e:                # noqa: BLE001 — H3: сетка исключений
+            log.warning("netwait.op_failed", op=op_id, kind=kind, err=repr(e))
+            await self.hub.send_global(conn_id, make_error(
+                Err.INTERNAL, f"operation failed: {e}", related=op_id))
+        finally:
+            slow.cancel()
+            self._ops.pop(op_id, None)
+
+    async def _handle_op_abort(self, op_id: str):
+        """op_abort от клиента: прервать сетевую фазу операции. login —
+        глобально (любой клиент). Неизвестный/завершённый opId — тихий no-op (M4)."""
+        op = self._ops.get(op_id)
+        if op is not None:
+            if op["abortable"] and not op["work_task"].done():
+                op["work_task"].cancel()      # _run_tracked пошлёт OP_ABORTED
+            return
+        lop = self._login_op
+        if lop is not None and lop["op_id"] == op_id:
+            await self._abort_login("authorization aborted")
+
+    # -- login single-flight: таймеры на сетевые под-ожидания (M2) --
+
+    def _start_login_timers(self, op_id: str, conn_id: int, phase: str):
+        """phase='start' (auth_start→auth_link) или 'code' (auth_code→auth_result).
+        Один набор одновременно (single-flight)."""
+        self._cancel_login_timers()
+        slow = asyncio.create_task(
+            self._emit_op_slow(op_id, "login", conn_id, True))   # broadcast
+        hard = asyncio.create_task(self._login_hard_timeout(op_id))
+        self._login_op = {"op_id": op_id, "conn_id": conn_id, "phase": phase,
+                          "slow_task": slow, "hard_task": hard}
+
+    def _cancel_login_timers(self):
+        lop = self._login_op
+        if lop is not None:
+            lop["slow_task"].cancel()
+            lop["hard_task"].cancel()
+
+    async def _login_hard_timeout(self, op_id: str):
+        try:
+            await asyncio.sleep(self.config.op_hard_timeout)
+        except asyncio.CancelledError:
+            return
+        lop = self._login_op
+        if lop is not None and lop["op_id"] == op_id:
+            log.warning("netwait.login_timeout", op=op_id)
+            # H2: снимаем состояние САМИ до broadcast (не через хук — иначе
+            # _cancel_login_timers отменил бы ЭТУ задачу на suspension внутри
+            # broadcast_global и терминальный auth_result потерялся бы). hard_task
+            # (это мы) не трогаем; гасим только slow.
+            self._login_op = None
+            lop["slow_task"].cancel()
+            await self.auth.stop()
+            await self._auth_broadcast(
+                "auth_result", {"ok": False, "error": "authorization timed out"})
+
+    async def _abort_login(self, reason: str):
+        self._cancel_login_timers()
+        self._login_op = None                 # хук увидит None → без двойной чистки
+        await self.auth.stop()
+        await self._auth_broadcast(
+            "auth_result", {"ok": False, "error": reason})
+
+    def _login_broadcast_hook(self, ftype: str):
+        """Гасит login-таймеры по шагам (M2): start-фазу — auth_link|auth_result,
+        code-фазу — только auth_result. Идемпотентно."""
+        lop = self._login_op
+        if lop is None:
+            return
+        if ftype == "auth_link" and lop["phase"] == "start":
+            self._cancel_login_timers()       # ссылка пришла; ждём код (клиент)
+            self._login_op = None
+        elif ftype == "auth_result":
+            self._cancel_login_timers()
+            self._login_op = None
+
     async def _probe_auth(self, base_url: str | None, api_key: str,
                           model: str) -> tuple[bool, str | None]:
         """Лёгкая проверка креденшела: 1-токенный запрос к <base>/v1/messages
@@ -1491,10 +1691,11 @@ class HedgehogServer:
         except Exception as e:  # noqa: BLE001 — валидация не должна ронять хендлер
             return False, f"ошибка проверки: {e}"
 
-    async def _activate_apikey(self, api_key: str,
-                               base_url: str | None) -> tuple[bool, str | None]:
+    async def _activate_apikey(self, api_key: str, base_url: str | None,
+                               op_id: str | None = None) -> tuple[bool, str | None]:
         ok, err = await self._probe_auth(
             base_url, api_key, "claude-3-5-haiku-latest")
+        self._mark_committing(op_id)   # §netwait H2: сетевая фаза прошла
         if not ok:
             return False, err
         self.config.save_auth_config({
@@ -1515,7 +1716,8 @@ class HedgehogServer:
             out.append({"id": m.id, "name": name})
         return out
 
-    async def _activate_omniroute(self, p) -> tuple[bool, str | None]:
+    async def _activate_omniroute(self, p,
+                                  op_id: str | None = None) -> tuple[bool, str | None]:
         # §omni новый вид: ключ + base_url + выбранные модели (любые, без
         # opus/sonnet/haiku-логики). Легаси-вид (3 слота) — совместимость.
         if p.models:
@@ -1524,6 +1726,7 @@ class HedgehogServer:
             active = p.active_id if p.active_id in idset else ids[0]
             small = p.small_fast_id if p.small_fast_id in idset else active
             ok, err = await self._probe_auth(p.base_url, p.api_key, active)
+            self._mark_committing(op_id)   # §netwait H2: сетевая фаза прошла
             if not ok:
                 return False, err
             self.config.save_auth_config({
@@ -1540,6 +1743,7 @@ class HedgehogServer:
             if not probe_model:
                 return False, "не заданы модели шлюза"
             ok, err = await self._probe_auth(p.base_url, p.api_key, probe_model)
+            self._mark_committing(op_id)   # §netwait H2: сетевая фаза прошла
             if not ok:
                 return False, err
             self.config.save_auth_config({
@@ -1598,7 +1802,8 @@ class HedgehogServer:
                  active=p.active_id, small=p.small_fast_id)
         return True, None
 
-    async def _set_omniroute_key(self, api_key: str) -> tuple[bool, str | None]:
+    async def _set_omniroute_key(self, api_key: str,
+                                 op_id: str | None = None) -> tuple[bool, str | None]:
         """§omni: сменить ТОЛЬКО ключ активного omniroute-подключения. Проба по
         активной модели валидирует именно КЛЮЧ (401/403 = отказ; «unknown model»
         400/404 = ключ валиден). Модели/active/small_fast/base_url сохраняем."""
@@ -1612,6 +1817,7 @@ class HedgehogServer:
         if not probe:
             return False, "нет модели для проверки ключа"
         ok, err = await self._probe_auth(base, api_key, probe)
+        self._mark_committing(op_id)   # §netwait H2: сетевая фаза прошла
         if not ok:
             return False, err
         self.config.save_auth_config({**auth, "api_key": api_key})

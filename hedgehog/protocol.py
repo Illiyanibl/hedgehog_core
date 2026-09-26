@@ -35,6 +35,9 @@ class Err:
     FILE_TOO_LARGE = "FILE_TOO_LARGE"
     RATE_LIMITED = "RATE_LIMITED"
     INTERNAL = "INTERNAL"
+    # §netwait: операция сама превысила серверный hard-timeout / прервана клиентом.
+    OP_TIMEOUT = "OP_TIMEOUT"
+    OP_ABORTED = "OP_ABORTED"
 
 
 class BadFrame(Exception):
@@ -221,6 +224,12 @@ class AuthCodePayload(_Payload):
     code: str = Field(min_length=1)
 
 
+class OpAbortPayload(_Payload):
+    """§netwait: «заверши операцию». opId — id инициирующего клиентского
+    фрейма (login/omni/apikey), который ранее прислал op_slow."""
+    opId: str = Field(min_length=1)
+
+
 class AuthApiKeyPayload(_Payload):
     """§altauth: авторизация прямым API-ключом (заголовок x-api-key).
     base_url — опционально (кастомный Anthropic-совместимый endpoint;
@@ -396,6 +405,8 @@ CLIENT_FRAME_TYPES: dict[str, tuple[type[_Payload], bool]] = {
     "omniroute_probe_models": (OmniRouteProbeModelsPayload, False),
     "omniroute_set_models": (OmniRouteSetModelsPayload, False),
     "omniroute_set_key": (OmniRouteSetKeyPayload, False),
+    # §netwait: прервать долгую операцию (глобальный, без chatId)
+    "op_abort": (OpAbortPayload, False),
     "logout": (EmptyPayload, False),
     # §14: лог приложения-клиента (глобальный, без chatId)
     "client_log": (ClientLogPayload, False),
