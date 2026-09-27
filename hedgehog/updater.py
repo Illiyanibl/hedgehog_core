@@ -94,15 +94,23 @@ def _requirements(root: Path) -> Path | None:
     return None
 
 
-def pull_latest() -> UpdateResult:
+def pull_latest(process_sha: str = "") -> UpdateResult:
     """git fetch + hard reset на текущую ветку + (при изменении) pip install.
-    Блокирующая — вызывать через asyncio.to_thread."""
+    Блокирующая — вызывать через asyncio.to_thread.
+
+    process_sha — короткий SHA, на котором РЕАЛЬНО работает текущий процесс
+    (server._SERVER_COMMIT, снят при старте). M5: без него ловится «залипание в
+    полуобновлённом»: прошлый апдейт сделал reset --hard (диск→B), но pip/рестарт
+    упали → процесс остаётся на A, а диск уже B. Тогда повторный апдейт видел бы
+    old(B)==new(B) → «уже актуально», рестарта нет → навсегда на старом коде.
+    Поэтому «изменилось» = диск ПОСЛЕ reset ≠ SHA процесса (а не ≠ диск ДО)."""
     root = repo_root()
     if root is None:
         return UpdateResult(
             ok=False, message="не git-установка — обновление недоступно")
 
-    old = current_sha(root)
+    disk_before = current_sha(root)
+    old = process_sha or disk_before      # от чего реально уходим (версия процесса)
 
     # текущая ветка (обычно main); detached HEAD → main
     code, branch = _run(["git", "rev-parse", "--abbrev-ref", "HEAD"], root)
@@ -110,7 +118,10 @@ def pull_latest() -> UpdateResult:
         branch = "main"
 
     req = _requirements(root)
-    req_before = req.read_bytes() if req else b""
+    try:
+        req_before = req.read_bytes() if req else b""   # guard: файл могли снести
+    except OSError:
+        req_before = b""
 
     # fetch + hard reset — работает и на shallow (--depth 1) клоне. _fetch тянет
     # АНОНИМНО (без stored-токена), с HTTP/1.1 и ретраями.
@@ -122,17 +133,27 @@ def pull_latest() -> UpdateResult:
         return UpdateResult(ok=False, old=old, message=f"git reset: {out[-300:]}")
 
     new = current_sha(root)
-    changed = bool(new) and new != old
+    # M5: сверяем с версией ПРОЦЕССА (fallback на disk_before, если SHA процесса
+    # неизвестен) — иначе провалившийся ранее апдейт больше не рестартанёт.
+    ref = process_sha or disk_before
+    changed = bool(new) and new != ref
 
-    # зависимости — только если requirements.txt изменился (обычно нет)
-    if changed and req and req.read_bytes() != req_before:
+    # зависимости: если requirements.txt изменился в этом pull ЛИБО диск уже был
+    # впереди процесса (прошлый апдейт сделал reset, но deps для B могли не
+    # доставиться) — переустанавливаем, чтобы не рестартовать в код без зависимостей.
+    try:
+        req_after = req.read_bytes() if req else b""
+    except OSError:
+        req_after = b""
+    stale_disk = bool(process_sha) and disk_before != process_sha
+    if changed and req and (req_after != req_before or stale_disk):
         code, out = _run(
             [sys.executable, "-m", "pip", "install", "-q", "-r", str(req)], root)
         if code != 0:
             return UpdateResult(ok=False, old=old, new=new, changed=changed,
                                 message=f"pip install: {out[-300:]}")
 
-    msg = f"обновлено {old} → {new}" if changed else f"уже актуально ({old})"
+    msg = f"обновлено {old} → {new}" if changed else f"уже актуально ({new or old})"
     return UpdateResult(ok=True, changed=changed, old=old, new=new, message=msg)
 
 

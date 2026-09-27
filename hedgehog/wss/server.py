@@ -681,7 +681,8 @@ class HedgehogServer:
             restarting = False
             try:
                 from .. import updater
-                result = await asyncio.to_thread(updater.pull_latest)
+                result = await asyncio.to_thread(updater.pull_latest,
+                                                 _SERVER_COMMIT)
                 await self.hub.send_global(conn_id, make_frame("update_result", {
                     "ok": result.ok,
                     "changed": result.changed,
@@ -699,9 +700,10 @@ class HedgehogServer:
                         try:
                             updater.restart_in_place()   # execv — не возвращается
                         except Exception as e:  # noqa: BLE001
-                            # execv упал: код уже на новом SHA (повтор вернёт
-                            # changed=False), но без явного лога это было бы тихим
-                            # unhandled-task exc — сервер тихо остался бы на старом.
+                            # execv упал: диск на новом SHA, но процесс на старом.
+                            # Повтор update_self теперь вернёт changed=True (S6-M5:
+                            # диск ≠ SHA процесса) и рестарт будет повторён. Без
+                            # явного лога это было бы тихим unhandled-task exc.
                             log.error("update.restart_failed", err=repr(e))
                             self._updating = False   # разлатчиваем — рестарт не идёт
                     asyncio.create_task(_restart())
