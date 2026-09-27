@@ -141,13 +141,21 @@ class AuthManager:
         """
         if not self.running or self._master_fd is None:
             return False
+        # M: снапшот fd. За sleep(0.5) флоу может закрыться → _cleanup обнулит
+        # _master_fd, и второй os.write(None,…) бросил бы TypeError МИМО except
+        # OSError (в обработчик фрейма). Пишем в локальный fd и re-check'аем, что
+        # флоу тот же (fd — int, сравниваем !=, не is).
+        fd = self._master_fd
         try:
-            os.write(self._master_fd, code.strip().encode())
+            os.write(fd, code.strip().encode())
             await asyncio.sleep(0.5)
-            os.write(self._master_fd, b"\r")
+            if not self.running or self._master_fd != fd:
+                log.info("auth.code_flow_gone")   # флоу закрылся/сменился за паузу
+                return False
+            os.write(fd, b"\r")
             log.info("auth.code_submitted")
             return True
-        except OSError as e:
+        except (OSError, ValueError) as e:      # закрытый/битый fd — не роняем хендлер
             log.warning("auth.code_write_failed", err=str(e))
             return False
 
