@@ -20,6 +20,7 @@ import json
 import re
 import shutil
 import tempfile
+import threading
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -62,6 +63,11 @@ class SkillInstallError(Exception):
 class SkillSources:
     def __init__(self, path: Path):
         self.path = path  # data/skill_sources.json
+        # M2: install() крутится в asyncio.to_thread (долгий download/extract),
+        # а set_default_for_new/remove — на loop. Все делают read-modify-write
+        # JSON → без лока теряется обновление / бьётся файл. Лок держим ТОЛЬКО
+        # вокруг load+mutate+save (не вокруг скачивания), поэтому loop не встаёт.
+        self._lock = threading.Lock()
 
     # ---------- реестр ----------
 
@@ -77,24 +83,27 @@ class SkillSources:
 
     def _save(self, data: dict):
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(data, ensure_ascii=False, indent=1))
+        tmp = self.path.with_suffix(".json.tmp")   # атомарно: crash не бьёт реестр
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1))
+        tmp.replace(self.path)
 
     def sources(self) -> dict:
         """{source: {url, skills:[names], default_for_new:bool}}."""
         return self._load()
 
     def set_default_for_new(self, source: str, on: bool) -> bool:
-        data = self._load()
-        if source not in data:
-            # §fix: встроенный/осиротевший скилл (лежит на ФС, но без git-
-            # источника в реестре) — заводим минимальную запись, иначе флаг
-            # «по умолчанию для новых чатов» не сохранялся и тумблер откатывался.
-            # skills=[source]: у одиночных групп имя источника = имя скилла.
-            data[source] = {"url": None, "skills": [source],
-                            "default_for_new": bool(on)}
-        else:
-            data[source]["default_for_new"] = bool(on)
-        self._save(data)
+        with self._lock:
+            data = self._load()
+            if source not in data:
+                # §fix: встроенный/осиротевший скилл (лежит на ФС, но без git-
+                # источника в реестре) — заводим минимальную запись, иначе флаг
+                # «по умолчанию для новых чатов» не сохранялся и тумблер откатывался.
+                # skills=[source]: у одиночных групп имя источника = имя скилла.
+                data[source] = {"url": None, "skills": [source],
+                                "default_for_new": bool(on)}
+            else:
+                data[source]["default_for_new"] = bool(on)
+            self._save(data)
         return True
 
     def new_chat_skill_names(self) -> list[str]:
@@ -107,17 +116,19 @@ class SkillSources:
 
     def remove(self, source: str) -> list[str]:
         """Снести источник и папки его скиллов. Возврат — удалённые имена."""
-        data = self._load()
-        meta = data.pop(source, None)
-        if meta is None:
-            return []
-        removed = meta.get("skills", [])
+        with self._lock:
+            data = self._load()
+            meta = data.pop(source, None)
+            if meta is None:
+                return []
+            removed = meta.get("skills", [])
+            self._save(data)          # реестр обновляем под локом
+        # rmtree — вне лока (долгий FS-I/O не держит loop/поток install)
         base = _user_skills_dir()
         for name in removed:
             dst = _safe_skill_dst(base, name)   # страховка от traversal в реестре
             if dst is not None:
                 shutil.rmtree(dst, ignore_errors=True)
-        self._save(data)
         return removed
 
     # ---------- установка ----------
@@ -160,13 +171,14 @@ class SkillSources:
                 "в репозитории не найдено валидных скиллов "
                 "(нужен SKILL.md с frontmatter name)")
         source = repo
-        data = self._load()
-        data[source] = {
-            "url": url,
-            "skills": names,
-            "default_for_new": bool(default_for_new),
-        }
-        self._save(data)
+        with self._lock:          # только запись реестра под локом (не download)
+            data = self._load()
+            data[source] = {
+                "url": url,
+                "skills": names,
+                "default_for_new": bool(default_for_new),
+            }
+            self._save(data)
         log.info("skills.installed", source=source, count=len(names),
                  default_for_new=default_for_new)
         return {"source": source, "skills": names,
