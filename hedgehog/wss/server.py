@@ -174,36 +174,61 @@ class HedgehogServer:
         await session.handle_user_msg(text, interrupt=interrupt)
         return True, {"cold_started": not was_running, "was_busy": was_busy}
 
+    async def _defer_failed(self, chat_id: str, job_id: str) -> None:
+        """§defer S4-M3: отложенное НЕ отправлено — снимаем pending-чип
+        (scheduled_cancelled, журналируемо → на всех устройствах и на resume,
+        иначе висел бы вечно) и сообщаем пользователю (не теряем молча)."""
+        await self.hub.publish(chat_id, "scheduled_cancelled", {"jobId": job_id})
+        await self.notify_chat(chat_id, "Отложенное сообщение",
+                               "Не удалось отправить после сброса лимита")
+
     async def inject_user_message(self, chat_id: str, text: str,
                                   attachments: list, job_id: str) -> None:
         """§defer: отложенное сообщение пользователя сработало по таймеру.
         Эхо в ленту (sender=deferred + jobId — клиент снимет pending-чип на всех
         устройствах) + промпт с вложениями. interrupt=False — НЕ прерываем
-        возможный живой ход пользователя. Плюс notify (оффлайн-курьер)."""
+        возможный живой ход пользователя. Плюс notify (оффлайн-курьер).
+
+        S4-M3: на ЛЮБОМ отказе (нет чата / упал подъём сессии до эха) — вызываем
+        _defer_failed, чтобы отложенное не пропало молча и чип не завис."""
         meta = self.store.get(chat_id)
         if meta is None or meta.addressee != "claude":
             log.warning("defer.inject_skip", chat=chat_id,
                         reason="no meta or not claude")
+            await self._defer_failed(chat_id, job_id)
             return
-        self._cancel_models_probe()
-        atts = [Attachment(fileId=str(a.get("fileId", "")),
-                           mime=str(a.get("mime", "")),
-                           name=str(a.get("name", "")))
-                for a in attachments if isinstance(a, dict)]
-        session = await self._ensure_session(meta)
-        await self.hub.publish(chat_id, "user_msg_echo", {
-            "content": text, "sender": "deferred", "related": None,
-            "attachments": [a.model_dump() for a in atts], "btw": False,
-            "jobId": job_id,
-        })
-        resolved = fileserver.resolve_attachment_paths(
-            self.config.chats_dir, chat_id, atts)
-        prompt = fileserver.compose_prompt(text, resolved)
-        await session.handle_user_msg(prompt, interrupt=False)
-        log.info("defer.fired", chat=chat_id, job=job_id, atts=len(atts))
-        # Оффлайн-курьер: устройства узнают, что отложенное ушло агенту.
-        await self.notify_chat(chat_id, "Отложенное сообщение",
-                               "Отправлено агенту после сброса лимита")
+        echoed = False
+        try:
+            self._cancel_models_probe()
+            atts = [Attachment(fileId=str(a.get("fileId", "")),
+                               mime=str(a.get("mime", "")),
+                               name=str(a.get("name", "")))
+                    for a in attachments if isinstance(a, dict)]
+            session = await self._ensure_session(meta)
+            await self.hub.publish(chat_id, "user_msg_echo", {
+                "content": text, "sender": "deferred", "related": None,
+                "attachments": [a.model_dump() for a in atts], "btw": False,
+                "jobId": job_id,
+            })
+            echoed = True   # чип снят эхом — дальше _defer_failed не нужен
+            resolved = fileserver.resolve_attachment_paths(
+                self.config.chats_dir, chat_id, atts)
+            prompt = fileserver.compose_prompt(text, resolved)
+            await session.handle_user_msg(prompt, interrupt=False)
+            log.info("defer.fired", chat=chat_id, job=job_id, atts=len(atts))
+            # Оффлайн-курьер: устройства узнают, что отложенное ушло агенту.
+            await self.notify_chat(chat_id, "Отложенное сообщение",
+                                   "Отправлено агенту после сброса лимита")
+        except Exception as e:  # noqa: BLE001 — отказ не должен теряться молча
+            log.warning("defer.inject_error", chat=chat_id, job=job_id,
+                        err=repr(e))
+            if not echoed:
+                await self._defer_failed(chat_id, job_id)   # + снять чип
+            else:
+                # чип уже снят эхом, но агенту не доставлено — хотя бы уведомим (M).
+                await self.notify_chat(chat_id, "Отложенное сообщение",
+                                       "Не удалось отправить после сброса лимита")
+            raise   # чтобы планировщик записал error в job_runs
 
     async def notify_chat(self, chat_id: str, title: str, body: str) -> None:
         """Уведомление (баннер/инбокс) в чат по расписанию — журналируемый фрейм."""
