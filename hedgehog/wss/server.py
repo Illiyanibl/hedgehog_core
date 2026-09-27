@@ -320,9 +320,23 @@ class HedgehogServer:
             await asyncio.gather(probe, return_exceptions=True)
         if self.scheduler is not None:
             await self.scheduler.stop()
-        for session in list(self.sessions.values()):
-            await session.stop()
+        # M: гасим ВСЕ сессии параллельно с сеткой исключений — сбой .stop()
+        # одной раньше прерывал цикл и оставлял остальные висеть (утечка PTY/CLI).
+        # ДО дренажа пушей: умирающая сессия может через notify→_push_offline
+        # создать новую пуш-задачу, и её должен подмести gather ниже.
+        sessions = list(self.sessions.values())
         self.sessions.clear()
+        results = await asyncio.gather(
+            *(s.stop() for s in sessions), return_exceptions=True)
+        for r in results:
+            if isinstance(r, Exception):
+                log.warning("shutdown.session_stop_failed", err=repr(r))
+        # M: fire-and-forget пуши (APNs) — отменяем и дожидаемся, иначе на
+        # shutdown осиротевшие задачи → «Task was destroyed but it is pending».
+        if self._push_tasks:
+            for t in list(self._push_tasks):
+                t.cancel()
+            await asyncio.gather(*self._push_tasks, return_exceptions=True)
 
     # ---------- §models: фоновый рефрешер списка моделей ----------
 
@@ -613,6 +627,11 @@ class HedgehogServer:
             # §13: разлогин. /logout в SDK не работает (интерактивная
             # команда), поэтому удаляем сохранённый OAuth-токен и пересоздаём
             # claude-сессии. Следующий user_msg → AUTH_REQUIRED → auth-флоу.
+            # M: если прямо сейчас идёт OAuth-флоу — гасим его ДО unlink, иначе он
+            # дожуёт код и запишет токен уже ПОСЛЕ разлогина (broadcast ok). stop()
+            # отменяет задачу флоу до удаления файла → сохранения после нет.
+            if self.auth.running or self._login_op is not None:
+                await self._abort_login("logged out")
             try:
                 self.config.oauth_token_file.unlink(missing_ok=True)
             except OSError as e:
@@ -1136,8 +1155,18 @@ class HedgehogServer:
 
         if ftype == "ui_event":
             # §ui async: действие в постоянном окне (hedgehog.notify) →
-            # полноценный ход агента, как обычное сообщение.
-            session = self.sessions.get(frame.chatId)
+            # полноценный ход агента, как обычное сообщение. Окна открывает только
+            # ClaudeSession (ui_open — её инструмент) → для bash-чата ui_event
+            # мусорный, сессию зря не поднимаем.
+            if meta.addressee != "claude":
+                return
+            # §models M1: как в user_msg — гасим фоновую пробу /model, чтобы не
+            # держать второй CLI-процесс рядом с единственной авторизацией.
+            self._cancel_models_probe()
+            # M: поднимаем сессию (после рестарта Ёжика окно ре-пушится клиенту
+            # из views_registry, а sessions пуст — с sessions.get нажатие молча
+            # терялось бы).
+            session = await self._ensure_session(meta)
             if isinstance(session, ClaudeSession):
                 await session.handle_ui_event(p.data)
             return
@@ -1614,6 +1643,20 @@ class HedgehogServer:
         coro → (result_ftype, payload); ответ адресно инициатору с related=opId.
         Абортится только сетевая фаза (до _mark_committing). Держит сетку
         исключений (H3): любой сбой → адресный error(related)."""
+        # M: op_id == frame.id. Если клиент переиспользовал id для второй
+        # параллельной операции — регистрация ниже перезаписала бы первую, а её
+        # finally-pop снял бы вторую из _ops (abort/shutdown её «не видят»).
+        # Отказываемся стартовать дубль (первый доработает штатно).
+        if op_id in self._ops:
+            if asyncio.iscoroutine(coro):
+                coro.close()          # не запускаем корутину — без «never awaited»
+            else:                     # Task/Future (не случается) — не теряем управление
+                asyncio.ensure_future(coro).cancel()
+            # дубль frame.id — клиентское нарушение протокола, не сбой сервера
+            # (иначе retry-on-INTERNAL у клиента зациклится на том же id).
+            await self.hub.send_global(conn_id, make_error(
+                Err.BAD_FRAME, "duplicate operation id", related=op_id))
+            return
         slow = asyncio.create_task(
             self._emit_op_slow(op_id, kind, conn_id, broadcast))
         work = asyncio.ensure_future(coro)
@@ -1647,7 +1690,10 @@ class HedgehogServer:
                 Err.INTERNAL, f"operation failed: {e}", related=op_id))
         finally:
             slow.cancel()
-            self._ops.pop(op_id, None)
+            # снимаем ТОЛЬКО свою запись (defense-in-depth к дубль-отказу выше):
+            # если бы в _ops оказался чужой op с тем же id — не трогаем его.
+            if self._ops.get(op_id, {}).get("wrapper") is asyncio.current_task():
+                self._ops.pop(op_id, None)
 
     async def _handle_op_abort(self, op_id: str):
         """op_abort от клиента: прервать сетевую фазу операции. login —
@@ -1717,12 +1763,44 @@ class HedgehogServer:
             self._cancel_login_timers()
             self._login_op = None
 
+    @staticmethod
+    def _json_obj(text: str) -> dict | None:
+        """Тело ответа как JSON-объект или None (HTML/пустое/массив/скаляр)."""
+        t = (text or "").lstrip()
+        if not t.startswith("{"):
+            return None
+        try:
+            obj = json.loads(t)
+        except ValueError:
+            return None
+        return obj if isinstance(obj, dict) else None
+
+    @staticmethod
+    def _looks_like_api_error(text: str) -> bool:
+        """S1-M: тело — JSON-ошибка Anthropic/OpenAI-совместимого API, т.е. это
+        настоящий API-шлюз. Anthropic: {"type":"error","error":{…}}; OpenAI и
+        шлюзы: {"error":{…}} (error — ОБЪЕКТ). Строковый {"error":"Not Found"}
+        и FastAPI {"detail":…} — стоковые ответы чужих JSON-хостов → False."""
+        obj = HedgehogServer._json_obj(text)
+        if obj is None:
+            return False
+        return obj.get("type") == "error" or isinstance(obj.get("error"), dict)
+
     async def _probe_auth(self, base_url: str | None, api_key: str,
                           model: str) -> tuple[bool, str | None]:
         """Лёгкая проверка креденшела: 1-токенный запрос к <base>/v1/messages
-        с заголовком x-api-key. Успех = достучались И не отказ по авторизации
-        (401/403). 400 «unknown model» доказывает, что ключ принят (Anthropic
-        gateway docs), поэтому считаем это ОК."""
+        с заголовком x-api-key.
+
+        S1-M: НЕ считаем «валидно» всё подряд, кроме 401/403 — опечатка base_url,
+        отдающая 404/5xx/HTML(даже со статусом 200 от веб-консоли/SPA-фолбэка),
+        раньше активировала мусорный конфиг и перезапускала ВСЕ сессии. Теперь:
+          401/403 → отказ ключа; 5xx → сервер недоступен;
+          2xx → ок ТОЛЬКО если тело — JSON-объект (настоящий /v1/messages), не HTML;
+          прочие 4xx → ок ТОЛЬКО если тело — Anthropic/OpenAI-подобная JSON-ошибка
+          (unknown model/invalid request доказывает: ключ принят, эндпоинт настоящий).
+        Остаточный компромисс: верный хост, но неверный ПУТЬ (…/api) может отдать
+        валидный not_found JSON до проверки ключа — примем как «ок» (шлюзы отдают
+        такой же 404 на unknown-model, отличить нельзя)."""
         import aiohttp
         root = (base_url or "https://api.anthropic.com").rstrip("/")
         url = f"{root}/v1/messages"
@@ -1739,7 +1817,22 @@ class HedgehogServer:
                 async with sess.post(url, json=body, headers=headers) as r:
                     if r.status in (401, 403):
                         return False, f"ключ отклонён ({r.status})"
-                    return True, None
+                    if r.status >= 500:
+                        return False, f"сервер недоступен ({r.status})"
+                    # читаем ограниченный кусок тела (L: не тянем в память
+                    # мегабайты с чужого хоста) — первых 64 КБ хватает для класс-ции
+                    raw = await r.content.read(65536)
+                    text = raw.decode("utf-8", "replace")
+                    if 200 <= r.status < 300:
+                        if self._json_obj(text) is not None:
+                            return True, None   # настоящий JSON-ответ message
+                        return False, "endpoint не похож на Anthropic API (200 без JSON)"
+                    if self._looks_like_api_error(text):
+                        return True, None       # ключ принят, модель/запрос отвергнуты
+                    return False, (f"endpoint не похож на Anthropic API "
+                                   f"({r.status})")
+        except (asyncio.TimeoutError, TimeoutError):
+            return False, "таймаут проверки (15с)"
         except aiohttp.ClientError as e:
             return False, f"сервер недоступен: {e}"
         except Exception as e:  # noqa: BLE001 — валидация не должна ронять хендлер
