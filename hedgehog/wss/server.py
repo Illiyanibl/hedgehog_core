@@ -136,6 +136,11 @@ class HedgehogServer:
         # §netwait: текущая login-операция (single-flight): {op_id,conn_id,phase,
         # slow_task,hard_task}. Логин глобальный → таймеры отдельно от _ops.
         self._login_op: dict[str, Any] | None = None
+        # S1-M: chatId'ы в процессе удаления — «надгробие» на время delete_chat.
+        # _ensure_session отказывается поднимать такой чат, чтобы параллельный
+        # user_msg/inject (meta прочитана до удаления) не воскресил его сессию
+        # (висячий CLI-процесс + падение журнала на удалённый чат).
+        self._deleting: set[str] = set()
 
     # ---------- §sched: точки входа для планировщика ----------
 
@@ -775,17 +780,23 @@ class HedgehogServer:
             return
 
         if ftype == "delete_chat":
-            # Сессия закрывается всегда; рабочая папка (cwd) — по флагу.
-            await self._stop_session(frame.chatId)
-            self.store.delete(frame.chatId, delete_cwd=p.delete_cwd,
-                              projects_base=self.config.default_cwd)
-            views_registry.clear_chat(self.config.data_dir, frame.chatId)  # §views
-            handlers_registry.clear_chat(self.config.data_dir, frame.chatId)  # §handlers
-            if self.scheduler is not None:   # §defer: не оставляем осиротевшие jobs
-                await self.scheduler.purge_chat(frame.chatId)
-            log.info("chat.deleted", chat=frame.chatId, delete_cwd=p.delete_cwd)
-            await self.hub.broadcast_global(
-                make_frame("chat_deleted", {"chatId": frame.chatId}))
+            # S1-M: метим «удаляется» ДО _stop_session — окно между стопом и
+            # store.delete иначе даёт гонку воскрешения (см. _ensure_session).
+            self._deleting.add(frame.chatId)
+            try:
+                # Сессия закрывается всегда; рабочая папка (cwd) — по флагу.
+                await self._stop_session(frame.chatId)
+                self.store.delete(frame.chatId, delete_cwd=p.delete_cwd,
+                                  projects_base=self.config.default_cwd)
+                views_registry.clear_chat(self.config.data_dir, frame.chatId)  # §views
+                handlers_registry.clear_chat(self.config.data_dir, frame.chatId)  # §handlers
+                if self.scheduler is not None:   # §defer: не оставляем осиротевшие jobs
+                    await self.scheduler.purge_chat(frame.chatId)
+                log.info("chat.deleted", chat=frame.chatId, delete_cwd=p.delete_cwd)
+                await self.hub.broadcast_global(
+                    make_frame("chat_deleted", {"chatId": frame.chatId}))
+            finally:
+                self._deleting.discard(frame.chatId)
             return
 
         if ftype == "rename_chat":
@@ -1483,6 +1494,9 @@ class HedgehogServer:
     # ---------- сессии ----------
 
     async def _ensure_session(self, meta: ChatMeta) -> ClaudeSession | PtySession:
+        # S1-M: чат удаляется прямо сейчас — не поднимаем сессию (иначе воскресим).
+        if meta.chatId in self._deleting:
+            raise RuntimeError(f"chat {meta.chatId} is being deleted")
         session = self.sessions.get(meta.chatId)
         if session is not None:
             return session
@@ -1527,6 +1541,12 @@ class HedgehogServer:
         # M6: пока строили сессию (await neko.is_running / build_auth_env), в неё
         # мог параллельно впрыснуть cron/roster и уже поднять её — не плодим
         # второй CLI-процесс. re-check→assign без await между ними → атомарно.
+        # S1-M: за время await'ов чат мог начать удаляться ИЛИ уже удалиться
+        # целиком (delete пробежал и снял tombstone, пока мы висели на
+        # neko.is_running) — проверяем и метку, и наличие в сторе. store.get
+        # синхронный, между ним и assign нет await → атомарно.
+        if meta.chatId in self._deleting or self.store.get(meta.chatId) is None:
+            raise RuntimeError(f"chat {meta.chatId} is being deleted")
         existing = self.sessions.get(meta.chatId)
         if existing is not None:
             return existing
