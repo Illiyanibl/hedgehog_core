@@ -184,11 +184,30 @@ class ChatStore:
             return False
         if delete_cwd and projects_base:
             meta = self.get(chat_id)
-            if meta is not None:
+            # M6: при slug-коллизии имён два чата делят один cwd
+            # (<projects_base>/<slug>). Не удаляем папку, которую ещё использует
+            # другой чат — иначе снесли бы его живые данные.
+            if meta is not None and not self._cwd_shared(chat_id, meta.cwd):
                 self._rm_cwd_if_safe(meta.cwd, projects_base)
         shutil.rmtree(chat_dir, ignore_errors=True)
         self._log_limits.pop(chat_id, None)
         return True
+
+    def _cwd_shared(self, chat_id: str, cwd: str) -> bool:
+        """M6: cwd используется ДРУГИМ чатом (slug-коллизия) → удалять нельзя."""
+        try:
+            target = Path(cwd).resolve()
+        except OSError:
+            return True                      # не смогли проверить — не рискуем
+        for other in self.list():
+            if other.chatId == chat_id:
+                continue
+            try:
+                if Path(other.cwd).resolve() == target:
+                    return True
+            except OSError:
+                continue
+        return False
 
     @staticmethod
     def _rm_cwd_if_safe(cwd: str, projects_base: str):
