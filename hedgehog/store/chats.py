@@ -266,25 +266,38 @@ class ChatStore:
 
     def transcript_last_id(self, chat_id: str) -> str | None:
         """id последнего события транскрипта — дешёвым чтением хвоста файла
-        (без парсинга всего лога). Для short-circuit в events_after."""
+        (без парсинга всего лога). Для short-circuit в events_after.
+
+        M7: окно растёт, пока не выделит ПОЛНУЮ последнюю запись — большой
+        ui_request мог быть > стартовых 4КБ, и тогда хвост не содержал целой
+        строки → возвращался id предыдущей записи → short-circuit промахивался
+        и падал в полный разбор лога."""
         path = self._transcript_path(chat_id)
         try:
             with path.open("rb") as fh:
                 fh.seek(0, 2)
                 size = fh.tell()
-                fh.seek(max(0, size - 4096))
-                chunk = fh.read()
+                if size == 0:
+                    return None
+                window = 4096
+                while True:
+                    start = max(0, size - window)
+                    fh.seek(start)
+                    chunk = fh.read().rstrip(b"\n")
+                    nl = chunk.rfind(b"\n")
+                    if nl != -1:               # после последнего \n — целая запись
+                        last = chunk[nl + 1:]
+                        break
+                    if start == 0:             # весь файл — одна строка
+                        last = chunk
+                        break
+                    window *= 4                # запись больше окна — растём
         except OSError:
             return None
-        for raw in reversed(chunk.split(b"\n")):
-            raw = raw.strip()
-            if not raw:
-                continue
-            try:
-                return json.loads(raw).get("id")
-            except ValueError:
-                continue
-        return None
+        try:
+            return json.loads(last).get("id")
+        except ValueError:
+            return None
 
     def read_transcript_tail(self, chat_id: str, n: int) -> list[dict]:
         path = self._transcript_path(chat_id)
@@ -399,9 +412,58 @@ class ChatStore:
             return [], False
         # 4) Девайс реально отстал → добираем всё новее курсора из вечного
         #    транскрипта (ULID сортируется по времени, клиент дедуплицирует).
-        after = [ev for ev in self.read_transcript_tail(chat_id, 0)
-                 if str(ev.get("id", "")) > last_seen_id]
-        return after, False
+        #    M7: читаем С КОНЦА блоками и останавливаемся, дойдя до курсора —
+        #    не тянем весь лог (до 10 МБ) в память ради пары кадров.
+        return self._transcript_after(chat_id, last_seen_id), False
+
+    def _transcript_after(self, chat_id: str, last_seen_id: str) -> list[dict]:
+        """Записи транскрипта с id > last_seen_id, читая файл С КОНЦА блоками.
+        ULID отсортированы по времени, поэтому как только встречаем id ≤ курсора
+        — дальше только старее, останавливаемся. Возврат — в хронологическом
+        порядке. Эквивалентно фильтру полного чтения, но без загрузки всего лога.
+        """
+        path = self._transcript_path(chat_id)
+        if not path.exists():
+            return []
+        block = 65536
+        collected: list[dict] = []
+        carry = b""            # неполная первая строка блока (продолжается ранее)
+        try:
+            with path.open("rb") as fh:
+                fh.seek(0, 2)
+                pos = fh.tell()
+                done = False
+                while pos > 0 and not done:
+                    start = max(0, pos - block)
+                    fh.seek(start)
+                    data = fh.read(pos - start) + carry
+                    pos = start
+                    parts = data.split(b"\n")
+                    # у не-начального блока первый фрагмент неполон → в carry
+                    carry = parts[0] if start > 0 else b""
+                    body = parts[1:] if start > 0 else parts
+                    for raw in reversed(body):
+                        raw = raw.strip()
+                        if not raw:
+                            continue
+                        try:
+                            ev = json.loads(raw)
+                        except ValueError:
+                            continue
+                        if str(ev.get("id", "")) > last_seen_id:
+                            collected.append(ev)
+                        else:
+                            # ULID монотонны → дальше только старее. (Оговорка:
+                            # монотонность per-process; редкий clock-rewind через
+                            # рестарт мог бы оставить чуть более старые id новее —
+                            # это лишь пропуск реплея уже старых кадров, клиент
+                            # дедуплицирует.)
+                            done = True
+                            break
+        except OSError:
+            return []
+        collected.reverse()                    # хронологический порядок
+        return collected
 
     def _rewrite_pending(self, chat_id: str, events: list[dict]):
         path = self._pending_path(chat_id)

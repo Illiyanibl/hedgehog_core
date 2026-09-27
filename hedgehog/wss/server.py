@@ -1120,7 +1120,10 @@ class HedgehogServer:
             return
 
         if ftype == "resume":
-            events, full_replay = self.store.events_after(frame.chatId, p.last_seen_id)
+            # M7: отставший девайс тянет хвост вечного транскрипта — читаем в
+            # отдельном потоке, чтобы дисковый разбор не стопорил event loop.
+            events, full_replay = await asyncio.to_thread(
+                self.store.events_after, frame.chatId, p.last_seen_id)
             log.info("chat.resume", conn_id=conn_id, chat_id=frame.chatId,
                      events=len(events), full=full_replay,
                      last_seen=(p.last_seen_id or "")[-6:])
