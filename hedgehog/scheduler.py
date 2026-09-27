@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import sqlite3
 import threading
 import time
@@ -43,6 +44,11 @@ log = structlog.get_logger("scheduler")
 _INLINE_MAX = 8 * 1024
 # Потолок задач на чат — защита от заглючившего агента, плодящего расписания.
 _MAX_JOBS_PER_CHAT = 100
+# M5: нижняя граница interval. spec=0/отрицательный давал next_run в прошлом →
+# next_run не продвигался → срабатывание на КАЖДОМ тике петли (busy-loop). Петля
+# тикает раз в 1с, поэтому < 1с бессмысленно (всё равно не чаще тика); 1с —
+# документированный «суб-минутный» минимум. Блокируем именно 0/отрицательные.
+_MIN_INTERVAL_SEC = 1.0
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
@@ -155,7 +161,12 @@ def _compute_next(kind: str, spec: str, after_ts: float) -> float | None:
     if kind == "cron":
         return _cron_next(spec, datetime.fromtimestamp(after_ts)).timestamp()
     if kind == "interval":
-        return after_ts + float(spec)
+        secs = float(spec)
+        if not math.isfinite(secs):    # nan/inf → пусть _claim_due отключит задачу
+            raise ValueError("interval spec not finite")
+        # M5: клампим на случай уже сохранённой в БД слишком малой величины —
+        # петля не должна крутить одну задачу каждую секунду.
+        return after_ts + max(secs, _MIN_INTERVAL_SEC)
     if kind == "once":
         return None                    # once не повторяется
     raise ValueError(f"unknown kind: {kind}")
@@ -168,7 +179,12 @@ def _initial_next(kind: str, spec: str, now_ts: float) -> float:
     if kind == "cron":
         return _cron_next(spec, datetime.fromtimestamp(now_ts)).timestamp()
     if kind == "interval":
-        return now_ts + float(spec)
+        secs = float(spec)
+        # M5: `not (secs >= MIN)` заодно отсекает nan; отдельно inf (никогда не
+        # выстрелит, но займёт слот из лимита на чат).
+        if not math.isfinite(secs) or not (secs >= _MIN_INTERVAL_SEC):
+            raise ValueError(f"interval must be a finite number ≥ {_MIN_INTERVAL_SEC:g}s")
+        return now_ts + secs
     raise ValueError(f"unknown kind: {kind}")
 
 
@@ -346,6 +362,11 @@ class SchedulerService:
             raise ValueError("kind must be cron|interval|once")
         if action not in ("inject_text", "notify", "remind", "inject_user"):
             raise ValueError("action must be inject_text|notify|remind|inject_user")
+        # M5: inject_user — только пользовательский §defer (wss, created_by=user).
+        # Иначе агент через MCP schedule_add занял бы единственный defer-слот чата
+        # (или впрыснул бы себе сообщение под видом пользователя).
+        if action == "inject_user" and created_by != "user":
+            raise ValueError("inject_user reserved for user deferred messages")
         now = time.time()
         next_run = _initial_next(kind, spec, now)   # валидирует spec
         jid = new_ulid()
