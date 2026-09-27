@@ -12,6 +12,8 @@ status). Токен — тот же OAuth, что и у агента (scope user
 
 from __future__ import annotations
 
+from email.utils import parsedate_to_datetime
+
 import aiohttp
 import structlog
 
@@ -32,6 +34,18 @@ _PROBE = {
 def _num(v) -> float | None:
     try:
         return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def http_date_epoch(value: str | None) -> float | None:
+    """HTTP-заголовок Date («Mon, 28 Sep 2026 21:20:15 GMT») → unix-ts (UTC).
+    Даёт эталонное время по часам Anthropic — для планирования defer без опоры
+    на (возможно кривые) локальные часы сервера."""
+    if not value:
+        return None
+    try:
+        return parsedate_to_datetime(value).timestamp()
     except (TypeError, ValueError):
         return None
 
@@ -85,6 +99,9 @@ async def fetch_limits(config: Config) -> dict:
                     log.warning("limits.http_error", status=resp.status)
                     return {"error": "http", "message": f"HTTP {resp.status}"}
                 result = parse_limits(resp.headers)
+                # Эталонное время по часам Anthropic (для defer при кривых
+                # локальных часах сервера).
+                result["serverDate"] = http_date_epoch(resp.headers.get("Date"))
                 log.info("limits.fetched", five=result["fiveHour"],
                          seven=result["sevenDay"], status=result["status"])
                 return result

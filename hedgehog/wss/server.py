@@ -145,6 +145,15 @@ class HedgehogServer:
         # не должен запустить 2× git reset/pip/execv. Латчится при запланированном
         # рестарте (процесс вот-вот сменится — новых обновлений не начинаем).
         self._updating = False
+        # §defer-clock: смещение часов Anthropic относительно локальных
+        # (serverDate из заголовка Date ответа /v1/messages − time.time()).
+        # Обновляется при get_limits. Нужно, чтобы планировать defer к реальному
+        # сбросу лимита, даже если системные часы сервера уехали (наблюдали −22ч).
+        # Якоря monotonic/wall — чтобы поймать ШАГ часов (NTP/ресинк) после замера
+        # и не доверять протухшему offset (иначе defer выстрелит мгновенно).
+        self._clock_offset = 0.0
+        self._clock_offset_mono = 0.0
+        self._clock_offset_wall = 0.0
 
     # ---------- §sched: точки входа для планировщика ----------
 
@@ -439,6 +448,19 @@ class HedgehogServer:
         t = self._models_probe_task
         if t is not None and not t.done():
             t.cancel()
+
+    def _effective_clock_offset(self) -> float:
+        """§defer-clock: смещение часов Anthropic для ректификации fireAt. 0, если
+        замера не было, ЛИБО он протух (>1ч), ЛИБО с момента замера системные часы
+        ШАГНУЛИ (расхождение wall vs monotonic > 60с) — иначе после NTP-коррекции
+        протухший offset заставил бы defer выстрелить мгновенно."""
+        if self._clock_offset == 0.0:
+            return 0.0
+        mono_elapsed = time.monotonic() - self._clock_offset_mono
+        wall_elapsed = time.time() - self._clock_offset_wall
+        if mono_elapsed > 3600 or abs(wall_elapsed - mono_elapsed) > 60:
+            return 0.0
+        return self._clock_offset
 
     def _invalidate_models_cache(self) -> None:
         """Смена авторизации: список моделей мог смениться. Гасим пробу в
@@ -895,7 +917,15 @@ class HedgehogServer:
                     chat_id=frame.chatId, related=frame.id))
                 return
             now = time.time()
-            fire_at = max(now + 1, min(float(p.fireAt), now + 7 * 24 * 3600))
+            # §defer-clock: fireAt — целевой сброс по часам Anthropic. Считаем
+            # СКОЛЬКО осталось до него по тем же часам (now + offset), затем ставим
+            # на локальную шкалу планировщика (now + delay). Так задержка верна,
+            # даже если системные часы сервера смещены (offset их компенсирует; при
+            # offset=0 формула эквивалентна прежнему клампу [now+1 … now+7д]).
+            offset = self._effective_clock_offset()
+            delay = float(p.fireAt) - (now + offset)
+            delay = max(1.0, min(delay, 7 * 24 * 3600))
+            fire_at = now + delay                # локальная шкала — для планировщика
             atts = [a.model_dump() for a in p.attachments]
             try:
                 jid = await self.scheduler.add_job(
@@ -915,10 +945,12 @@ class HedgehogServer:
                     chat_id=frame.chatId, related=frame.id))
                 return
             # Журналируемое событие → pending-чип восстановится на resume и
-            # появится на других устройствах сразу.
+            # появится на других устройствах сразу. fireAt в чип отдаём в РЕАЛЬНОЙ
+            # шкале (обратно + offset) — у клиента часы верные, чип покажет верное
+            # время сброса, хотя в планировщике храним локальное fire_at.
             await self.hub.publish(frame.chatId, "scheduled", {
                 "jobId": jid, "text": p.text, "attachments": atts,
-                "fireAt": fire_at})
+                "fireAt": fire_at + offset})
             log.info("defer.scheduled", chat=frame.chatId, job=jid,
                      fire_at=fire_at)
             return
@@ -941,6 +973,10 @@ class HedgehogServer:
         if ftype == "list_scheduled":
             jobs = (await self.scheduler.list_jobs(frame.chatId)
                     if self.scheduler else [])
+            # §defer-clock: next_run хранится в ЛОКАЛЬНОЙ шкале → для чипа отдаём
+            # в реальной (+offset), чтобы клиент с верными часами показал время
+            # сброса правильно.
+            offset = self._effective_clock_offset()
             pending = []
             for j in jobs:
                 if j.get("action") != "inject_user" or j.get("enabled") != 1:
@@ -950,9 +986,10 @@ class HedgehogServer:
                     pl = json.loads(j.get("payload") or "{}")
                 except ValueError:
                     pl = {}
+                nr = j.get("next_run")
                 pending.append({
                     "jobId": j["id"],
-                    "fireAt": j.get("next_run"),
+                    "fireAt": (nr + offset) if isinstance(nr, (int, float)) else nr,
                     "text": pl.get("text", ""),
                     "attachments": pl.get("attachments", []),
                 })
@@ -1061,6 +1098,15 @@ class HedgehogServer:
             # §limits: лимиты подписки из заголовков /v1/messages (usage.py).
             from .. import usage
             data = await usage.fetch_limits(self.config)
+            # §defer-clock: запоминаем смещение часов Anthropic от локальных —
+            # им потом ректифицируем fireAt в schedule_message. Якорим на monotonic.
+            sd = data.get("serverDate")
+            if sd:
+                self._clock_offset = sd - time.time()
+                self._clock_offset_mono = time.monotonic()
+                self._clock_offset_wall = time.time()
+                if abs(self._clock_offset) > 120:
+                    log.warning("clock.skew", offset_s=round(self._clock_offset))
             await self.hub.send_global(conn_id, make_frame(
                 "limits_result", data, frame.chatId))
             return
