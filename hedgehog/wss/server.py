@@ -337,6 +337,7 @@ class HedgehogServer:
             for t in list(self._push_tasks):
                 t.cancel()
             await asyncio.gather(*self._push_tasks, return_exceptions=True)
+        await self.hub.aclose()          # backpressure: догасить close-задачи шины
 
     # ---------- §models: фоновый рефрешер списка моделей ----------
 
@@ -473,7 +474,12 @@ class HedgehogServer:
         async def send(frame: dict):
             await ws.send(dumps(frame))
 
-        conn_id = self.hub.register(send)
+        async def close():
+            # backpressure: Hub закрывает зависший сокет по send-таймауту
+            # (1013 «Try Again Later»); ws.close сам ограничен close_timeout.
+            await ws.close(1013)
+
+        conn_id = self.hub.register(send, close)
         t0 = time.time()
         peer = ws.remote_address
         try:

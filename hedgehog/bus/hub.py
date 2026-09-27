@@ -22,6 +22,7 @@ from ..store.chats import ChatStore
 log = structlog.get_logger("hub")
 
 SendFn = Callable[[dict], Awaitable[None]]
+CloseFn = Callable[[], Awaitable[None]]
 
 
 class Hub:
@@ -32,20 +33,28 @@ class Hub:
         # conn_id → deviceId (§push: несекретный id устройства, для per-device
         # маршрутизации пуша). Отдельный dict, чтобы не менять кортеж _conns.
         self._conn_device: dict[int, str] = {}
+        # conn_id → close (закрыть WS): backpressure-таймаут не только снимает
+        # соединение из шины, но и закрывает сокет — иначе ожившее после столла
+        # соединение осталось бы «живым, но глухим» (мы на него не шлём).
+        self._conn_close: dict[int, CloseFn] = {}
+        self._close_tasks: set[asyncio.Task] = set()   # держим ссылки на fire-and-forget
         self._next_conn_id = 1
 
     # ---------- соединения ----------
 
-    def register(self, send: SendFn) -> int:
+    def register(self, send: SendFn, close: CloseFn | None = None) -> int:
         conn_id = self._next_conn_id
         self._next_conn_id += 1
         self._conns[conn_id] = (send, set())
+        if close is not None:
+            self._conn_close[conn_id] = close
         log.info("conn.register", conn_id=conn_id, total=len(self._conns))
         return conn_id
 
     def unregister(self, conn_id: int):
         self._conns.pop(conn_id, None)
         self._conn_device.pop(conn_id, None)
+        self._conn_close.pop(conn_id, None)
         log.info("conn.unregister", conn_id=conn_id, total=len(self._conns))
 
     def set_device(self, conn_id: int, device_id: str):
@@ -112,6 +121,13 @@ class Hub:
                      id=frame.get("id", "")[-6:])
         return frame
 
+    # M(backpressure): медленный/зависший подписчик (полный TCP-буфер, ушёл в
+    # фон без чтения) не должен держать publish и блокировать доставку остальным.
+    # Каждый send ограничен таймаутом; по нему соединение снимается (его
+    # handler-loop доснимет себя сам). Fanout идёт КОНКУРЕНТНО, чтобы один
+    # тормозящий сокет не сериализовал доставку всем прочим.
+    _SEND_TIMEOUT = 15.0
+
     async def send_global(self, conn_id: int, frame: dict):
         """Системный фрейм (hello, chat_list, pong, error) одному соединению."""
         entry = self._conns.get(conn_id)
@@ -120,23 +136,55 @@ class Hub:
 
     async def broadcast_global(self, frame: dict):
         """Системная нотификация всем соединениям (chat_created и т.п.)."""
-        for conn_id, (send, _) in list(self._conns.items()):
-            await self._safe_send(conn_id, send, frame)
+        targets = list(self._conns.items())
+        if targets:
+            await asyncio.gather(*(self._safe_send(cid, send, frame)
+                                   for cid, (send, _) in targets))
 
     async def _fanout(self, chat_id: str, frame: dict) -> int:
-        delivered = 0
-        for conn_id, (send, subs) in list(self._conns.items()):
-            if chat_id in subs:
-                await self._safe_send(conn_id, send, frame)
-                delivered += 1
-        return delivered
+        targets = [(cid, send) for cid, (send, subs) in list(self._conns.items())
+                   if chat_id in subs]
+        if targets:
+            # gather: зависший подписчик не задержит доставку остальным (его send
+            # отвалится по таймауту в _safe_send). delivered = число адресатов
+            # (как и раньше — считали попытки; _safe_send глотает сбои сам).
+            await asyncio.gather(*(self._safe_send(cid, send, frame)
+                                   for cid, send in targets))
+        return len(targets)
 
     async def _safe_send(self, conn_id: int, send: SendFn, frame: dict):
         try:
-            await send(frame)
+            await asyncio.wait_for(send(frame), self._SEND_TIMEOUT)
         except asyncio.CancelledError:
             raise
+        except asyncio.TimeoutError:
+            # Клиент не вычитывает (завис/полный буфер) — не держим шину, снимаем
+            # соединение И закрываем сокет. Без close ожившее после столла
+            # соединение остаётся открытым (keepalive доволен), но из шины
+            # выкинуто → «живой, но глухой» зомби. close захватываем ДО unregister
+            # (он его снимет); закрываем фоном — ws.close сам ограничен таймаутом.
+            log.warning("send.timeout", conn_id=conn_id)
+            close = self._conn_close.get(conn_id)
+            self.unregister(conn_id)
+            if close is not None:
+                task = asyncio.create_task(self._close_quietly(conn_id, close))
+                self._close_tasks.add(task)
+                task.add_done_callback(self._close_tasks.discard)
         except Exception as e:
             # Обрыв WS одного подписчика не должен ронять publish()
             # у сессии — соединение снимет себя само в handler'е.
             log.info("send.failed", conn_id=conn_id, err=str(e))
+
+    async def _close_quietly(self, conn_id: int, close: CloseFn):
+        try:
+            await close()
+        except Exception as e:  # noqa: BLE001 — закрытие не должно всплывать
+            log.info("close.failed", conn_id=conn_id, err=str(e))
+
+    async def aclose(self):
+        """Shutdown: погасить фоновые close-задачи (backpressure-таймаут), иначе
+        на выходе возможен «Task was destroyed but it is pending»."""
+        if self._close_tasks:
+            for t in list(self._close_tasks):
+                t.cancel()
+            await asyncio.gather(*self._close_tasks, return_exceptions=True)
