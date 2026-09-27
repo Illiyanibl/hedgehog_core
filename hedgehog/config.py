@@ -28,6 +28,21 @@ def write_secret_file(path: Path, text: str) -> None:
         os.close(fd)
 
 
+def ensure_secure_dir(path: Path) -> None:
+    """Создать каталог данных с правами 0o700. Внутри лежат секреты (auth_token/
+    auth.json — 0o600), но сам каталог `mkdir` создаёт по umask (обычно 0o755) →
+    чужой юзер на общем хосте мог бы листать имена файлов/траверсить. Форсим
+    chmod и для уже существующего (более слабого) каталога. Best-effort."""
+    # mode=0o700 при создании → лист рождается без окна (0o700 не расширить
+    # umask'ом); chmod добивает уже существующий более слабый каталог (mkdir
+    # игнорирует mode для существующего). parents создаются по umask — не секрет.
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        path.chmod(0o700)
+    except OSError:
+        pass
+
+
 @dataclass
 class Config:
     host: str = field(default_factory=lambda: os.environ.get("HEDGEHOG_HOST", "127.0.0.1"))
@@ -180,7 +195,7 @@ class Config:
 
     def save_auth_config(self, data: dict) -> None:
         """Записать выбранный способ (перезаписывая прошлый). chmod 600 — секрет."""
-        self.data_dir.mkdir(parents=True, exist_ok=True)
+        ensure_secure_dir(self.data_dir)   # 0o700: внутри секреты
         tmp = self.auth_config_file.with_suffix(".json.tmp")
         write_secret_file(tmp, json.dumps(data, ensure_ascii=False))  # 0o600 без окна
         tmp.replace(self.auth_config_file)
@@ -226,7 +241,7 @@ class Config:
             if token:
                 return token
         token = secrets.token_urlsafe(32)
-        self.data_dir.mkdir(parents=True, exist_ok=True)
+        ensure_secure_dir(self.data_dir)   # 0o700: внутри секреты
         write_secret_file(self.token_file, token + "\n")   # 0o600 без окна
         return token
 
@@ -236,6 +251,6 @@ class Config:
         утечь. ВНИМАНИЕ: env HEDGEHOG_TOKEN перекрывает файл (load_token) —
         при деплое через env токен ротируется на стороне env, не здесь."""
         token = secrets.token_urlsafe(32)
-        self.data_dir.mkdir(parents=True, exist_ok=True)
+        ensure_secure_dir(self.data_dir)   # 0o700: внутри секреты
         write_secret_file(self.token_file, token + "\n")   # 0o600 без окна
         return token

@@ -34,7 +34,8 @@ async def _amain():
     log = structlog.get_logger("main")
 
     config = Config()
-    config.data_dir.mkdir(parents=True, exist_ok=True)
+    from .config import ensure_secure_dir
+    ensure_secure_dir(config.data_dir)   # M6: 0o700 (внутри секреты 0o600)
     # §tls: серт нужен ОБОИМ портам (8765 WS + 8767 файлы) и одному отпечатку.
     # WS-сервер стартует раньше файл-сервера, поэтому гарантируем серт здесь,
     # до старта приёма соединений (ensure_cert идемпотентна).
