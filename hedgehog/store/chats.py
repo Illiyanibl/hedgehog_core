@@ -115,9 +115,18 @@ class ChatStore:
                         cwd=cwd, created_at=time.time(),
                         mcp=mcp or [], permission_mode=permission_mode,
                         log_kb=log_kb, skills=skills, cliType=cli_type)
-        (chat_dir / "meta.json").write_text(
-            json.dumps(asdict(meta), ensure_ascii=False, indent=1))
+        self._write_meta(chat_dir / "meta.json", meta)
         return meta
+
+    @staticmethod
+    def _write_meta(meta_path: Path, meta: ChatMeta) -> None:
+        """M1: атомарная запись meta.json (tmp+replace). Прямой write_text на
+        crash/диск-фулл оставлял бы полузаписанный битый JSON → get() ловит
+        ValueError → None → чат «исчезает». replace атомарен на POSIX; при сбое
+        записи tmp прежний meta.json остаётся целым."""
+        tmp = meta_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(asdict(meta), ensure_ascii=False, indent=1))
+        tmp.replace(meta_path)
 
     def get(self, chat_id: str) -> ChatMeta | None:
         try:
@@ -147,8 +156,7 @@ class ChatStore:
         for k, v in changes.items():
             if hasattr(meta, k):
                 setattr(meta, k, v)
-        (self._chat_dir(chat_id) / "meta.json").write_text(
-            json.dumps(asdict(meta), ensure_ascii=False, indent=1))
+        self._write_meta(self._chat_dir(chat_id) / "meta.json", meta)
         self._log_limits.pop(chat_id, None)
         return meta
 
