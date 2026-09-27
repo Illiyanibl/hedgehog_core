@@ -141,6 +141,10 @@ class HedgehogServer:
         # user_msg/inject (meta прочитана до удаления) не воскресил его сессию
         # (висячий CLI-процесс + падение журнала на удалённый чат).
         self._deleting: set[str] = set()
+        # M4: update_self в полёте — второй вызов (двойной тап/второе устройство)
+        # не должен запустить 2× git reset/pip/execv. Латчится при запланированном
+        # рестарте (процесс вот-вот сменится — новых обновлений не начинаем).
+        self._updating = False
 
     # ---------- §sched: точки входа для планировщика ----------
 
@@ -666,23 +670,44 @@ class HedgehogServer:
             # §15: git pull своего исходника + перезапуск. Авторизация — тем же
             # токеном, что и WS (SSH не нужен). Работает для серверов,
             # добавленных только по порту Ёжика.
-            from .. import updater
-            result = await asyncio.to_thread(updater.pull_latest)
-            await self.hub.send_global(conn_id, make_frame("update_result", {
-                "ok": result.ok,
-                "changed": result.changed,
-                "old": result.old,
-                "new": result.new,
-                "message": result.message,
-            }))
-            log.info("update.self", ok=result.ok, changed=result.changed,
-                     old=result.old, new=result.new)
-            if result.ok and result.changed:
-                async def _restart():
-                    await asyncio.sleep(1.0)  # дать update_result долететь
-                    log.info("update.restart", to=result.new)
-                    updater.restart_in_place()
-                asyncio.create_task(_restart())
+            # M4: single-flight — параллельный вызов не запускает 2× git reset/
+            # pip/execv (проверка+взвод атомарны: между ними нет await).
+            if self._updating:
+                await self.hub.send_global(conn_id, make_frame("update_result", {
+                    "ok": False, "changed": False, "old": "", "new": "",
+                    "message": "обновление уже идёт"}))
+                return
+            self._updating = True
+            restarting = False
+            try:
+                from .. import updater
+                result = await asyncio.to_thread(updater.pull_latest)
+                await self.hub.send_global(conn_id, make_frame("update_result", {
+                    "ok": result.ok,
+                    "changed": result.changed,
+                    "old": result.old,
+                    "new": result.new,
+                    "message": result.message,
+                }))
+                log.info("update.self", ok=result.ok, changed=result.changed,
+                         old=result.old, new=result.new)
+                if result.ok and result.changed:
+                    restarting = True   # процесс сменится — флаг НЕ снимаем
+                    async def _restart():
+                        await asyncio.sleep(1.0)  # дать update_result долететь
+                        log.info("update.restart", to=result.new)
+                        try:
+                            updater.restart_in_place()   # execv — не возвращается
+                        except Exception as e:  # noqa: BLE001
+                            # execv упал: код уже на новом SHA (повтор вернёт
+                            # changed=False), но без явного лога это было бы тихим
+                            # unhandled-task exc — сервер тихо остался бы на старом.
+                            log.error("update.restart_failed", err=repr(e))
+                            self._updating = False   # разлатчиваем — рестарт не идёт
+                    asyncio.create_task(_restart())
+            finally:
+                if not restarting:
+                    self._updating = False
             return
         if ftype in ("install_neko", "get_neko", "remove_neko"):
             # §17: Neko-браузер. Провижининг/снос — блокирующий docker I/O в
