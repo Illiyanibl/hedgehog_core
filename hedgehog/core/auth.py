@@ -103,6 +103,17 @@ def extract_token(raw: bytes) -> str | None:
     return matches[-1] if matches else None
 
 
+def extract_oauth_error(raw: bytes) -> str | None:
+    """Текущее «OAuth error: …» на ЭКРАНЕ (через ScreenGrid), а не в кумулятивном
+    буфере. ink перерисовывает кадр десятки раз/сек → одна ошибка в сыром буфере
+    даёт десятки совпадений findall → лавина retry+Enter, каждый Enter
+    инвалидирует свежую ссылку. Рендер экрана схлопывает повторы к одному."""
+    grid = ScreenGrid(rows=_PTY_ROWS, cols=_PTY_COLS)
+    grid.feed(raw)
+    m = _OAUTH_ERR_RE.search(grid.render_plain())
+    return m.group(1).strip() if m else None
+
+
 class AuthManager:
     def __init__(self, config: Config, broadcast: BroadcastFn):
         self._config = config
@@ -114,7 +125,7 @@ class AuthManager:
         self._raw = b""        # сырой поток целиком — для ScreenGrid (токен)
         self._url: str | None = None
         self._parse_from = 0   # ссылку ищем только в выводе после этой позиции
-        self._errs_seen = 0    # сколько «OAuth error» уже отработано
+        self._last_err: str | None = None   # M: последняя отработанная OAuth-ошибка (фронт)
 
     @property
     def running(self) -> bool:
@@ -173,7 +184,7 @@ class AuthManager:
 
     async def _flow(self):
         self._buf, self._raw, self._url = "", b"", None
-        self._parse_from, self._errs_seen = 0, 0
+        self._parse_from, self._last_err = 0, None
         loop = asyncio.get_running_loop()
         master, slave = os.openpty()
         self._master_fd = master
@@ -244,21 +255,25 @@ class AuthManager:
                     self._url = url
                     log.info("auth.link_found")
                     await self._broadcast("auth_link", {"url": url})
-            # Неверный код → промежуточный auth_result {retry: true},
-            # жмём Enter (CLI выдаст новую ссылку — уйдёт как auth_link).
-            errs = _OAUTH_ERR_RE.findall(strip_ansi(self._buf))
-            if len(errs) > self._errs_seen:
-                for msg in errs[self._errs_seen:]:
-                    log.warning("auth.code_rejected", err=msg.strip())
-                    await self._broadcast("auth_result", {
-                        "ok": False, "retry": True,
-                        "error": f"код не принят: {msg.strip()}"})
-                self._errs_seen = len(errs)
+            # Неверный код → ОДИН промежуточный auth_result{retry} на ошибку,
+            # затем Enter (CLI выдаст новую ссылку → уйдёт как auth_link). M:
+            # детект по ЭКРАНУ + фронт (появление новой ошибки), иначе repaints
+            # кумулятивного буфера давали лавину retry/Enter, инвалидируя ссылку.
+            # Гейт до постройки ScreenGrid: пока «OAuth error» не появлялось,
+            # не гоняем O(n) разбор всего _raw на каждой итерации (loop общий).
+            err = extract_oauth_error(self._raw) if b"OAuth error" in self._raw else None
+            if err and err != self._last_err:
+                self._last_err = err
+                log.warning("auth.code_rejected", err=err)
+                await self._broadcast("auth_result", {
+                    "ok": False, "retry": True, "error": f"код не принят: {err}"})
                 self._url, self._parse_from = None, len(self._buf)
                 try:
                     os.write(self._master_fd, b"\r")
                 except OSError:
                     pass
+            elif not err:
+                self._last_err = None   # экран без ошибки → следующее появление сработает
 
         rc = await self._proc.wait()
         token = extract_token(self._raw)
@@ -267,7 +282,16 @@ class AuthManager:
             log.info("auth.success")
             await self._broadcast("auth_result", {"ok": True})
         else:
-            tail = strip_ansi(self._buf).strip()[-400:]
+            # M/L: в хвост мог попасть напечатанный токен (rc≠0, но токен виден).
+            # Берём хвост с ОТРЕНДЕРЕННОГО экрана (там токен целен и с префиксом —
+            # в кумулятивном _buf ink-дифф мог его порвать, оставив фрагмент без
+            # префикса мимо _TOKEN_RE), редактируем по префиксу + подстраховка по
+            # длинным рунам токен-charset.
+            grid = ScreenGrid(rows=_PTY_ROWS, cols=_PTY_COLS)
+            grid.feed(self._raw)
+            tail = grid.render_plain().strip()[-400:]
+            tail = _TOKEN_RE.sub("sk-ant-oat<redacted>", tail)
+            tail = re.sub(r"[0-9A-Za-z_\-]{40,}", "<redacted>", tail)
             log.warning("auth.failed", rc=rc, token_found=bool(token))
             await self._broadcast("auth_result", {
                 "ok": False,
