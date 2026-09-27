@@ -15,6 +15,19 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
+def write_secret_file(path: Path, text: str) -> None:
+    """Записать секрет (токен/ключи) с правами 0o600 БЕЗ окна world-readable.
+    `write_text` создаёт файл по umask (обычно 0644) и лишь потом chmod — на
+    общем хосте другой юзер успел бы прочитать. Здесь режим задаётся при создании
+    (os.open) + fchmod форсит 0o600 и для уже существующего (более слабого) файла."""
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        os.write(fd, text.encode("utf-8"))
+    finally:
+        os.close(fd)
+
+
 @dataclass
 class Config:
     host: str = field(default_factory=lambda: os.environ.get("HEDGEHOG_HOST", "127.0.0.1"))
@@ -169,8 +182,7 @@ class Config:
         """Записать выбранный способ (перезаписывая прошлый). chmod 600 — секрет."""
         self.data_dir.mkdir(parents=True, exist_ok=True)
         tmp = self.auth_config_file.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(data, ensure_ascii=False))
-        tmp.chmod(0o600)
+        write_secret_file(tmp, json.dumps(data, ensure_ascii=False))  # 0o600 без окна
         tmp.replace(self.auth_config_file)
 
     def clear_auth_config(self) -> None:
@@ -215,8 +227,7 @@ class Config:
                 return token
         token = secrets.token_urlsafe(32)
         self.data_dir.mkdir(parents=True, exist_ok=True)
-        self.token_file.write_text(token + "\n")
-        self.token_file.chmod(0o600)
+        write_secret_file(self.token_file, token + "\n")   # 0o600 без окна
         return token
 
     def rotate_token(self) -> str:
@@ -226,6 +237,5 @@ class Config:
         при деплое через env токен ротируется на стороне env, не здесь."""
         token = secrets.token_urlsafe(32)
         self.data_dir.mkdir(parents=True, exist_ok=True)
-        self.token_file.write_text(token + "\n")
-        self.token_file.chmod(0o600)
+        write_secret_file(self.token_file, token + "\n")   # 0o600 без окна
         return token

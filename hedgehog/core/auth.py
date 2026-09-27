@@ -34,7 +34,7 @@ from typing import Awaitable, Callable
 import structlog
 
 from ..adapters.screen_grid import ScreenGrid
-from ..config import Config
+from ..config import Config, write_secret_file
 
 log = structlog.get_logger("auth")
 
@@ -270,8 +270,7 @@ class AuthManager:
     def _save_token(self, token: str):
         path = self._config.oauth_token_file
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(token + "\n")
-        path.chmod(0o600)
+        write_secret_file(path, token + "\n")   # 0o600 без окна world-readable
 
     def _cleanup(self):
         if self._proc is not None and self._proc.returncode is None:

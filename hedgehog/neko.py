@@ -26,7 +26,7 @@ from pathlib import Path
 
 import structlog
 
-from .config import Config
+from .config import Config, write_secret_file
 
 log = structlog.get_logger("neko")
 
@@ -142,8 +142,8 @@ def _passwords(config: Config) -> tuple[str, str]:
         pass
     user, admin = secrets.token_hex(16), secrets.token_hex(16)
     config.data_dir.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps({"user": user, "admin": admin}))
-    p.chmod(0o600)
+    # 0o600 без окна world-readable (пароли neko лежат прямо в data_dir).
+    write_secret_file(p, json.dumps({"user": user, "admin": admin}))
     return user, admin
 
 
