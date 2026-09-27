@@ -62,6 +62,10 @@ async def _amain():
         loop.add_signal_handler(sig, stop.set)
 
     serve_task = asyncio.create_task(server.serve_forever())
+    # M: если WS-сервер упал сам (порт занят / битый серт / внезапный exc), а не
+    # по сигналу — не зависаем навечно в stop.wait() (зомби: процесс жив, порт не
+    # слушается). Пробуждаем shutdown; исключение достаём ниже и пробрасываем.
+    serve_task.add_done_callback(lambda _t: stop.set())
     # §7 файл-сервер — отдельный aiohttp-порт, WS-чаты не трогает.
     file_runner, tls_fp = await fileserver.start(config, config.load_token())
     log.info("files.start", port=config.file_port, tls=config.tls_enabled,
@@ -69,13 +73,21 @@ async def _amain():
 
     await stop.wait()
     log.info("hedgehog.shutdown")
-    serve_task.cancel()
-    try:
-        await serve_task
-    except asyncio.CancelledError:
-        pass
+    serve_exc: BaseException | None = None
+    if serve_task.done() and not serve_task.cancelled():
+        serve_exc = serve_task.exception()   # упал сам — не по нашему cancel
+        if serve_exc is not None:
+            log.error("serve.crashed", err=repr(serve_exc))
+    else:
+        serve_task.cancel()
+        try:
+            await serve_task
+        except asyncio.CancelledError:
+            pass
     await file_runner.cleanup()
     await server.shutdown()
+    if serve_exc is not None:
+        raise serve_exc   # ненулевой код выхода → перезапуск супервизором
 
 
 def main():
