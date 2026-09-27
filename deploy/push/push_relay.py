@@ -129,7 +129,8 @@ JWKS_MIN_GAP = 60       # анти-DoS: битые/неизвестные kid н
 MAX_DEVICES = 20
 REVOKED_TTL = 730 * 86400
 # Ручки, куда ходит ТЕЛЕФОН (может быть за CGNAT) — мягкий рейт-лимит register.
-_PHONE_PATHS = {"/v1/register", "/v1/auth/apple", "/v1/devices", "/v1/revoke"}
+_PHONE_PATHS = {"/v1/register", "/v1/auth/apple", "/v1/devices", "/v1/revoke",
+                "/v1/account/delete"}
 
 
 def _iso(ts: float) -> str:
@@ -816,6 +817,38 @@ async def handle_revoke(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "revoked": target})
 
 
+async def handle_account_delete(request: web.Request) -> web.Response:
+    """§siwa/A1 (Apple 5.1.1(v)): полное удаление учётки — ВСЕ устройства + сам
+    users-ряд + легаси-devices по их notifyKey'ам. Авторизация по deviceToken
+    (как revoke). Необратимо; после — вход через Apple создаст новую учётку."""
+    ip = _client_ip(request)
+    now = _now()
+    d = await _parse_dict(request)
+    if d is None:
+        _ban(request.app, ip, now, "bad_json")
+        return _drop(request)
+    dtok = str(d.get("deviceToken") or "").strip()
+    if not _ID_RE.match(dtok):
+        _ban(request.app, ip, now, "bad_ids")
+        return _drop(request)
+    db = request.app["db"]
+    me = await _device_by_token(db, dtok)
+    if me is None:
+        return _bad("unauthorized", 401)
+    uid, _my_dev = me
+    async with request.app["wlock"]:
+        async with db.execute(
+                "SELECT notify_key FROM user_devices "
+                "WHERE user_id=? AND notify_key IS NOT NULL", (uid,)) as cur:
+            keys = [r[0] for r in await cur.fetchall()]
+        for nk in keys:                       # легаси-таблица маршрутизации
+            await db.execute("DELETE FROM devices WHERE notify_key=?", (nk,))
+        await db.execute("DELETE FROM user_devices WHERE user_id=?", (uid,))
+        await db.execute("DELETE FROM users WHERE id=?", (uid,))
+        await db.commit()
+    return web.json_response({"ok": True, "deleted": True})
+
+
 async def handle_health(_: web.Request) -> web.Response:
     return web.json_response({"ok": True, "topic": TOPIC, "env": DEFAULT_ENV})
 
@@ -855,6 +888,7 @@ def make_app() -> web.Application:
         web.post("/v1/auth/apple", handle_auth_apple),   # §siwa
         web.post("/v1/devices", handle_devices),         # §siwa
         web.post("/v1/revoke", handle_revoke),           # §siwa
+        web.post("/v1/account/delete", handle_account_delete),  # §siwa/A1
         web.get("/v1/health", handle_health),
     ])
     app.on_startup.append(on_startup)
