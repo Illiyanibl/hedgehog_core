@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import shutil
 import sqlite3
 import threading
 import time
@@ -44,6 +45,8 @@ log = structlog.get_logger("scheduler")
 _INLINE_MAX = 8 * 1024
 # Потолок задач на чат — защита от заглючившего агента, плодящего расписания.
 _MAX_JOBS_PER_CHAT = 100
+# M4: сколько последних запусков хранить на задачу (job_runs растут бесконечно).
+_JOB_RUNS_KEEP = 50
 # M5: нижняя граница interval. spec=0/отрицательный давал next_run в прошлом →
 # next_run не продвигался → срабатывание на КАЖДОМ тике петли (busy-loop). Петля
 # тикает раз в 1с, поэтому < 1с бессмысленно (всё равно не чаще тика); 1с —
@@ -345,6 +348,13 @@ class SchedulerService:
             self._conn.execute(
                 "INSERT INTO job_runs(id, job_id, ts, status, detail) VALUES(?,?,?,?,?)",
                 (new_ulid(), job_id, time.time(), status, detail))
+            # M4: retention — держим только последние _JOB_RUNS_KEEP на задачу,
+            # иначе история запусков частой interval-задачи растёт неограниченно.
+            self._conn.execute(
+                "DELETE FROM job_runs WHERE job_id=? AND id NOT IN ("
+                "SELECT id FROM job_runs WHERE job_id=? "
+                "ORDER BY ts DESC, id DESC LIMIT ?)",
+                (job_id, job_id, _JOB_RUNS_KEEP))
             self._conn.commit()
 
     # --- API расписаний (зовётся из MCP-тулов) ----------------------------
@@ -417,10 +427,21 @@ class SchedulerService:
 
     def _purge_chat_sync(self, chat_id: str) -> int:
         with self._dblock:
+            # M4: чистим ВСЁ, привязанное к чату — иначе после delete_chat
+            # остаются сироты. job_runs (нет FK cascade) удаляем ДО jobs по их id.
+            self._conn.execute(
+                "DELETE FROM job_runs WHERE job_id IN "
+                "(SELECT id FROM jobs WHERE chat_id=?)", (chat_id,))
             cur = self._conn.execute(
                 "DELETE FROM jobs WHERE chat_id=?", (chat_id,))
+            self._conn.execute(
+                "DELETE FROM artifacts WHERE chat_id=?", (chat_id,))
             self._conn.commit()
-            return cur.rowcount
+            removed = cur.rowcount
+        # Файлы больших артефактов чата — вне лока (FS-I/O). chat_id = ULID
+        # (безопасное имя каталога).
+        shutil.rmtree(self._artifacts_dir / chat_id, ignore_errors=True)
+        return removed
 
     def _cancel_job_sync(self, job_id: str, chat_id: str,
                          action: str | None = None) -> bool:
@@ -438,6 +459,9 @@ class SchedulerService:
                 cur = self._conn.execute(
                     "DELETE FROM jobs WHERE id=? AND chat_id=? AND enabled=1",
                     (job_id, chat_id))
+            if cur.rowcount > 0:      # M4: не оставляем историю удалённой задачи
+                self._conn.execute(
+                    "DELETE FROM job_runs WHERE job_id=?", (job_id,))
             self._conn.commit()
             return cur.rowcount > 0
 
