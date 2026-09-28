@@ -80,6 +80,10 @@ class ScreenGrid:
         # shape as a grid row. 0 disables (no scrollback kept).
         self.scrollback_max = max(0, scrollback_max)
         self.scrollback: list[list[bytes]] = []
+        # M4: бюджет строк, к которым применяется content-dedup — взводится ТОЛЬКО
+        # после полной очистки экрана (redraw-механизм TUI). Обычный вывод
+        # (`yes`, логи) экран не чистит → бюджет 0 → повторы сохраняются.
+        self._redraw_budget = 0
 
     # ---------- grid helpers ----------
 
@@ -159,10 +163,14 @@ class ScreenGrid:
             for r in range(take):
                 # Copy the row — the grid will reuse list slots otherwise.
                 new_row = list(self._grid[r])
-                if self.scrollback:
-                    recent = self.scrollback[-dedup_window:]
-                    if any(new_row == old for old in recent):
-                        continue
+                # M4: content-dedup применяем ТОЛЬКО в окне после очистки экрана
+                # (redraw). Иначе легитимные повторы (`yes`, логи) сохраняем.
+                if self._redraw_budget > 0:
+                    self._redraw_budget -= 1
+                    if self.scrollback:
+                        recent = self.scrollback[-dedup_window:]
+                        if any(new_row == old for old in recent):
+                            continue
                 self.scrollback.append(new_row)
             overflow = len(self.scrollback) - self.scrollback_max
             if overflow > 0:
@@ -427,6 +435,11 @@ class ScreenGrid:
                 row[c] = b' '
             for r in range(self.cursor_row + 1, self.rows):
                 grid[r] = self._blank_row()
+            # M4: ESC[H + ESC[J из левого-верхнего угла = очистка всего экрана —
+            # тот же redraw-паттерн, что и mode 2. В alt-screen scrollback не
+            # пишется → бюджет там не взводим (иначе протёк бы в пост-alt вывод).
+            if not self.alt_mode and self.cursor_row == 0 and self.cursor_col == 0:
+                self._redraw_budget = self.rows
         elif mode == 1:
             # start → cursor
             for r in range(0, self.cursor_row):
@@ -438,6 +451,11 @@ class ScreenGrid:
             # mode 2 or 3 — whole screen (scrollback erase is no-op for us)
             for r in range(self.rows):
                 grid[r] = self._blank_row()
+            # M4: полная очистка = начало TUI-перерисовки → следующий экран строк,
+            # уходящих в scrollback, дедупим против недавних (это тот же кадр).
+            # В alt-screen scrollback не пишется → бюджет не взводим.
+            if not self.alt_mode:
+                self._redraw_budget = self.rows
 
     def _erase_line(self, mode: int):
         row = self._grid[self.cursor_row]
@@ -503,6 +521,7 @@ class ScreenGrid:
         self.cursor_col = 0
         self._saved = {"normal": None, "alt": None}
         self.scrollback.clear()
+        self._redraw_budget = 0        # M4: не оставляем взведённый бюджет после RIS
 
     # ---------- render ----------
 
