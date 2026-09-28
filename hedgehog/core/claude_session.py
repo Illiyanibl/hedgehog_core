@@ -73,6 +73,12 @@ log = structlog.get_logger("claude_session")
 # §roster: потолок длины кросс-чат впрыска (send_to_chat). Эхо уходит в
 # pending.jsonl + транскрипт целевого чата; у MCP-аргумента своего лимита нет.
 _SEND_TO_CHAT_MAX = 64 * 1024
+# S2-M3: маркер провенанса кросс-чат сообщения. Только сервер имеет право его
+# ставить (первой строкой) — в теле нейтрализуем, иначе агент подделал бы источник.
+_CC_MARK = "[cross-chat message from chat"
+# S2-M3: rate-limit кросс-чат впрысков на чат-источник — тормозит циклы A→B→A.
+_CC_RATE_MAX = 20          # не более N send_to_chat
+_CC_RATE_WINDOW = 60.0     # за окно, секунд (monotonic)
 
 # §caps: путеводитель по инструментам Ёжика. Дописывается (append) к дефолтному
 # системному промпту Claude Code, НЕ заменяет его. Задача — чтобы агент в
@@ -264,6 +270,8 @@ class ClaudeSession:
         # list_chats/send_to_chat. None в тестах/старых вызовах (тулы вернут
         # "roster unavailable").
         self._roster = roster
+        # S2-M3: monotonic-таймстампы последних send_to_chat (rate-limit циклов).
+        self._cc_sends: list[float] = []
         self._publish = publish
         self._send_chat_error = send_chat_error  # (code, message) → journal+fanout
         self._config = config
@@ -1084,13 +1092,28 @@ class ClaudeSession:
                 return _text("refusing to send to the current chat (would loop)")
             if not text.strip():
                 return _text("text is empty")
+            # S2-M3: rate-limit на чат-источник — тормозит циклы A→B→A (docstring
+            # просит не строить авто-реплаи, но одного текста мало). Окно monotonic.
+            mono = time.monotonic()
+            session._cc_sends = [t for t in session._cc_sends
+                                 if mono - t < _CC_RATE_WINDOW]
+            if len(session._cc_sends) >= _CC_RATE_MAX:
+                return _text("rate limit: too many cross-chat messages, slow down")
+            session._cc_sends.append(mono)
             src = session.meta.chatId
             # L2: имя чата может содержать кавычки/переводы строк — не даём
             # сломать строку-провенанс (первая строка, кавычки → одинарные).
             raw_name = (session.meta.name or "").splitlines()
             src_name = (raw_name[0] if raw_name else "").replace('"', "'")
-            prefixed = (f'[cross-chat message from chat {src} "{src_name}"]\n'
-                        f"{text}")
+            # S2-M3: нейтрализуем маркер провенанса В ТЕЛЕ — иначе агент подделал
+            # бы источник (первой строкой фейковый «[cross-chat message from chat…»).
+            # Ломаем ведущую «[» → «(»: визуально это уже НЕ маркер (та же длина —
+            # байт-кап ниже не меняется). Остаточный семантический спуфинг
+            # (перефраз «forwarded from …») неустраним против LLM-читателя — но
+            # настоящий маркер с истинным источником всегда физически первой строкой.
+            body = text.replace(_CC_MARK, "(cross-chat message from chat")
+            prefixed = (f'{_CC_MARK} {src} "{src_name}"]\n'
+                        f"{body}")
             # M1/L1: потолок — по БАЙТАМ итогового сообщения (эхо уходит в
             # pending.jsonl + транскрипт цели; кириллица в UTF-8 крупнее символа).
             if len(prefixed.encode("utf-8")) > _SEND_TO_CHAT_MAX:
