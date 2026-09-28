@@ -1244,8 +1244,22 @@ class ClaudeSession:
 
     async def _ask_ui(self, html: str, title: str) -> str:
         """§ui: показать интерактивный HTML в чате и дождаться ответа юзера.
-        Тем же round-trip, что picker/permission (_pending future)."""
-        data = await self.request("ui_request", {"html": html, "title": title})
+        Тем же round-trip, что picker/permission (_pending future).
+
+        S2-M2: окно интерактивное — юзер может думать дольше permission_timeout
+        (300с), поэтому ждём по большому ui_timeout. И перехватываем таймаут: без
+        этого asyncio.TimeoutError вылетал из тела тула (в отличие от permission-
+        пути) → тул падал ошибкой, окно висело с мёртвым related. Теперь тул
+        возвращает человекочитаемый текст, агент продолжает штатно."""
+        try:
+            data = await self.request(
+                "ui_request", {"html": html, "title": title},
+                timeout=self._config.ui_timeout)
+        except asyncio.TimeoutError:
+            log.info("ui.timeout", chat=self.meta.chatId,
+                     after=int(self._config.ui_timeout))
+            return (f"(no answer: the interactive window timed out after "
+                    f"{int(self._config.ui_timeout)}s)")
         log.info("ui.answered", chat=self.meta.chatId, size=len(data or ""))
         return data or "(the user closed the window without answering)"
 

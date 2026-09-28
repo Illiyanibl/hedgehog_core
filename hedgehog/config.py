@@ -112,6 +112,10 @@ class Config:
     snapshot_interval: float = 0.08
     # user has this long to answer permission_request / picker_request
     permission_timeout: float = 300.0
+    # §ui S2-M2: интерактивное ask_ui-окно (игра/форма/мультишаг) юзер держит
+    # ДОЛЬШЕ 300с permission_timeout — отдельный большой лимит; по нему ask_ui
+    # graceful-таймаутит (не роняет тул), окно юзер закрывает сам.
+    ui_timeout: float = 3600.0
     # user has this long to open the OAuth link and paste the code back (§13)
     auth_timeout: float = 600.0
 
