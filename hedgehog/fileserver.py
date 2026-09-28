@@ -310,15 +310,21 @@ async def _mkdir(request: web.Request) -> web.Response:
 
 
 def _prepare_dst(dst: Path, overwrite: bool) -> web.Response | None:
-    """Общая проверка приёмника для move/copy. None → можно писать."""
+    """Проверка приёмника для move/copy (без разрушающих операций — они в потоке,
+    _clear_dst). None → можно писать."""
+    if dst.exists() and not overwrite:
+        return web.json_response({"error": "exists"}, status=409)
+    return None
+
+
+def _clear_dst(dst: Path) -> None:
+    """Снести существующий приёмник при overwrite. Блокирующее (rmtree крупной
+    папки) — звать ТОЛЬКО внутри asyncio.to_thread (S5-M6)."""
     if dst.exists():
-        if not overwrite:
-            return web.json_response({"error": "exists"}, status=409)
         if dst.is_dir() and not dst.is_symlink():
             shutil.rmtree(dst)
         else:
             dst.unlink()
-    return None
 
 
 async def _move(request: web.Request) -> web.Response:
@@ -327,10 +333,16 @@ async def _move(request: web.Request) -> web.Response:
     dst = _resolve(config, _dec(request, "X-To"))
     if src == _browse_root(config):
         raise web.HTTPForbidden(text="refuse to move root")
-    if (resp := _prepare_dst(dst, request.headers.get("X-Overwrite", "") == "1")):
+    overwrite = request.headers.get("X-Overwrite", "") == "1"
+    if (resp := _prepare_dst(dst, overwrite)):
         return resp
+
+    def _do():                       # S5-M6: блокирующее — в поток, не на loop
+        if overwrite:                # чистим приёмник ТОЛЬКО при overwrite — иначе
+            _clear_dst(dst)          # гонка (dst создан после _prepare_dst) снесла бы
+        shutil.move(str(src), str(dst))   # чужой файл; без флага move сам даст ошибку
     try:
-        shutil.move(str(src), str(dst))
+        await asyncio.to_thread(_do)
     except OSError as e:
         raise web.HTTPBadRequest(text=str(e))
     log.info("file.move", **{"from": str(src), "to": str(dst)})
@@ -341,13 +353,19 @@ async def _copy(request: web.Request) -> web.Response:
     config: Config = request.app[CONFIG_KEY]
     src = _resolve(config, _dec(request, "X-From"), must_exist=True)
     dst = _resolve(config, _dec(request, "X-To"))
-    if (resp := _prepare_dst(dst, request.headers.get("X-Overwrite", "") == "1")):
+    overwrite = request.headers.get("X-Overwrite", "") == "1"
+    if (resp := _prepare_dst(dst, overwrite)):
         return resp
-    try:
+
+    def _do():                       # S5-M6: блокирующее — в поток, не на loop
+        if overwrite:                # чистим приёмник только при overwrite (см. _move)
+            _clear_dst(dst)
         if src.is_dir() and not src.is_symlink():
             shutil.copytree(src, dst)
         else:
             shutil.copy2(src, dst)
+    try:
+        await asyncio.to_thread(_do)
     except OSError as e:
         raise web.HTTPBadRequest(text=str(e))
     log.info("file.copy", **{"from": str(src), "to": str(dst)})
@@ -360,11 +378,13 @@ async def _rm(request: web.Request) -> web.Response:
     # Запрет на снос потолка обзора и «домашнего» корня проектов.
     if p == _browse_root(config) or p == config.projects_root:
         raise web.HTTPForbidden(text="refuse to delete root")
-    try:
+    def _do():                       # S5-M6: rmtree крупной папки — в поток
         if p.is_dir() and not p.is_symlink():
             shutil.rmtree(p)
         else:
             p.unlink()
+    try:
+        await asyncio.to_thread(_do)
     except OSError as e:
         raise web.HTTPBadRequest(text=str(e))
     log.info("file.rm", path=str(p))
