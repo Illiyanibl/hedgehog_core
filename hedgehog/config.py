@@ -76,6 +76,12 @@ class Config:
     # через docker CLI + socket-proxy. Один общий инстанс на сервер, opt-in.
     neko_image: str = field(default_factory=lambda: os.environ.get(
         "HEDGEHOG_NEKO_IMAGE", "ghcr.io/illiyanibl/devolution-neko:latest"))
+    # S5-M7: образ для ПРИВИЛЕГИРОВАННОГО one-shot swap (nsenter в PID1 хоста).
+    # НЕ neko-образ: компрометация часто-обновляемого CI-тега = root на хосте.
+    # Минимальный доверенный alpine (busybox даёт nsenter; сам swap-скрипт идёт
+    # бинарями ХОСТА через nsenter -m, образу нужен лишь nsenter).
+    neko_swap_image: str = field(default_factory=lambda: os.environ.get(
+        "HEDGEHOG_NEKO_SWAP_IMAGE", "alpine:3"))
     # Порт HTTPS/WSS-сигналинга neko (TLS терминирует сам neko нашим сертом).
     neko_https_port: int = field(default_factory=lambda: int(
         os.environ.get("HEDGEHOG_NEKO_PORT", "8766")))

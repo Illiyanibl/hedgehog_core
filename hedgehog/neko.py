@@ -21,6 +21,7 @@ import json
 import secrets
 import socket
 import subprocess
+import threading
 from dataclasses import dataclass, asdict
 from pathlib import Path
 
@@ -38,6 +39,11 @@ TLS_VOLUME = "hedgehog-neko-tls"
 # держим его в отдельной сети, куда не попадают caddy/edge-приложения, иначе
 # любой со-сетевой контейнер угнал бы браузер (живые сессии пользователя).
 NETWORK = "hedgehog-neko-net"
+
+# S5-M2: provision/teardown зовутся через asyncio.to_thread (несколько
+# get_neko/install_neko параллельно) → сериализуем, иначе два потока
+# интерливят rename/rm/run и рвут контейнер. Lock (не asyncio) — операции в потоках.
+_provision_lock = threading.Lock()
 
 
 @dataclass
@@ -161,7 +167,7 @@ def _seed_tls_volume(config: Config) -> bool:
     for name, data in (("cert.pem", cert), ("key.pem", key)):
         code, out = _run(
             ["docker", "run", "--rm", "-i", "-v", f"{TLS_VOLUME}:/tls",
-             "alpine", "sh", "-c", f"cat > /tls/{name}"],
+             config.neko_swap_image, "sh", "-c", f"cat > /tls/{name}"],
             timeout=60, input_bytes=data)
         if code != 0:
             log.error("neko.tls.seed_failed", file=name, out=out[-200:])
@@ -232,9 +238,12 @@ def _ensure_swap(config: Config) -> None:
         "grep -q '^/swapfile ' /etc/fstab || "
         "echo '/swapfile none swap sw 0 0' >> /etc/fstab"
     )
+    # S5-M7: привилегированный one-shot — на МИНИМАЛЬНОМ доверенном образе
+    # (neko_swap_image=alpine), НЕ на часто-обновляемом neko-образе: иначе
+    # компрометация его тега = root на хосте (--privileged --pid=host + nsenter PID1).
     code, out = _run([
         "docker", "run", "--rm", "--privileged", "--pid=host",
-        config.neko_image,
+        config.neko_swap_image,
         "nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--",
         "sh", "-c", script,
     ], timeout=120)
@@ -277,7 +286,14 @@ def status(config: Config) -> NekoResult:
 
 
 def provision(config: Config) -> NekoResult:
-    """Идемпотентно поднять neko. Блокирующая — звать через asyncio.to_thread."""
+    """Идемпотентно поднять neko. Блокирующая — звать через asyncio.to_thread.
+    S5-M2: сериализовано _provision_lock — параллельные install_neko/get_neko не
+    интерливят rename/rm/run."""
+    with _provision_lock:
+        return _provision_locked(config)
+
+
+def _provision_locked(config: Config) -> NekoResult:
     if not _docker_ok():
         _set_stage(STAGE_ERROR)
         return NekoResult(ok=False, status="error", stage=STAGE_ERROR,
@@ -318,7 +334,10 @@ def provision(config: Config) -> NekoResult:
     if code != 0:
         _set_stage(STAGE_ERROR)
         if recreate:
-            # откат на рабочий старый
+            # откат на рабочий старый. S5-M1: упавший `docker run --name CONTAINER`
+            # (без --rm) мог оставить труп Created/Exited под этим именем → снимаем
+            # его ДО rename-back, иначе rename провалится и старый не вернётся.
+            _run(["docker", "rm", "-f", CONTAINER], timeout=60)
             _run(["docker", "rename", f"{CONTAINER}-old", CONTAINER], timeout=60)
             _run(["docker", "start", CONTAINER], timeout=60)
             return NekoResult(ok=False, status="error", stage=STAGE_ERROR,
@@ -340,7 +359,8 @@ def provision(config: Config) -> NekoResult:
 
 
 def teardown(config: Config) -> NekoResult:
-    _run(["docker", "rm", "-f", CONTAINER], timeout=60)
-    _set_stage(STAGE_IDLE)
-    return NekoResult(ok=True, status="absent", stage=STAGE_IDLE,
-                      message="neko удалён")
+    with _provision_lock:            # S5-M2: не пересекаться с идущим provision
+        _run(["docker", "rm", "-f", CONTAINER], timeout=60)
+        _set_stage(STAGE_IDLE)
+        return NekoResult(ok=True, status="absent", stage=STAGE_IDLE,
+                          message="neko удалён")
