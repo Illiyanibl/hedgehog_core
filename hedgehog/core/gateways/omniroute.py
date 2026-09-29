@@ -115,6 +115,12 @@ def build_catalog(raw_models: list[dict]) -> dict[str, Any]:
         owner = (m.get("owned_by") or "").strip() or "unknown"
         if m.get("type") == "video" or owner in VIDEO_OWNERS:   # не для чат-CLI
             continue
+        # M/L: дедуп по полному id (с учётом no-think — это разные модели) ДО
+        # создания группы. Иначе дубль id под ДРУГИМ owner заводил бы пустую
+        # группу+order (пустой заголовок провайдера в UI).
+        if mid in seen_ids:
+            continue
+        seen_ids.add(mid)
         ns = _namespace(mid)              # префикс id (для показа у модели)
         base_id, no_think = _strip_nothink(mid)
         is_builtin = owner in BUILTIN_OWNERS
@@ -123,10 +129,6 @@ def build_catalog(raw_models: list[dict]) -> dict[str, Any]:
             groups[provider_id] = []
             if not is_builtin:
                 order.append(provider_id)
-        # дедуп по полному id (с учётом no-think — это разные модели)
-        if mid in seen_ids:
-            continue
-        seen_ids.add(mid)
         name = _clean_name(m, ns)
         if no_think:
             name = f"{name} · no-think"
