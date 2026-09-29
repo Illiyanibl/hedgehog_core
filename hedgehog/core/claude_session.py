@@ -311,6 +311,11 @@ class ClaudeSession:
         # Взводится ридером на каждом ResultMessage — _turn ждёт его как «ход
         # завершён». Чистится перед каждым query().
         self._turn_done = asyncio.Event()
+        # §btw-interrupt (M1): запрос на прерыв ТЕКУЩЕГО хода. handle_user_msg лишь
+        # взводит его (при занятом агенте), а прерывает САМ воркер в _turn — так
+        # прямой interrupt() не «попадёт» на стыке ходов в ход нашего же только что
+        # начатого сообщения. Событие чистится на старте каждого хода.
+        self._interrupt_evt = asyncio.Event()
         # Причина выхода ридера (крах CLI/закрытие потока) — прокидываем в _turn,
         # чтобы _run отработал разбор auth/crash + свежий коннект.
         self._reader_error: BaseException | None = None
@@ -411,9 +416,12 @@ class ClaudeSession:
         """
         await self.start()
         await self._queue.put(content)
-        # A1: сообщение при занятом агенте прерывает текущий ход (кроме §defer).
-        if interrupt and self._busy and self._client is not None:
-            await self._interrupt_current()
+        # A1 (M1): агент занят ходом → просим воркер прервать ТЕКУЩИЙ ход. НЕ зовём
+        # interrupt() здесь: на стыке ходов прямой вызов мог оборвать ход нашего же
+        # только что начатого сообщения (гонка). Воркер прерывает свой ход сам и
+        # чистит событие на старте хода → «своё» не рвётся.
+        if interrupt and self._busy:
+            self._interrupt_evt.set()
         await self._emit_status()  # idle→busy при первом сообщении
         return False
 
@@ -435,6 +443,31 @@ class ClaudeSession:
         except Exception as e:  # noqa: BLE001
             log.warning("agent.interrupt_failed", chat=self.meta.chatId,
                         err=repr(e))
+
+    async def _await_result_or_interrupt(self) -> None:
+        """M1: ждать ResultMessage текущего хода (_turn_done); если во время хода
+        пришло новое сообщение (_interrupt_evt), прерываем ИМЕННО этот ход —
+        interrupt() зовётся из воркера, привязан к его текущему ходу, без гонки
+        «оборвать своё же только что начатое». Прерванный ход отдаст свой
+        ResultMessage → _turn_done → выходим."""
+        while not self._turn_done.is_set():
+            done = asyncio.ensure_future(self._turn_done.wait())
+            intr = asyncio.ensure_future(self._interrupt_evt.wait())
+            try:
+                await asyncio.wait({done, intr},
+                                   return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                done.cancel()
+                intr.cancel()
+            if self._turn_done.is_set():
+                # Могли проснуться и по _interrupt_evt тоже — оставить его
+                # взведённым безопасно ТОЛЬКО пока действует инвариант «evt взведён
+                # ⇒ сообщение уже в очереди ⇒ следующий _turn очистит его на старте»
+                # (единственный сеттер — handle_user_msg, кладёт в очередь ДО set).
+                return
+            if self._interrupt_evt.is_set():
+                self._interrupt_evt.clear()
+                await self._interrupt_current()   # прерываем ТЕКУЩИЙ ход воркера
 
     async def request(self, frame_type: str, payload: dict[str, Any], *,
                       timeout: float | None = None) -> str:
@@ -1448,9 +1481,12 @@ class ClaudeSession:
         self._turn_auth_needed = False
         self._turn_rate_limited = False
         self._turn_done.clear()
+        # M1: окно прерывания начинается с ЭТОГО хода — стухший запрос (message
+        # пришёл до старта хода) не должен оборвать только что начатое сообщение.
+        self._interrupt_evt.clear()
         self._awaiting_result += 1     # ждём ResultMessage этого хода (BUG2-диаг)
         await client.query(prompt)
-        await self._turn_done.wait()
+        await self._await_result_or_interrupt()
         # Настоящий слёт авторизации приходит ОШИБОЧНЫМ ResultMessage
         # (is_error=True) — диспетчер выставил _turn_auth_needed. Проверяем ДО
         # _reader_error: на ошибочном результате труба SDK ещё и кидает
