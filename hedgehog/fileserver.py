@@ -27,6 +27,7 @@ percent-encoded UTF-8 (заголовки HTTP латиница) → серве�
 from __future__ import annotations
 
 import asyncio
+import hmac
 import mimetypes
 import os
 import re
@@ -101,7 +102,13 @@ def compose_prompt(content: str, resolved: list[dict]) -> str:
 
 @web.middleware
 async def _auth_mw(request: web.Request, handler):
-    if request.headers.get("Authorization", "") != f"Bearer {request.app[TOKEN_KEY]}":
+    # L: constant-time сравнение Bearer (hmac.compare_digest, по байтам) — без
+    # тайминг-оракула для подбора токена. surrogateescape: заголовок декодится
+    # aiohttp с surrogateescape (лон-суррогаты на битых байтах); strict .encode()
+    # бросил бы UnicodeEncodeError → 500 в обход 401+fail2ban-лога (P0-1).
+    got = request.headers.get("Authorization", "").encode("utf-8", "surrogateescape")
+    want = f"Bearer {request.app[TOKEN_KEY]}".encode()
+    if not hmac.compare_digest(got, want):
         # IP атакующего из TCP-пира → auth_failures.log для fail2ban (§security).
         from . import authlog
         authlog.record_failure(request.app[CONFIG_KEY], request.remote,

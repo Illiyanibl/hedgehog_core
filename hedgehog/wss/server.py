@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import hashlib
+import hmac
 import http
 import json
 import time
@@ -485,7 +486,12 @@ class HedgehogServer:
         if path != WS_PATH:
             return connection.respond(http.HTTPStatus.NOT_FOUND, "not found\n")
         auth = request.headers.get("Authorization", "")
-        if auth != f"Bearer {self.token}":
+        # L: сравнение constant-time (hmac.compare_digest) — не даём тайминг-оракул
+        # для подбора токена. Клиентский заголовок декодится с surrogateescape
+        # (лон-суррогаты на битых байтах) → кодируем ИМ ЖЕ, иначе strict .encode()
+        # бросил бы UnicodeEncodeError → 500 в обход 401+fail2ban-лога (P0-1).
+        got = auth.encode("utf-8", "surrogateescape")
+        if not hmac.compare_digest(got, f"Bearer {self.token}".encode()):
             # IP атакующего — из TCP-пира (не из X-Forwarded-For: порт торчит
             # напрямую). Пишем в auth_failures.log для fail2ban (§security).
             peer = connection.remote_address
