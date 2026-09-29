@@ -122,6 +122,9 @@ class HedgehogServer:
         # авторизации (и при пустом кэше) → немедленное обновление вне суток.
         self._models_refresh_now = asyncio.Event()
         self._models_task: asyncio.Task | None = None
+        # L: держим ссылку на задачу рестарта — иначе GC мог бы её собрать до
+        # execv (update вернул ok, а рестарта нет).
+        self._restart_task: asyncio.Task | None = None
         # Текущая one-shot проба (для отмены при входящем user_msg — не держим
         # второй CLI-процесс во время хода, §models M1) + троттлинг проб (M2).
         self._models_probe_task: asyncio.Task | None = None
@@ -325,10 +328,10 @@ class HedgehogServer:
         self._cancel_models_probe()       # осиротевшую пробу тоже гасим
         if self._models_task is not None:
             self._models_task.cancel()
-            try:
-                await self._models_task
-            except (asyncio.CancelledError, Exception):
-                pass
+            # L: gather(return_exceptions) поглощает CancelledError/исключение
+            # САМОЙ задачи, но пробрасывает отмену НАШЕГО shutdown (как у probe
+            # ниже) — прежний `except (CancelledError, Exception)` глотал и её.
+            await asyncio.gather(self._models_task, return_exceptions=True)
             self._models_task = None
         if probe is not None:             # дожать отменённую пробу (без warning)
             await asyncio.gather(probe, return_exceptions=True)
@@ -359,6 +362,7 @@ class HedgehogServer:
     _MODELS_RETRY = 120          # переспрос, если проба отложена (агент занят)
     _MODELS_MIN_INTERVAL = 60    # троттлинг: не чаще одной пробы CLI в минуту
     _OMNI_CATALOG_TTL = 300      # §omni: кэш каталога шлюза (5 мин)
+    _OMNI_CATALOG_MAX = 32       # L: потолок записей кэша (не растёт бесконечно)
 
     async def _models_refresh_loop(self) -> None:
         """Раз в сутки (и по событию смены авторизации) обновляет кэш моделей.
@@ -802,7 +806,6 @@ class HedgehogServer:
         self._updating = True
         restarting = False
         try:
-            from .. import updater
             result = await asyncio.to_thread(updater.pull_latest,
                                              _SERVER_COMMIT)
             await self.hub.send_global(conn_id, make_frame("update_result", {
@@ -828,7 +831,8 @@ class HedgehogServer:
                         # явного лога это было бы тихим unhandled-task exc.
                         log.error("update.restart_failed", err=repr(e))
                         self._updating = False   # разлатчиваем — рестарт не идёт
-                asyncio.create_task(_restart())
+                # L: держим ссылку (иначе GC может собрать задачу до execv).
+                self._restart_task = asyncio.create_task(_restart())
         finally:
             if not restarting:
                 self._updating = False
@@ -983,6 +987,8 @@ class HedgehogServer:
     async def _h_set_mode(self, conn_id, frame, p, meta):
         updated = self.store.update_meta(
             frame.chatId, permission_mode=p.permission_mode)
+        if updated is None:   # L: чат исчез (конкурентный delete) → vars(None)
+            return
         # Стопаем сессию — новый режим применится при следующем user_msg.
         await self._stop_session(frame.chatId)
         log.info("chat.mode_changed", chat=frame.chatId,
@@ -1000,6 +1006,8 @@ class HedgehogServer:
             ch for ch in (p.model or "").strip() if ch.isprintable()
         ) or None
         updated = self.store.update_meta(frame.chatId, model=new_model)
+        if updated is None:   # L: чат исчез (конкурентный delete) → vars(None)
+            return
         await self._stop_session(frame.chatId)
         log.info("chat.model_changed", chat=frame.chatId, model=new_model)
         await self.hub.broadcast_global(
@@ -1117,6 +1125,8 @@ class HedgehogServer:
             current = [s for s in current if s not in group]
         updated = self.store.update_meta(
             frame.chatId, skills=(current or None))
+        if updated is None:   # L: чат исчез (конкурентный delete) → vars(None)
+            return
         await self._stop_session(frame.chatId)
         log.info("chat.skill_group_changed", chat=frame.chatId,
                  source=p.source, enabled=p.enabled,
@@ -1157,6 +1167,8 @@ class HedgehogServer:
         self.mcp.add(p.name, self._mcp_config(p))
         enabled = list(dict.fromkeys(list(meta.mcp or []) + [p.name]))
         updated = self.store.update_meta(frame.chatId, mcp=enabled)
+        if updated is None:   # L: чат исчез (конкурентный delete) → vars(None)
+            return
         await self._stop_session(frame.chatId)  # применить новый MCP
         log.info("chat.mcp_added", chat=frame.chatId, name=p.name,
                  transport=p.transport)
@@ -1172,6 +1184,8 @@ class HedgehogServer:
         else:
             current = [n for n in current if n != p.name]
         updated = self.store.update_meta(frame.chatId, mcp=current)
+        if updated is None:   # L: чат исчез (конкурентный delete) → vars(None)
+            return
         await self._stop_session(frame.chatId)  # рестарт агента
         log.info("chat.mcp_enabled", chat=frame.chatId, name=p.name,
                  enabled=p.enabled)
@@ -1184,6 +1198,8 @@ class HedgehogServer:
         self.mcp.remove(p.name)
         current = [n for n in (meta.mcp or []) if n != p.name]
         updated = self.store.update_meta(frame.chatId, mcp=current)
+        if updated is None:   # L: чат исчез (конкурентный delete) → vars(None)
+            return
         await self._stop_session(frame.chatId)
         log.info("chat.mcp_removed", chat=frame.chatId, name=p.name)
         await self.hub.broadcast_global(make_frame("chat_updated", vars(updated)))
@@ -2103,7 +2119,20 @@ class HedgehogServer:
             return {"ok": False, "error": str(e), "providers": []}
         data = {"ok": True, **cat}
         self._omni_catalog_cache[key] = (now, data)
+        self._evict_omni_cache(now)
         return copy.deepcopy(data)
+
+    def _evict_omni_cache(self, now: float) -> None:
+        """L: не даём кэшу каталога расти без предела — сначала выкидываем
+        просроченные, затем (если всё ещё выше потолка) самые старые."""
+        cache = self._omni_catalog_cache
+        for k in [k for k, (ts, _) in cache.items()
+                  if now - ts >= self._OMNI_CATALOG_TTL]:
+            del cache[k]
+        if len(cache) > self._OMNI_CATALOG_MAX:
+            for k in sorted(cache, key=lambda k: cache[k][0])[
+                    :len(cache) - self._OMNI_CATALOG_MAX]:
+                del cache[k]
 
     def _save_omniroute_models(self, p) -> tuple[bool, str | None]:
         """§omni шаг 1: сохранить выбор моделей в активный omniroute-конфиг
