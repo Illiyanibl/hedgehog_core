@@ -555,296 +555,79 @@ class HedgehogServer:
                 Err.INTERNAL, f"{type(e).__name__}: {e}",
                 chat_id=frame.chatId, related=frame.id))
 
+    # P3: диспетчеризация фреймов по таблицам (было — if-цепочка ~760 строк).
+    # Системные (без чата) → _SYS_ROUTES; чат-скоупные (после резолва meta) →
+    # _CHAT_ROUTES. Порядок сохранён: сперва системные, затем meta+CHAT_NOT_FOUND.
+    _SYS_ROUTES = {
+        'ping': '_h_ping',
+        'op_abort': '_h_op_abort',
+        'auth_start': '_h_auth_start',
+        'auth_code': '_h_auth_code',
+        'auth_apikey': '_h_auth_apikey',
+        'auth_omniroute': '_h_auth_omniroute',
+        'omniroute_probe_models': '_h_omniroute_probe_models',
+        'omniroute_set_key': '_h_omniroute_set_key',
+        'omniroute_set_models': '_h_omniroute_set_models',
+        'logout': '_h_logout',
+        'client_log': '_h_client_log',
+        'register_push': '_h_register_push',
+        'update_self': '_h_update_self',
+        'install_neko': '_h_install_neko',
+        'get_neko': '_h_install_neko',
+        'remove_neko': '_h_install_neko',
+        'install_skill': '_h_install_skill',
+        'set_skill_default': '_h_set_skill_default',
+        'list_chats': '_h_list_chats',
+        'list_models': '_h_list_models',
+        'create_chat': '_h_create_chat',
+    }
+    _CHAT_ROUTES = {
+        'delete_chat': '_h_delete_chat',
+        'rename_chat': '_h_rename_chat',
+        'set_mode': '_h_set_mode',
+        'set_model': '_h_set_model',
+        'schedule_message': '_h_schedule_message',
+        'cancel_scheduled': '_h_cancel_scheduled',
+        'list_scheduled': '_h_list_scheduled',
+        'list_skills': '_h_list_skills',
+        'set_skill_group': '_h_set_skill_group',
+        'restart_agent': '_h_restart_agent',
+        'clear_session': '_h_clear_session',
+        'list_mcp': '_h_list_mcp',
+        'add_mcp': '_h_add_mcp',
+        'set_mcp_enabled': '_h_set_mcp_enabled',
+        'remove_mcp': '_h_remove_mcp',
+        'get_limits': '_h_get_limits',
+        'subscribe_chat': '_h_subscribe_chat',
+        'unsubscribe_chat': '_h_unsubscribe_chat',
+        'get_log': '_h_get_log',
+        'get_status': '_h_get_status',
+        'ack': '_h_ack',
+        'resume': '_h_resume',
+        'user_msg': '_h_user_msg',
+        'pty_write': '_h_pty_write',
+        'pty_resize': '_h_pty_write',
+        'ui_event': '_h_ui_event',
+        'ui_list': '_h_ui_list',
+        'ui_reopen': '_h_ui_reopen',
+        'ui_forget': '_h_ui_forget',
+        'ui_closed': '_h_ui_closed',
+        'ui_call': '_h_ui_call',
+        'ui_new_blank': '_h_ui_new_blank',
+        'ui_draw_apply': '_h_ui_draw_apply',
+        'ui_draw_clear': '_h_ui_draw_clear',
+        'permission_response': '_h_permission_response',
+        'picker_response': '_h_permission_response',
+        'ui_response': '_h_permission_response',
+    }
+
     async def _route(self, conn_id: int, frame: ClientFrame):
         ftype = frame.type
         p = frame.payload
-
-        # --- системные ---
-        if ftype == "ping":
-            # §obs (time-sync): кладём серверную метку в pong. Клиент помнит
-            # свой t0 и ловит t2 → offset = server_ts − (t0+t2)/2, RTT = t2−t0.
-            # Так серверные ts кадров переводятся в клиентскую шкалу.
-            await self.hub.send_global(
-                conn_id, make_frame("pong", {"server_ts": time.time()}))
+        name = self._SYS_ROUTES.get(ftype)
+        if name is not None:
+            await getattr(self, name)(conn_id, frame, p)
             return
-        if ftype == "op_abort":
-            # §netwait: прервать долгую операцию (login/omni/apikey), opId = id
-            # инициировавшего фрейма. Любой клиент (для глобального login).
-            await self._handle_op_abort(p.opId)
-            return
-        if ftype == "auth_start":
-            # §netwait: single-flight — если флоу уже идёт, auth.start() лишь
-            # пере-шлёт ссылку; новые таймеры ставим ТОЛЬКО на реально новый флоу.
-            was_running = self.auth.running
-            await self.auth.start()
-            if not was_running and self.auth.running:
-                self._start_login_timers(frame.id, conn_id, "start")
-            return
-        if ftype == "auth_code":
-            if not await self.auth.submit_code(p.code):
-                # Единый путь у клиента: неуспех — тоже auth_result.
-                await self.hub.send_global(conn_id, make_frame(
-                    "auth_result",
-                    {"ok": False, "error": "no auth flow in progress"}))
-                return
-            # §netwait: ждём auth_result по коду (обмен кода на токен — сеть).
-            self._start_login_timers(frame.id, conn_id, "code")
-            return
-        if ftype == "auth_apikey":
-            # §altauth: активировать прямой API-ключ (заголовок x-api-key).
-            async def _op_apikey():
-                ok, err = await self._activate_apikey(
-                    p.api_key, p.base_url, frame.id)
-                return "auth_result", {"ok": ok, "error": err}
-            self._spawn_tracked(
-                conn_id, frame.id, "auth_apikey", _op_apikey())
-            return
-        if ftype == "auth_omniroute":
-            # §altauth: активировать шлюз (ключ + base_url + выбранные модели).
-            async def _op_omni():
-                ok, err = await self._activate_omniroute(p, frame.id)
-                return "auth_result", {"ok": ok, "error": err}
-            self._spawn_tracked(
-                conn_id, frame.id, "omni_activate", _op_omni())
-            return
-        if ftype == "omniroute_probe_models":
-            # §omni шаг 1: каталог моделей шлюза. Ключ пуст → берём сохранённый
-            # (редактирование без ввода ключа), но ТОЛЬКО на сохранённый base_url:
-            # не отправляем секрет на произвольный клиентский URL (Fable SF1).
-            base = (p.base_url or "").strip()
-            key = (p.api_key or "").strip()
-            if not key:
-                auth = self.config.load_auth_config()
-                if auth.get("mode") == "omniroute":
-                    stored_base = auth.get("base_url", "")
-                    if not base or base == stored_base:
-                        base = base or stored_base
-                        key = auth.get("api_key", "")
-            if not base or not key:
-                # §netwait L2: мгновенный отказ — op не регистрируем.
-                await self.hub.send_global(conn_id, make_frame(
-                    "omniroute_catalog",
-                    {"ok": False, "error": "нет base_url/ключа",
-                     "providers": [], "cliType": p.cliType,
-                     "related": frame.id}))
-                return
-            cli = p.cliType
-
-            async def _op_probe():
-                data = await self._omniroute_catalog(base, key)
-                data["cliType"] = cli
-                return "omniroute_catalog", data
-            self._spawn_tracked(
-                conn_id, frame.id, "omni_probe", _op_probe())
-            return
-        if ftype == "omniroute_set_key":
-            # §omni: сменить только ключ активного omniroute (модели сохраняются).
-            async def _op_setkey():
-                ok, err = await self._set_omniroute_key(p.api_key, frame.id)
-                return "omniroute_set_result", {"ok": ok, "error": err}
-            self._spawn_tracked(
-                conn_id, frame.id, "omni_setkey", _op_setkey())
-            return
-        if ftype == "omniroute_set_models":
-            # §omni шаг 1: сохранить выбор моделей (без тир-лимита — режет клиент).
-            ok, err = self._save_omniroute_models(p)
-            if ok:
-                self._reset_all_chat_models()   # выбор мог протухнуть (§models L2)
-                await self._restart_claude_sessions()
-                self._invalidate_models_cache()
-            await self.hub.send_global(conn_id, make_frame(
-                "omniroute_set_result", {"ok": ok, "error": err}))
-            return
-        if ftype == "logout":
-            # §13: разлогин. /logout в SDK не работает (интерактивная
-            # команда), поэтому удаляем сохранённый OAuth-токен и пересоздаём
-            # claude-сессии. Следующий user_msg → AUTH_REQUIRED → auth-флоу.
-            # M: если прямо сейчас идёт OAuth-флоу — гасим его ДО unlink, иначе он
-            # дожуёт код и запишет токен уже ПОСЛЕ разлогина (broadcast ok). stop()
-            # отменяет задачу флоу до удаления файла → сохранения после нет.
-            if self.auth.running or self._login_op is not None:
-                await self._abort_login("logged out")
-            try:
-                self.config.oauth_token_file.unlink(missing_ok=True)
-            except OSError as e:
-                log.warning("auth.logout_unlink_failed", err=str(e))
-            # §altauth: разлогин сбрасывает и альт-способ (API-ключ/OmniRoute).
-            self.config.clear_auth_config()
-            self._reset_all_chat_models()    # §models L2: выбор мог протухнуть
-            for chat_id, session in list(self.sessions.items()):
-                if isinstance(session, ClaudeSession):
-                    await self._stop_session(chat_id)
-            self._invalidate_models_cache()   # §models: сбросить/переобновить
-            log.info("auth.logout")
-            return
-        if ftype == "client_log":
-            self._append_client_log(p.text)
-            return
-        if ftype == "register_push":
-            # §push: запомнить notifyKey устройства (секрет отправки) — по нему
-            # попросим релей отправить APNs-пуш, когда устройство будет оффлайн.
-            # deviceId привязываем к соединению → знаем, какие устройства онлайн
-            # (получат напрямую по WS) и каким нужен пуш (per-device маршрутизация).
-            self.push_keys.remember(p.notifyKey, p.deviceId)
-            self.hub.set_device(conn_id, p.deviceId)
-            return
-        if ftype == "update_self":
-            # §15: git pull своего исходника + перезапуск. Авторизация — тем же
-            # токеном, что и WS (SSH не нужен). Работает для серверов,
-            # добавленных только по порту Ёжика.
-            # M4: single-flight — параллельный вызов не запускает 2× git reset/
-            # pip/execv (проверка+взвод атомарны: между ними нет await).
-            if self._updating:
-                await self.hub.send_global(conn_id, make_frame("update_result", {
-                    "ok": False, "changed": False, "old": "", "new": "",
-                    "message": "обновление уже идёт"}))
-                return
-            self._updating = True
-            restarting = False
-            try:
-                from .. import updater
-                result = await asyncio.to_thread(updater.pull_latest,
-                                                 _SERVER_COMMIT)
-                await self.hub.send_global(conn_id, make_frame("update_result", {
-                    "ok": result.ok,
-                    "changed": result.changed,
-                    "old": result.old,
-                    "new": result.new,
-                    "message": result.message,
-                }))
-                log.info("update.self", ok=result.ok, changed=result.changed,
-                         old=result.old, new=result.new)
-                if result.ok and result.changed:
-                    restarting = True   # процесс сменится — флаг НЕ снимаем
-                    async def _restart():
-                        await asyncio.sleep(1.0)  # дать update_result долететь
-                        log.info("update.restart", to=result.new)
-                        try:
-                            updater.restart_in_place()   # execv — не возвращается
-                        except Exception as e:  # noqa: BLE001
-                            # execv упал: диск на новом SHA, но процесс на старом.
-                            # Повтор update_self теперь вернёт changed=True (S6-M5:
-                            # диск ≠ SHA процесса) и рестарт будет повторён. Без
-                            # явного лога это было бы тихим unhandled-task exc.
-                            log.error("update.restart_failed", err=repr(e))
-                            self._updating = False   # разлатчиваем — рестарт не идёт
-                    asyncio.create_task(_restart())
-            finally:
-                if not restarting:
-                    self._updating = False
-            return
-        if ftype in ("install_neko", "get_neko", "remove_neko"):
-            # §17: Neko-браузер. Провижининг/снос — блокирующий docker I/O в
-            # отдельном потоке. Авторизация — тем же токеном, что WS (без SSH).
-            from .. import neko
-            if ftype == "install_neko":
-                result = await asyncio.to_thread(neko.provision, self.config)
-            elif ftype == "remove_neko":
-                result = await asyncio.to_thread(neko.teardown, self.config)
-            else:
-                result = await asyncio.to_thread(neko.status, self.config)
-            await self.hub.send_global(conn_id, make_frame("neko_result", {
-                "ok": result.ok,
-                "status": result.status,
-                "message": result.message,
-                "https_port": result.https_port,
-                "user_password": result.user_password,
-                "server_ip": result.server_ip,
-                "mcp_port": result.mcp_port,
-                "ai_control": result.ai_control,
-                "stage": result.stage,
-            }))
-            log.info("neko." + ftype, ok=result.ok, status=result.status)
-            return
-        if ftype == "install_skill":
-            # Установка скиллов из git-репо (§skills v2). Сетевой I/O —
-            # в отдельном потоке, чтобы не блокировать event loop. Клиент
-            # доверие подтверждает у себя (тумблер) — сервер просто ставит.
-            try:
-                result = await asyncio.to_thread(
-                    self.skill_sources.install, p.url, p.default_for_new)
-                log.info("skills.install_ok", url=p.url,
-                         source=result["source"], count=len(result["skills"]))
-                await self.hub.send_global(conn_id, make_frame(
-                    "install_skill_result", {"ok": True, **result}))
-            except SkillInstallError as e:
-                await self.hub.send_global(conn_id, make_frame(
-                    "install_skill_result", {"ok": False, "error": str(e)}))
-            except Exception as e:  # noqa: BLE001
-                log.warning("skills.install_fail", url=p.url, err=repr(e))
-                await self.hub.send_global(conn_id, make_frame(
-                    "install_skill_result",
-                    {"ok": False, "error": f"{type(e).__name__}: {e}"}))
-            return
-        if ftype == "set_skill_default":
-            ok = self.skill_sources.set_default_for_new(p.source, p.default_for_new)
-            log.info("skills.default_changed", source=p.source,
-                     default_for_new=p.default_for_new, ok=ok)
-            await self.hub.send_global(conn_id, make_frame(
-                "skill_default_result",
-                {"ok": ok, "source": p.source,
-                 "default_for_new": p.default_for_new}))
-            return
-        if ftype == "list_chats":
-            chats = []
-            for m in self.store.list():
-                entry = vars(m) | self._chat_status(m.chatId)
-                chats.append(entry)
-            await self.hub.send_global(conn_id, make_frame("chat_list", {"chats": chats}))
-            return
-        if ftype == "list_models":
-            # §models/§cli-types: отдаём кэш нужного типа CLI МГНОВЕННО (CLI не
-            # дёргаем). Неизвестный тип → UNSUPPORTED; нет кэша → PENDING + будим
-            # фоновый рефрешер.
-            cli_type = p.cliType
-            if cli_type not in models.KNOWN_CLI_TYPES:
-                data = {"cliType": cli_type, "models": [], "current": None,
-                        "raw": "", "auth_state": "UNSUPPORTED",
-                        "cli_present": False, "updated_at": 0}
-            elif (omni := self._omniroute_models_list(cli_type)) is not None:
-                # §omni: при omniroute-авторизации источник — ВЫБРАННЫЕ модели
-                # (шаг 1), а не CLI-проба. Тир-лимит (первые N) применяет клиент.
-                data = omni
-            else:
-                data = models.load_cache(self.config, cli_type)
-                if data is None:
-                    data = {"cliType": cli_type, "models": [], "current": None,
-                            "raw": "", "auth_state": "PENDING",
-                            "cli_present": None, "updated_at": 0}
-                    self._models_refresh_now.set()
-            await self.hub.send_global(
-                conn_id, make_frame("models_list", data))
-            return
-        if ftype == "create_chat":
-            # cwd задан клиентом → используем его. Иначе, если сервер знает
-            # базу проектов (default_cwd, напр. /root/projects), заводим
-            # ПАПКУ ПОД ЧАТ по имени: <base>/<slug> (§3.7). Без базы — свой
-            # изолированный каталог data/chats/<id>.
-            # Сидируем новый чат скиллами групп с флагом default_for_new
-            # (§skills v2). Только для агентских чатов.
-            seed_skills = None
-            if p.addressee == "claude":
-                seed_skills = self.skill_sources.new_chat_skill_names() or None
-            # §cli-types: неизвестный тип клампим к дефолту — meta не должна
-            # врать о типе (сессию по нему поднимаем; сейчас всегда claude).
-            cli_type = (p.cliType if p.cliType in models.KNOWN_CLI_TYPES
-                        else models.DEFAULT_CLI_TYPE)
-            if cli_type != p.cliType:
-                log.warning("chat.clitype_unknown", requested=p.cliType,
-                            fallback=cli_type)
-            meta = self.store.create(
-                p.name, p.addressee, p.cwd,
-                mcp=p.mcp, permission_mode=p.permission_mode,
-                log_kb=p.log_kb, skills=seed_skills,
-                cli_type=cli_type,
-                projects_base=self.config.default_cwd)
-            log.info("chat.created", chat=meta.chatId, name=meta.name,
-                     addressee=meta.addressee, cwd=meta.cwd, mcp=meta.mcp,
-                     permission_mode=meta.permission_mode, log_kb=meta.log_kb,
-                     skills=seed_skills or [])
-            await self.hub.broadcast_global(make_frame("chat_created", vars(meta)))
-            return
-
         # --- чат-скоупные: чат обязан существовать ---
         meta = self.store.get(frame.chatId)
         if meta is None:
@@ -852,547 +635,856 @@ class HedgehogServer:
                 Err.CHAT_NOT_FOUND, f"Chat {frame.chatId} does not exist",
                 chat_id=frame.chatId, related=frame.id))
             return
-
-        if ftype == "delete_chat":
-            # S1-M: метим «удаляется» ДО _stop_session — окно между стопом и
-            # store.delete иначе даёт гонку воскрешения (см. _ensure_session).
-            self._deleting.add(frame.chatId)
-            try:
-                # Сессия закрывается всегда; рабочая папка (cwd) — по флагу.
-                await self._stop_session(frame.chatId)
-                self.store.delete(frame.chatId, delete_cwd=p.delete_cwd,
-                                  projects_base=self.config.default_cwd)
-                views_registry.clear_chat(self.config.data_dir, frame.chatId)  # §views
-                handlers_registry.clear_chat(self.config.data_dir, frame.chatId)  # §handlers
-                if self.scheduler is not None:   # §defer: не оставляем осиротевшие jobs
-                    await self.scheduler.purge_chat(frame.chatId)
-                log.info("chat.deleted", chat=frame.chatId, delete_cwd=p.delete_cwd)
-                await self.hub.broadcast_global(
-                    make_frame("chat_deleted", {"chatId": frame.chatId}))
-            finally:
-                self._deleting.discard(frame.chatId)
+        name = self._CHAT_ROUTES.get(ftype)
+        if name is not None:
+            await getattr(self, name)(conn_id, frame, p, meta)
             return
+        raise AssertionError(  # защита от рассинхрона с protocol.py
+            f"unrouted frame type {ftype}")
 
-        if ftype == "rename_chat":
-            updated = self.store.update_meta(frame.chatId, name=p.name)
-            log.info("chat.renamed", chat=frame.chatId, name=p.name)
-            if updated is not None:
-                await self.hub.broadcast_global(
-                    make_frame("chat_updated", vars(updated)))
+    async def _h_ping(self, conn_id, frame, p):
+        # §obs (time-sync): кладём серверную метку в pong. Клиент помнит
+        # свой t0 и ловит t2 → offset = server_ts − (t0+t2)/2, RTT = t2−t0.
+        # Так серверные ts кадров переводятся в клиентскую шкалу.
+        await self.hub.send_global(
+            conn_id, make_frame("pong", {"server_ts": time.time()}))
+        return
+
+    async def _h_op_abort(self, conn_id, frame, p):
+        # §netwait: прервать долгую операцию (login/omni/apikey), opId = id
+        # инициировавшего фрейма. Любой клиент (для глобального login).
+        await self._handle_op_abort(p.opId)
+        return
+
+    async def _h_auth_start(self, conn_id, frame, p):
+        # §netwait: single-flight — если флоу уже идёт, auth.start() лишь
+        # пере-шлёт ссылку; новые таймеры ставим ТОЛЬКО на реально новый флоу.
+        was_running = self.auth.running
+        await self.auth.start()
+        if not was_running and self.auth.running:
+            self._start_login_timers(frame.id, conn_id, "start")
+        return
+
+    async def _h_auth_code(self, conn_id, frame, p):
+        if not await self.auth.submit_code(p.code):
+            # Единый путь у клиента: неуспех — тоже auth_result.
+            await self.hub.send_global(conn_id, make_frame(
+                "auth_result",
+                {"ok": False, "error": "no auth flow in progress"}))
             return
+        # §netwait: ждём auth_result по коду (обмен кода на токен — сеть).
+        self._start_login_timers(frame.id, conn_id, "code")
+        return
 
-        if ftype == "set_mode":
-            updated = self.store.update_meta(
-                frame.chatId, permission_mode=p.permission_mode)
-            # Стопаем сессию — новый режим применится при следующем user_msg.
+    async def _h_auth_apikey(self, conn_id, frame, p):
+        # §altauth: активировать прямой API-ключ (заголовок x-api-key).
+        async def _op_apikey():
+            ok, err = await self._activate_apikey(
+                p.api_key, p.base_url, frame.id)
+            return "auth_result", {"ok": ok, "error": err}
+        self._spawn_tracked(
+            conn_id, frame.id, "auth_apikey", _op_apikey())
+        return
+
+    async def _h_auth_omniroute(self, conn_id, frame, p):
+        # §altauth: активировать шлюз (ключ + base_url + выбранные модели).
+        async def _op_omni():
+            ok, err = await self._activate_omniroute(p, frame.id)
+            return "auth_result", {"ok": ok, "error": err}
+        self._spawn_tracked(
+            conn_id, frame.id, "omni_activate", _op_omni())
+        return
+
+    async def _h_omniroute_probe_models(self, conn_id, frame, p):
+        # §omni шаг 1: каталог моделей шлюза. Ключ пуст → берём сохранённый
+        # (редактирование без ввода ключа), но ТОЛЬКО на сохранённый base_url:
+        # не отправляем секрет на произвольный клиентский URL (Fable SF1).
+        base = (p.base_url or "").strip()
+        key = (p.api_key or "").strip()
+        if not key:
+            auth = self.config.load_auth_config()
+            if auth.get("mode") == "omniroute":
+                stored_base = auth.get("base_url", "")
+                if not base or base == stored_base:
+                    base = base or stored_base
+                    key = auth.get("api_key", "")
+        if not base or not key:
+            # §netwait L2: мгновенный отказ — op не регистрируем.
+            await self.hub.send_global(conn_id, make_frame(
+                "omniroute_catalog",
+                {"ok": False, "error": "нет base_url/ключа",
+                 "providers": [], "cliType": p.cliType,
+                 "related": frame.id}))
+            return
+        cli = p.cliType
+
+        async def _op_probe():
+            data = await self._omniroute_catalog(base, key)
+            data["cliType"] = cli
+            return "omniroute_catalog", data
+        self._spawn_tracked(
+            conn_id, frame.id, "omni_probe", _op_probe())
+        return
+
+    async def _h_omniroute_set_key(self, conn_id, frame, p):
+        # §omni: сменить только ключ активного omniroute (модели сохраняются).
+        async def _op_setkey():
+            ok, err = await self._set_omniroute_key(p.api_key, frame.id)
+            return "omniroute_set_result", {"ok": ok, "error": err}
+        self._spawn_tracked(
+            conn_id, frame.id, "omni_setkey", _op_setkey())
+        return
+
+    async def _h_omniroute_set_models(self, conn_id, frame, p):
+        # §omni шаг 1: сохранить выбор моделей (без тир-лимита — режет клиент).
+        ok, err = self._save_omniroute_models(p)
+        if ok:
+            self._reset_all_chat_models()   # выбор мог протухнуть (§models L2)
+            await self._restart_claude_sessions()
+            self._invalidate_models_cache()
+        await self.hub.send_global(conn_id, make_frame(
+            "omniroute_set_result", {"ok": ok, "error": err}))
+        return
+
+    async def _h_logout(self, conn_id, frame, p):
+        # §13: разлогин. /logout в SDK не работает (интерактивная
+        # команда), поэтому удаляем сохранённый OAuth-токен и пересоздаём
+        # claude-сессии. Следующий user_msg → AUTH_REQUIRED → auth-флоу.
+        # M: если прямо сейчас идёт OAuth-флоу — гасим его ДО unlink, иначе он
+        # дожуёт код и запишет токен уже ПОСЛЕ разлогина (broadcast ok). stop()
+        # отменяет задачу флоу до удаления файла → сохранения после нет.
+        if self.auth.running or self._login_op is not None:
+            await self._abort_login("logged out")
+        try:
+            self.config.oauth_token_file.unlink(missing_ok=True)
+        except OSError as e:
+            log.warning("auth.logout_unlink_failed", err=str(e))
+        # §altauth: разлогин сбрасывает и альт-способ (API-ключ/OmniRoute).
+        self.config.clear_auth_config()
+        self._reset_all_chat_models()    # §models L2: выбор мог протухнуть
+        for chat_id, session in list(self.sessions.items()):
+            if isinstance(session, ClaudeSession):
+                await self._stop_session(chat_id)
+        self._invalidate_models_cache()   # §models: сбросить/переобновить
+        log.info("auth.logout")
+        return
+
+    async def _h_client_log(self, conn_id, frame, p):
+        self._append_client_log(p.text)
+        return
+
+    async def _h_register_push(self, conn_id, frame, p):
+        # §push: запомнить notifyKey устройства (секрет отправки) — по нему
+        # попросим релей отправить APNs-пуш, когда устройство будет оффлайн.
+        # deviceId привязываем к соединению → знаем, какие устройства онлайн
+        # (получат напрямую по WS) и каким нужен пуш (per-device маршрутизация).
+        self.push_keys.remember(p.notifyKey, p.deviceId)
+        self.hub.set_device(conn_id, p.deviceId)
+        return
+
+    async def _h_update_self(self, conn_id, frame, p):
+        # §15: git pull своего исходника + перезапуск. Авторизация — тем же
+        # токеном, что и WS (SSH не нужен). Работает для серверов,
+        # добавленных только по порту Ёжика.
+        # M4: single-flight — параллельный вызов не запускает 2× git reset/
+        # pip/execv (проверка+взвод атомарны: между ними нет await).
+        if self._updating:
+            await self.hub.send_global(conn_id, make_frame("update_result", {
+                "ok": False, "changed": False, "old": "", "new": "",
+                "message": "обновление уже идёт"}))
+            return
+        self._updating = True
+        restarting = False
+        try:
+            from .. import updater
+            result = await asyncio.to_thread(updater.pull_latest,
+                                             _SERVER_COMMIT)
+            await self.hub.send_global(conn_id, make_frame("update_result", {
+                "ok": result.ok,
+                "changed": result.changed,
+                "old": result.old,
+                "new": result.new,
+                "message": result.message,
+            }))
+            log.info("update.self", ok=result.ok, changed=result.changed,
+                     old=result.old, new=result.new)
+            if result.ok and result.changed:
+                restarting = True   # процесс сменится — флаг НЕ снимаем
+                async def _restart():
+                    await asyncio.sleep(1.0)  # дать update_result долететь
+                    log.info("update.restart", to=result.new)
+                    try:
+                        updater.restart_in_place()   # execv — не возвращается
+                    except Exception as e:  # noqa: BLE001
+                        # execv упал: диск на новом SHA, но процесс на старом.
+                        # Повтор update_self теперь вернёт changed=True (S6-M5:
+                        # диск ≠ SHA процесса) и рестарт будет повторён. Без
+                        # явного лога это было бы тихим unhandled-task exc.
+                        log.error("update.restart_failed", err=repr(e))
+                        self._updating = False   # разлатчиваем — рестарт не идёт
+                asyncio.create_task(_restart())
+        finally:
+            if not restarting:
+                self._updating = False
+        return
+
+    async def _h_install_neko(self, conn_id, frame, p):
+        ftype = frame.type
+        # §17: Neko-браузер. Провижининг/снос — блокирующий docker I/O в
+        # отдельном потоке. Авторизация — тем же токеном, что WS (без SSH).
+        from .. import neko
+        if ftype == "install_neko":
+            result = await asyncio.to_thread(neko.provision, self.config)
+        elif ftype == "remove_neko":
+            result = await asyncio.to_thread(neko.teardown, self.config)
+        else:
+            result = await asyncio.to_thread(neko.status, self.config)
+        await self.hub.send_global(conn_id, make_frame("neko_result", {
+            "ok": result.ok,
+            "status": result.status,
+            "message": result.message,
+            "https_port": result.https_port,
+            "user_password": result.user_password,
+            "server_ip": result.server_ip,
+            "mcp_port": result.mcp_port,
+            "ai_control": result.ai_control,
+            "stage": result.stage,
+        }))
+        log.info("neko." + ftype, ok=result.ok, status=result.status)
+        return
+
+    async def _h_install_skill(self, conn_id, frame, p):
+        # Установка скиллов из git-репо (§skills v2). Сетевой I/O —
+        # в отдельном потоке, чтобы не блокировать event loop. Клиент
+        # доверие подтверждает у себя (тумблер) — сервер просто ставит.
+        try:
+            result = await asyncio.to_thread(
+                self.skill_sources.install, p.url, p.default_for_new)
+            log.info("skills.install_ok", url=p.url,
+                     source=result["source"], count=len(result["skills"]))
+            await self.hub.send_global(conn_id, make_frame(
+                "install_skill_result", {"ok": True, **result}))
+        except SkillInstallError as e:
+            await self.hub.send_global(conn_id, make_frame(
+                "install_skill_result", {"ok": False, "error": str(e)}))
+        except Exception as e:  # noqa: BLE001
+            log.warning("skills.install_fail", url=p.url, err=repr(e))
+            await self.hub.send_global(conn_id, make_frame(
+                "install_skill_result",
+                {"ok": False, "error": f"{type(e).__name__}: {e}"}))
+        return
+
+    async def _h_set_skill_default(self, conn_id, frame, p):
+        ok = self.skill_sources.set_default_for_new(p.source, p.default_for_new)
+        log.info("skills.default_changed", source=p.source,
+                 default_for_new=p.default_for_new, ok=ok)
+        await self.hub.send_global(conn_id, make_frame(
+            "skill_default_result",
+            {"ok": ok, "source": p.source,
+             "default_for_new": p.default_for_new}))
+        return
+
+    async def _h_list_chats(self, conn_id, frame, p):
+        chats = []
+        for m in self.store.list():
+            entry = vars(m) | self._chat_status(m.chatId)
+            chats.append(entry)
+        await self.hub.send_global(conn_id, make_frame("chat_list", {"chats": chats}))
+        return
+
+    async def _h_list_models(self, conn_id, frame, p):
+        # §models/§cli-types: отдаём кэш нужного типа CLI МГНОВЕННО (CLI не
+        # дёргаем). Неизвестный тип → UNSUPPORTED; нет кэша → PENDING + будим
+        # фоновый рефрешер.
+        cli_type = p.cliType
+        if cli_type not in models.KNOWN_CLI_TYPES:
+            data = {"cliType": cli_type, "models": [], "current": None,
+                    "raw": "", "auth_state": "UNSUPPORTED",
+                    "cli_present": False, "updated_at": 0}
+        elif (omni := self._omniroute_models_list(cli_type)) is not None:
+            # §omni: при omniroute-авторизации источник — ВЫБРАННЫЕ модели
+            # (шаг 1), а не CLI-проба. Тир-лимит (первые N) применяет клиент.
+            data = omni
+        else:
+            data = models.load_cache(self.config, cli_type)
+            if data is None:
+                data = {"cliType": cli_type, "models": [], "current": None,
+                        "raw": "", "auth_state": "PENDING",
+                        "cli_present": None, "updated_at": 0}
+                self._models_refresh_now.set()
+        await self.hub.send_global(
+            conn_id, make_frame("models_list", data))
+        return
+
+    async def _h_create_chat(self, conn_id, frame, p):
+        # cwd задан клиентом → используем его. Иначе, если сервер знает
+        # базу проектов (default_cwd, напр. /root/projects), заводим
+        # ПАПКУ ПОД ЧАТ по имени: <base>/<slug> (§3.7). Без базы — свой
+        # изолированный каталог data/chats/<id>.
+        # Сидируем новый чат скиллами групп с флагом default_for_new
+        # (§skills v2). Только для агентских чатов.
+        seed_skills = None
+        if p.addressee == "claude":
+            seed_skills = self.skill_sources.new_chat_skill_names() or None
+        # §cli-types: неизвестный тип клампим к дефолту — meta не должна
+        # врать о типе (сессию по нему поднимаем; сейчас всегда claude).
+        cli_type = (p.cliType if p.cliType in models.KNOWN_CLI_TYPES
+                    else models.DEFAULT_CLI_TYPE)
+        if cli_type != p.cliType:
+            log.warning("chat.clitype_unknown", requested=p.cliType,
+                        fallback=cli_type)
+        meta = self.store.create(
+            p.name, p.addressee, p.cwd,
+            mcp=p.mcp, permission_mode=p.permission_mode,
+            log_kb=p.log_kb, skills=seed_skills,
+            cli_type=cli_type,
+            projects_base=self.config.default_cwd)
+        log.info("chat.created", chat=meta.chatId, name=meta.name,
+                 addressee=meta.addressee, cwd=meta.cwd, mcp=meta.mcp,
+                 permission_mode=meta.permission_mode, log_kb=meta.log_kb,
+                 skills=seed_skills or [])
+        await self.hub.broadcast_global(make_frame("chat_created", vars(meta)))
+        return
+
+    async def _h_delete_chat(self, conn_id, frame, p, meta):
+        # S1-M: метим «удаляется» ДО _stop_session — окно между стопом и
+        # store.delete иначе даёт гонку воскрешения (см. _ensure_session).
+        self._deleting.add(frame.chatId)
+        try:
+            # Сессия закрывается всегда; рабочая папка (cwd) — по флагу.
             await self._stop_session(frame.chatId)
-            log.info("chat.mode_changed", chat=frame.chatId,
-                     permission_mode=p.permission_mode)
+            self.store.delete(frame.chatId, delete_cwd=p.delete_cwd,
+                              projects_base=self.config.default_cwd)
+            views_registry.clear_chat(self.config.data_dir, frame.chatId)  # §views
+            handlers_registry.clear_chat(self.config.data_dir, frame.chatId)  # §handlers
+            if self.scheduler is not None:   # §defer: не оставляем осиротевшие jobs
+                await self.scheduler.purge_chat(frame.chatId)
+            log.info("chat.deleted", chat=frame.chatId, delete_cwd=p.delete_cwd)
+            await self.hub.broadcast_global(
+                make_frame("chat_deleted", {"chatId": frame.chatId}))
+        finally:
+            self._deleting.discard(frame.chatId)
+        return
+
+    async def _h_rename_chat(self, conn_id, frame, p, meta):
+        updated = self.store.update_meta(frame.chatId, name=p.name)
+        log.info("chat.renamed", chat=frame.chatId, name=p.name)
+        if updated is not None:
             await self.hub.broadcast_global(
                 make_frame("chat_updated", vars(updated)))
-            return
+        return
 
-        if ftype == "set_model":
-            # §models: пустая строка → сброс к дефолту CLI (None). Как set_mode:
-            # стоп сессии → применится opts["model"] на следующем user_msg
-            # (resume сохранит контекст), затем broadcast обновлённой meta.
-            # N1: отсекаем непечатаемые символы (уедут в argv --model мусором).
-            new_model = "".join(
-                ch for ch in (p.model or "").strip() if ch.isprintable()
-            ) or None
-            updated = self.store.update_meta(frame.chatId, model=new_model)
-            await self._stop_session(frame.chatId)
-            log.info("chat.model_changed", chat=frame.chatId, model=new_model)
-            await self.hub.broadcast_global(
-                make_frame("chat_updated", vars(updated)))
-            return
+    async def _h_set_mode(self, conn_id, frame, p, meta):
+        updated = self.store.update_meta(
+            frame.chatId, permission_mode=p.permission_mode)
+        # Стопаем сессию — новый режим применится при следующем user_msg.
+        await self._stop_session(frame.chatId)
+        log.info("chat.mode_changed", chat=frame.chatId,
+                 permission_mode=p.permission_mode)
+        await self.hub.broadcast_global(
+            make_frame("chat_updated", vars(updated)))
+        return
 
-        if ftype == "schedule_message":
-            # §defer: отложить сообщение до сброса лимита. fireAt клампим (не
-            # доверяем клиентскому времени). Лимит «1 на чат» enforce'ит
-            # планировщик под локом (DeferPendingExists).
-            if self.scheduler is None:
-                await self.hub.send_global(conn_id, make_error(
-                    Err.INTERNAL, "scheduler unavailable",
-                    chat_id=frame.chatId, related=frame.id))
-                return
-            now = time.time()
-            # §defer-clock: fireAt — целевой сброс по часам Anthropic. Считаем
-            # СКОЛЬКО осталось до него по тем же часам (now + offset), затем ставим
-            # на локальную шкалу планировщика (now + delay). Так задержка верна,
-            # даже если системные часы сервера смещены (offset их компенсирует; при
-            # offset=0 формула эквивалентна прежнему клампу [now+1 … now+7д]).
-            offset = self._effective_clock_offset()
-            delay = float(p.fireAt) - (now + offset)
-            delay = max(1.0, min(delay, 7 * 24 * 3600))
-            fire_at = now + delay                # локальная шкала — для планировщика
-            atts = [a.model_dump() for a in p.attachments]
+    async def _h_set_model(self, conn_id, frame, p, meta):
+        # §models: пустая строка → сброс к дефолту CLI (None). Как set_mode:
+        # стоп сессии → применится opts["model"] на следующем user_msg
+        # (resume сохранит контекст), затем broadcast обновлённой meta.
+        # N1: отсекаем непечатаемые символы (уедут в argv --model мусором).
+        new_model = "".join(
+            ch for ch in (p.model or "").strip() if ch.isprintable()
+        ) or None
+        updated = self.store.update_meta(frame.chatId, model=new_model)
+        await self._stop_session(frame.chatId)
+        log.info("chat.model_changed", chat=frame.chatId, model=new_model)
+        await self.hub.broadcast_global(
+            make_frame("chat_updated", vars(updated)))
+        return
+
+    async def _h_schedule_message(self, conn_id, frame, p, meta):
+        # §defer: отложить сообщение до сброса лимита. fireAt клампим (не
+        # доверяем клиентскому времени). Лимит «1 на чат» enforce'ит
+        # планировщик под локом (DeferPendingExists).
+        if self.scheduler is None:
+            await self.hub.send_global(conn_id, make_error(
+                Err.INTERNAL, "scheduler unavailable",
+                chat_id=frame.chatId, related=frame.id))
+            return
+        now = time.time()
+        # §defer-clock: fireAt — целевой сброс по часам Anthropic. Считаем
+        # СКОЛЬКО осталось до него по тем же часам (now + offset), затем ставим
+        # на локальную шкалу планировщика (now + delay). Так задержка верна,
+        # даже если системные часы сервера смещены (offset их компенсирует; при
+        # offset=0 формула эквивалентна прежнему клампу [now+1 … now+7д]).
+        offset = self._effective_clock_offset()
+        delay = float(p.fireAt) - (now + offset)
+        delay = max(1.0, min(delay, 7 * 24 * 3600))
+        fire_at = now + delay                # локальная шкала — для планировщика
+        atts = [a.model_dump() for a in p.attachments]
+        try:
+            jid = await self.scheduler.add_job(
+                chat_id=frame.chatId, kind="once", spec=str(fire_at),
+                action="inject_user",
+                payload={"text": p.text, "attachments": atts},
+                created_by="user")
+        except DeferPendingExists:
+            await self.hub.send_global(conn_id, make_error(
+                Err.RATE_LIMITED,
+                "В этом чате уже есть отложенное сообщение (лимит 1)",
+                chat_id=frame.chatId, related=frame.id))
+            return
+        except Exception as e:  # noqa: BLE001
+            await self.hub.send_global(conn_id, make_error(
+                Err.INTERNAL, f"schedule failed: {e}",
+                chat_id=frame.chatId, related=frame.id))
+            return
+        # Журналируемое событие → pending-чип восстановится на resume и
+        # появится на других устройствах сразу. fireAt в чип отдаём в РЕАЛЬНОЙ
+        # шкале (обратно + offset) — у клиента часы верные, чип покажет верное
+        # время сброса, хотя в планировщике храним локальное fire_at.
+        await self.hub.publish(frame.chatId, "scheduled", {
+            "jobId": jid, "text": p.text, "attachments": atts,
+            "fireAt": fire_at + offset})
+        log.info("defer.scheduled", chat=frame.chatId, job=jid,
+                 fire_at=fire_at)
+        return
+
+    async def _h_cancel_scheduled(self, conn_id, frame, p, meta):
+        ok = (await self.scheduler.cancel_job(
+                p.jobId, frame.chatId, action="inject_user")
+              if self.scheduler else False)
+        if ok:
+            # Журналируемо → чип снимется на всех устройствах и на resume.
+            await self.hub.publish(frame.chatId, "scheduled_cancelled",
+                                   {"jobId": p.jobId})
+            log.info("defer.cancelled", chat=frame.chatId, job=p.jobId)
+        else:
+            # Уже сработало/не найдено (гонка D) — сообщаем инициатору.
+            await self.hub.send_global(conn_id, make_frame(
+                "scheduled_cancel_failed", {"jobId": p.jobId}, frame.chatId))
+        return
+
+    async def _h_list_scheduled(self, conn_id, frame, p, meta):
+        jobs = (await self.scheduler.list_jobs(frame.chatId)
+                if self.scheduler else [])
+        # §defer-clock: next_run хранится в ЛОКАЛЬНОЙ шкале → для чипа отдаём
+        # в реальной (+offset), чтобы клиент с верными часами показал время
+        # сброса правильно.
+        offset = self._effective_clock_offset()
+        pending = []
+        for j in jobs:
+            if j.get("action") != "inject_user" or j.get("enabled") != 1:
+                continue
+            pl = {}
             try:
-                jid = await self.scheduler.add_job(
-                    chat_id=frame.chatId, kind="once", spec=str(fire_at),
-                    action="inject_user",
-                    payload={"text": p.text, "attachments": atts},
-                    created_by="user")
-            except DeferPendingExists:
-                await self.hub.send_global(conn_id, make_error(
-                    Err.RATE_LIMITED,
-                    "В этом чате уже есть отложенное сообщение (лимит 1)",
-                    chat_id=frame.chatId, related=frame.id))
-                return
-            except Exception as e:  # noqa: BLE001
-                await self.hub.send_global(conn_id, make_error(
-                    Err.INTERNAL, f"schedule failed: {e}",
-                    chat_id=frame.chatId, related=frame.id))
-                return
-            # Журналируемое событие → pending-чип восстановится на resume и
-            # появится на других устройствах сразу. fireAt в чип отдаём в РЕАЛЬНОЙ
-            # шкале (обратно + offset) — у клиента часы верные, чип покажет верное
-            # время сброса, хотя в планировщике храним локальное fire_at.
-            await self.hub.publish(frame.chatId, "scheduled", {
-                "jobId": jid, "text": p.text, "attachments": atts,
-                "fireAt": fire_at + offset})
-            log.info("defer.scheduled", chat=frame.chatId, job=jid,
-                     fire_at=fire_at)
-            return
-
-        if ftype == "cancel_scheduled":
-            ok = (await self.scheduler.cancel_job(
-                    p.jobId, frame.chatId, action="inject_user")
-                  if self.scheduler else False)
-            if ok:
-                # Журналируемо → чип снимется на всех устройствах и на resume.
-                await self.hub.publish(frame.chatId, "scheduled_cancelled",
-                                       {"jobId": p.jobId})
-                log.info("defer.cancelled", chat=frame.chatId, job=p.jobId)
-            else:
-                # Уже сработало/не найдено (гонка D) — сообщаем инициатору.
-                await self.hub.send_global(conn_id, make_frame(
-                    "scheduled_cancel_failed", {"jobId": p.jobId}, frame.chatId))
-            return
-
-        if ftype == "list_scheduled":
-            jobs = (await self.scheduler.list_jobs(frame.chatId)
-                    if self.scheduler else [])
-            # §defer-clock: next_run хранится в ЛОКАЛЬНОЙ шкале → для чипа отдаём
-            # в реальной (+offset), чтобы клиент с верными часами показал время
-            # сброса правильно.
-            offset = self._effective_clock_offset()
-            pending = []
-            for j in jobs:
-                if j.get("action") != "inject_user" or j.get("enabled") != 1:
-                    continue
+                pl = json.loads(j.get("payload") or "{}")
+            except ValueError:
                 pl = {}
-                try:
-                    pl = json.loads(j.get("payload") or "{}")
-                except ValueError:
-                    pl = {}
-                nr = j.get("next_run")
-                pending.append({
-                    "jobId": j["id"],
-                    "fireAt": (nr + offset) if isinstance(nr, (int, float)) else nr,
-                    "text": pl.get("text", ""),
-                    "attachments": pl.get("attachments", []),
-                })
-            await self.hub.send_global(conn_id, make_frame(
-                "scheduled_list", {"jobs": pending}, frame.chatId))
-            return
-
-        if ftype == "list_skills":
-            # Дерево: источник (репо) → его скиллы (§skills v2). enabled —
-            # ВСЕ скиллы группы во включённом наборе чата (meta.skills).
-            await self.hub.send_global(conn_id, make_frame(
-                "skills_response", self._skills_tree(meta), frame.chatId))
-            return
-
-        if ftype == "set_skill_group":
-            # Групповое вкл/выкл источника в этом чате: добавляем/убираем
-            # ИМЕНА скиллов группы из meta.skills. Рестарт применит (как set_mode).
-            group = set(self.skill_sources.sources().get(p.source, {}).get(
-                "skills", []))
-            if not group:  # источник без записи → трактуем как одиночный
-                group = {p.source}
-            current = list(meta.skills or [])
-            if p.enabled:
-                current = list(dict.fromkeys(current + sorted(group)))
-            else:
-                current = [s for s in current if s not in group]
-            updated = self.store.update_meta(
-                frame.chatId, skills=(current or None))
-            await self._stop_session(frame.chatId)
-            log.info("chat.skill_group_changed", chat=frame.chatId,
-                     source=p.source, enabled=p.enabled,
-                     skills=updated.skills or [])
-            await self.hub.broadcast_global(
-                make_frame("chat_updated", vars(updated)))
-            return
-
-        # ---------- §mcp: перезапуск агента + управление MCP ----------
-
-        if ftype == "restart_agent":
-            # Контекст жив (resume по claude_session_id) — стоп-сессия лишь
-            # роняет коннект; новый MCP-набор подхватится на первом user_msg.
-            await self._stop_session(frame.chatId)
-            log.info("chat.agent_restarted", chat=frame.chatId)
-            await self.hub.send_global(conn_id, make_frame(
-                "mcp_response", self._mcp_tree(meta), frame.chatId))
-            return
-
-        if ftype == "clear_session":
-            # §clear: сброс контекста — роняем сессию И забываем session_id CLI,
-            # чтобы следующий user_msg стартовал СВЕЖУЮ сессию без resume.
-            # Спасает «отравленный» чат (напр. залипший на 400 content-filter),
-            # минуя модель. Видимая переписка чата не трогается.
-            await self._stop_session(frame.chatId)
-            self.store.update_meta(frame.chatId, claude_session_id=None)
-            log.info("chat.context_cleared", chat=frame.chatId)
-            # Подтверждаем клиенту — он покажет заметку ТОЛЬКО по этому фрейму
-            # (иначе на старом Ёжике без хендлера был бы ложный «очищено»).
-            await self.hub.send_global(conn_id, make_frame(
-                "session_cleared", {}, frame.chatId))
-            return
-
-        if ftype == "list_mcp":
-            await self.hub.send_global(conn_id, make_frame(
-                "mcp_response", self._mcp_tree(meta), frame.chatId))
-            return
-
-        if ftype == "add_mcp":
-            self.mcp.add(p.name, self._mcp_config(p))
-            enabled = list(dict.fromkeys(list(meta.mcp or []) + [p.name]))
-            updated = self.store.update_meta(frame.chatId, mcp=enabled)
-            await self._stop_session(frame.chatId)  # применить новый MCP
-            log.info("chat.mcp_added", chat=frame.chatId, name=p.name,
-                     transport=p.transport)
-            await self.hub.broadcast_global(make_frame("chat_updated", vars(updated)))
-            await self.hub.send_global(conn_id, make_frame(
-                "mcp_response", self._mcp_tree(updated), frame.chatId))
-            return
-
-        if ftype == "set_mcp_enabled":
-            current = list(meta.mcp or [])
-            if p.enabled:
-                current = list(dict.fromkeys(current + [p.name]))
-            else:
-                current = [n for n in current if n != p.name]
-            updated = self.store.update_meta(frame.chatId, mcp=current)
-            await self._stop_session(frame.chatId)  # рестарт агента
-            log.info("chat.mcp_enabled", chat=frame.chatId, name=p.name,
-                     enabled=p.enabled)
-            await self.hub.broadcast_global(make_frame("chat_updated", vars(updated)))
-            await self.hub.send_global(conn_id, make_frame(
-                "mcp_response", self._mcp_tree(updated), frame.chatId))
-            return
-
-        if ftype == "remove_mcp":
-            self.mcp.remove(p.name)
-            current = [n for n in (meta.mcp or []) if n != p.name]
-            updated = self.store.update_meta(frame.chatId, mcp=current)
-            await self._stop_session(frame.chatId)
-            log.info("chat.mcp_removed", chat=frame.chatId, name=p.name)
-            await self.hub.broadcast_global(make_frame("chat_updated", vars(updated)))
-            await self.hub.send_global(conn_id, make_frame(
-                "mcp_response", self._mcp_tree(updated), frame.chatId))
-            return
-
-        if ftype == "get_limits":
-            # §limits: лимиты подписки из заголовков /v1/messages (usage.py).
-            from .. import usage
-            data = await usage.fetch_limits(self.config)
-            # §defer-clock: запоминаем смещение часов Anthropic от локальных —
-            # им потом ректифицируем fireAt в schedule_message. Якорим на monotonic.
-            sd = data.get("serverDate")
-            if sd:
-                self._clock_offset = sd - time.time()
-                self._clock_offset_mono = time.monotonic()
-                self._clock_offset_wall = time.time()
-                if abs(self._clock_offset) > 120:
-                    log.warning("clock.skew", offset_s=round(self._clock_offset))
-            await self.hub.send_global(conn_id, make_frame(
-                "limits_result", data, frame.chatId))
-            return
-
-        if ftype == "subscribe_chat":
-            self.hub.subscribe(conn_id, frame.chatId)
-            log.info("chat.subscribe", conn_id=conn_id, chat_id=frame.chatId)
-            # Для shell-чата поднимаем bash сразу — клиент увидит prompt.
-            if meta.addressee == "broker_shell":
-                session = await self._ensure_session(meta)
-                # S5-H2: снапшоты не в pending → шлём ТЕКУЩИЙ экран этому
-                # соединению (реконнект к живому shell не увидит его иначе).
-                if isinstance(session, PtySession):
-                    await self.hub.send_global(conn_id, make_frame(
-                        "screen_snapshot", session.current_snapshot(),
-                        frame.chatId))
-            # §views авто-возврат: если в чате есть ОТКРЫТОЕ окно (current),
-            # ре-пушим его этому соединению — окно переживает рестарт/реконнект
-            # (клиент на реконнекте пере-сидит ленту и теряет живое окно).
-            # Точечно (send_global) — не броадкастим другим устройствам.
-            snap = views_registry.get(self.config.data_dir, frame.chatId)
-            cur = snap.get("current")
-            if isinstance(cur, dict) and cur.get("html"):
-                await self.hub.send_global(conn_id, make_frame("ui_request", {
-                    "html": cur.get("html", ""),
-                    "title": cur.get("title", "Interactive"),
-                    "persistent": True,
-                    "allow_external": bool(cur.get("allow_external", False)),
-                    "view_id": cur.get("id", ""),
-                    "kind": cur.get("kind", "app"),
-                }, frame.chatId))
-            return
-        if ftype == "unsubscribe_chat":
-            self.hub.unsubscribe(conn_id, frame.chatId)
-            return
-
-        if ftype == "get_log":
-            payload: dict[str, Any] = {
-                "events": self.store.read_transcript_tail(frame.chatId, p.tail)}
-            if self.store.transcript_limit(frame.chatId) <= 0:
-                payload["disabled"] = True  # чат создан с log_kb=0
-            await self.hub.send_global(conn_id, make_frame(
-                "log_response", payload, frame.chatId))
-            return
-
-        if ftype == "get_status":
-            await self.hub.send_global(conn_id, make_frame(
-                "status_response",
-                self._chat_status(frame.chatId, with_result=True),
-                frame.chatId))
-            return
-
-        if ftype == "ack":
-            self.store.ack(frame.chatId, p.last_seen_id)
-            log.info("chat.ack", chat_id=frame.chatId,
-                     last_seen=(p.last_seen_id or "")[-6:])
-            return
-
-        if ftype == "resume":
-            # M7: отставший девайс тянет хвост вечного транскрипта — читаем в
-            # отдельном потоке, чтобы дисковый разбор не стопорил event loop.
-            events, full_replay = await asyncio.to_thread(
-                self.store.events_after, frame.chatId, p.last_seen_id)
-            log.info("chat.resume", conn_id=conn_id, chat_id=frame.chatId,
-                     events=len(events), full=full_replay,
-                     last_seen=(p.last_seen_id or "")[-6:])
-            payload: dict[str, Any] = {
-                "events": events,
-                "cursor": events[-1]["id"] if events else p.last_seen_id,
-                "full_replay": full_replay,
-            }
-            if self.store.had_partial_loss(frame.chatId):
-                payload["partial_loss"] = True
-                self.store.clear_partial_loss(frame.chatId)
-            # Прямой ответ, не через журнал — иначе resume зациклится.
-            await self.hub.send_global(
-                conn_id, make_frame("resume_response", payload, frame.chatId))
-            return
-
-        if ftype == "user_msg":
-            # §models M1: пришёл ход → гасим фоновую пробу /model, чтобы не
-            # держать второй CLI-процесс рядом с единственной авторизацией.
-            self._cancel_models_probe()
-            # Эхо (§4.15): в чат пишут несколько писателей (устройства
-            # пользователя, менеджер-агент, cron) — журналим и рассылаем
-            # входящее ДО исполнения, чтобы все клиенты видели полную ленту.
-            # Вложения (§7.3): эхо несёт их для чипов в ленте; агенту в промпт
-            # дописываем абсолютные пути (Claude читает их Read'ом). Без
-            # вложений поведение идентично прежнему.
-            session = await self._ensure_session(meta)
-            # /btw (§btw-interrupt A1): агент занят → сообщение ПРЕРВЁТ текущий
-            # ход (handle_user_msg → client.interrupt()) и поедет следующим
-            # ходом с контекстом. Помечаем эхо флагом btw — клиенты показывают
-            # реплику как «дослано» (уточнение/«стой»).
-            is_btw = (isinstance(session, ClaudeSession)
-                      and session.status == "busy")
-            await self.hub.publish(frame.chatId, "user_msg_echo", {
-                "content": p.content,
-                "sender": p.sender,
-                "related": frame.id,
-                "attachments": [a.model_dump() for a in p.attachments],
-                "btw": is_btw,
+            nr = j.get("next_run")
+            pending.append({
+                "jobId": j["id"],
+                "fireAt": (nr + offset) if isinstance(nr, (int, float)) else nr,
+                "text": pl.get("text", ""),
+                "attachments": pl.get("attachments", []),
             })
-            resolved = fileserver.resolve_attachment_paths(
-                self.config.chats_dir, frame.chatId, p.attachments)
-            prompt = fileserver.compose_prompt(p.content, resolved)
-            # §draw: если сообщение несёт разметку окна — подкладываем её агенту
-            # (скриншот + координаты + подсказка по HTML).
-            if p.draw_view_id:
-                note = self._draw_note(frame.chatId, p.draw_view_id)
-                if note:
-                    prompt = f"{prompt}\n\n{note}" if prompt.strip() else note
-            await session.handle_user_msg(prompt)
-            return
+        await self.hub.send_global(conn_id, make_frame(
+            "scheduled_list", {"jobs": pending}, frame.chatId))
+        return
 
-        if ftype in ("pty_write", "pty_resize"):
-            if meta.addressee != "broker_shell":
-                await self.hub.send_global(conn_id, make_error(
-                    Err.BAD_FRAME, f"{ftype} is only valid for broker_shell chats",
-                    chat_id=frame.chatId, related=frame.id))
-                return
+    async def _h_list_skills(self, conn_id, frame, p, meta):
+        # Дерево: источник (репо) → его скиллы (§skills v2). enabled —
+        # ВСЕ скиллы группы во включённом наборе чата (meta.skills).
+        await self.hub.send_global(conn_id, make_frame(
+            "skills_response", self._skills_tree(meta), frame.chatId))
+        return
+
+    async def _h_set_skill_group(self, conn_id, frame, p, meta):
+        # Групповое вкл/выкл источника в этом чате: добавляем/убираем
+        # ИМЕНА скиллов группы из meta.skills. Рестарт применит (как set_mode).
+        group = set(self.skill_sources.sources().get(p.source, {}).get(
+            "skills", []))
+        if not group:  # источник без записи → трактуем как одиночный
+            group = {p.source}
+        current = list(meta.skills or [])
+        if p.enabled:
+            current = list(dict.fromkeys(current + sorted(group)))
+        else:
+            current = [s for s in current if s not in group]
+        updated = self.store.update_meta(
+            frame.chatId, skills=(current or None))
+        await self._stop_session(frame.chatId)
+        log.info("chat.skill_group_changed", chat=frame.chatId,
+                 source=p.source, enabled=p.enabled,
+                 skills=updated.skills or [])
+        await self.hub.broadcast_global(
+            make_frame("chat_updated", vars(updated)))
+        return
+
+    async def _h_restart_agent(self, conn_id, frame, p, meta):
+        # Контекст жив (resume по claude_session_id) — стоп-сессия лишь
+        # роняет коннект; новый MCP-набор подхватится на первом user_msg.
+        await self._stop_session(frame.chatId)
+        log.info("chat.agent_restarted", chat=frame.chatId)
+        await self.hub.send_global(conn_id, make_frame(
+            "mcp_response", self._mcp_tree(meta), frame.chatId))
+        return
+
+    async def _h_clear_session(self, conn_id, frame, p, meta):
+        # §clear: сброс контекста — роняем сессию И забываем session_id CLI,
+        # чтобы следующий user_msg стартовал СВЕЖУЮ сессию без resume.
+        # Спасает «отравленный» чат (напр. залипший на 400 content-filter),
+        # минуя модель. Видимая переписка чата не трогается.
+        await self._stop_session(frame.chatId)
+        self.store.update_meta(frame.chatId, claude_session_id=None)
+        log.info("chat.context_cleared", chat=frame.chatId)
+        # Подтверждаем клиенту — он покажет заметку ТОЛЬКО по этому фрейму
+        # (иначе на старом Ёжике без хендлера был бы ложный «очищено»).
+        await self.hub.send_global(conn_id, make_frame(
+            "session_cleared", {}, frame.chatId))
+        return
+
+    async def _h_list_mcp(self, conn_id, frame, p, meta):
+        await self.hub.send_global(conn_id, make_frame(
+            "mcp_response", self._mcp_tree(meta), frame.chatId))
+        return
+
+    async def _h_add_mcp(self, conn_id, frame, p, meta):
+        self.mcp.add(p.name, self._mcp_config(p))
+        enabled = list(dict.fromkeys(list(meta.mcp or []) + [p.name]))
+        updated = self.store.update_meta(frame.chatId, mcp=enabled)
+        await self._stop_session(frame.chatId)  # применить новый MCP
+        log.info("chat.mcp_added", chat=frame.chatId, name=p.name,
+                 transport=p.transport)
+        await self.hub.broadcast_global(make_frame("chat_updated", vars(updated)))
+        await self.hub.send_global(conn_id, make_frame(
+            "mcp_response", self._mcp_tree(updated), frame.chatId))
+        return
+
+    async def _h_set_mcp_enabled(self, conn_id, frame, p, meta):
+        current = list(meta.mcp or [])
+        if p.enabled:
+            current = list(dict.fromkeys(current + [p.name]))
+        else:
+            current = [n for n in current if n != p.name]
+        updated = self.store.update_meta(frame.chatId, mcp=current)
+        await self._stop_session(frame.chatId)  # рестарт агента
+        log.info("chat.mcp_enabled", chat=frame.chatId, name=p.name,
+                 enabled=p.enabled)
+        await self.hub.broadcast_global(make_frame("chat_updated", vars(updated)))
+        await self.hub.send_global(conn_id, make_frame(
+            "mcp_response", self._mcp_tree(updated), frame.chatId))
+        return
+
+    async def _h_remove_mcp(self, conn_id, frame, p, meta):
+        self.mcp.remove(p.name)
+        current = [n for n in (meta.mcp or []) if n != p.name]
+        updated = self.store.update_meta(frame.chatId, mcp=current)
+        await self._stop_session(frame.chatId)
+        log.info("chat.mcp_removed", chat=frame.chatId, name=p.name)
+        await self.hub.broadcast_global(make_frame("chat_updated", vars(updated)))
+        await self.hub.send_global(conn_id, make_frame(
+            "mcp_response", self._mcp_tree(updated), frame.chatId))
+        return
+
+    async def _h_get_limits(self, conn_id, frame, p, meta):
+        # §limits: лимиты подписки из заголовков /v1/messages (usage.py).
+        from .. import usage
+        data = await usage.fetch_limits(self.config)
+        # §defer-clock: запоминаем смещение часов Anthropic от локальных —
+        # им потом ректифицируем fireAt в schedule_message. Якорим на monotonic.
+        sd = data.get("serverDate")
+        if sd:
+            self._clock_offset = sd - time.time()
+            self._clock_offset_mono = time.monotonic()
+            self._clock_offset_wall = time.time()
+            if abs(self._clock_offset) > 120:
+                log.warning("clock.skew", offset_s=round(self._clock_offset))
+        await self.hub.send_global(conn_id, make_frame(
+            "limits_result", data, frame.chatId))
+        return
+
+    async def _h_subscribe_chat(self, conn_id, frame, p, meta):
+        self.hub.subscribe(conn_id, frame.chatId)
+        log.info("chat.subscribe", conn_id=conn_id, chat_id=frame.chatId)
+        # Для shell-чата поднимаем bash сразу — клиент увидит prompt.
+        if meta.addressee == "broker_shell":
             session = await self._ensure_session(meta)
-            if ftype == "pty_write":
-                await session.write(p.data)
-            else:
-                await session.resize(p.rows, p.cols)
-            return
-
-        if ftype == "ui_event":
-            # §ui async: действие в постоянном окне (hedgehog.notify) →
-            # полноценный ход агента, как обычное сообщение. Окна открывает только
-            # ClaudeSession (ui_open — её инструмент) → для bash-чата ui_event
-            # мусорный, сессию зря не поднимаем.
-            if meta.addressee != "claude":
-                return
-            # §models M1: как в user_msg — гасим фоновую пробу /model, чтобы не
-            # держать второй CLI-процесс рядом с единственной авторизацией.
-            self._cancel_models_probe()
-            # M: поднимаем сессию (после рестарта Ёжика окно ре-пушится клиенту
-            # из views_registry, а sessions пуст — с sessions.get нажатие молча
-            # терялось бы).
-            session = await self._ensure_session(meta)
-            if isinstance(session, ClaudeSession):
-                await session.handle_ui_event(p.data)
-            return
-
-        if ftype == "ui_list":
-            # §views: список окон чата (текущее + история закрытых) БЕЗ html —
-            # клиент строит меню «переоткрыть». Ответ только спросившему.
-            await self.hub.send_global(conn_id, make_frame(
-                "ui_list_response",
-                views_registry.summary(self.config.data_dir, frame.chatId),
-                frame.chatId))
-            return
-
-        if ftype == "ui_reopen":
-            # §views: детерминированный пушер — сервер сам повторно шлёт
-            # сохранённый ui_request в чат, БЕЗ хода агента (ноль токенов).
-            # Уходит всем подписчикам чата (мультидевайс) + в журнал.
-            rec = views_registry.reopen(self.config.data_dir, frame.chatId, p.id)
-            if rec:
-                await self.hub.publish(frame.chatId, "ui_request", {
-                    "html": rec.get("html", ""),
-                    "title": rec.get("title", "Interactive"),
-                    "persistent": True,
-                    "allow_external": bool(rec.get("allow_external", False)),
-                    "view_id": rec.get("id", ""),
-                    "kind": rec.get("kind", "app"),
-                })
-            else:
-                await self.hub.send_global(conn_id, make_error(
-                    Err.BAD_FRAME, f"no view {p.id}",
-                    chat_id=frame.chatId, related=frame.id))
-            return
-
-        if ftype == "ui_forget":
-            # §views: убрать окно из истории; вернуть обновлённый список.
-            views_registry.forget(self.config.data_dir, frame.chatId, p.id)
-            # §handlers: ручки, привязанные к этому окну, тоже стираем.
-            handlers_registry.unregister_by_view(
-                self.config.data_dir, frame.chatId, p.id)
-            await self.hub.send_global(conn_id, make_frame(
-                "ui_list_response",
-                views_registry.summary(self.config.data_dir, frame.chatId),
-                frame.chatId))
-            return
-
-        if ftype == "ui_closed":
-            # §views: пользователь закрыл ПОСТОЯННОЕ окно крестиком с телефона →
-            # архивируем текущее в историю (агентский ui_close делает это же
-            # серверно). Возвращаем свежий список спросившему.
-            views_registry.record_close(self.config.data_dir, frame.chatId)
-            await self.hub.send_global(conn_id, make_frame(
-                "ui_list_response",
-                views_registry.summary(self.config.data_dir, frame.chatId),
-                frame.chatId))
-            return
-
-        if ftype == "ui_call":
-            # §handlers Ф-2: окно зовёт серверную ручку — детерминированно, БЕЗ
-            # хода агента. Находим ручку в реестре чата, запускаем подпроцессом
-            # (stdin=args → stdout=JSON), результат — тем же callId спросившему.
-            rec = handlers_registry.get(
-                self.config.data_dir, frame.chatId, p.name)
-            if rec is None:
+            # S5-H2: снапшоты не в pending → шлём ТЕКУЩИЙ экран этому
+            # соединению (реконнект к живому shell не увидит его иначе).
+            if isinstance(session, PtySession):
                 await self.hub.send_global(conn_id, make_frame(
-                    "ui_call_result",
-                    {"callId": p.callId, "ok": False,
-                     "error": f"no handler '{p.name}'"}, frame.chatId))
-                return
-            try:
-                args_obj = json.loads(p.args or "{}")
-            except ValueError:
-                await self.hub.send_global(conn_id, make_frame(
-                    "ui_call_result",
-                    {"callId": p.callId, "ok": False,
-                     "error": "args not JSON"}, frame.chatId))
-                return
-            res = await handler_runner.run(meta.cwd, rec["script"], args_obj)
-            if res.get("ok"):
-                payload = {"callId": p.callId, "ok": True,
-                           "data": json.dumps(res.get("data"),
-                                              ensure_ascii=False)}
-            else:
-                payload = {"callId": p.callId, "ok": False,
-                           "error": res.get("error", "handler error")}
-            await self.hub.send_global(
-                conn_id, make_frame("ui_call_result", payload, frame.chatId))
-            return
+                    "screen_snapshot", session.current_snapshot(),
+                    frame.chatId))
+        # §views авто-возврат: если в чате есть ОТКРЫТОЕ окно (current),
+        # ре-пушим его этому соединению — окно переживает рестарт/реконнект
+        # (клиент на реконнекте пере-сидит ленту и теряет живое окно).
+        # Точечно (send_global) — не броадкастим другим устройствам.
+        snap = views_registry.get(self.config.data_dir, frame.chatId)
+        cur = snap.get("current")
+        if isinstance(cur, dict) and cur.get("html"):
+            await self.hub.send_global(conn_id, make_frame("ui_request", {
+                "html": cur.get("html", ""),
+                "title": cur.get("title", "Interactive"),
+                "persistent": True,
+                "allow_external": bool(cur.get("allow_external", False)),
+                "view_id": cur.get("id", ""),
+                "kind": cur.get("kind", "app"),
+            }, frame.chatId))
+        return
 
-        if ftype == "ui_new_blank":
-            # §draw: пользователь нажал ＋ — создаём пустое белое §views-окно
-            # (холст для свободного рисунка) и пушим его как обычное окно.
-            blank = ("<!DOCTYPE html><html><head><meta charset='UTF-8'>"
-                     "<meta name='viewport' content='width=device-width,"
-                     "initial-scale=1,maximum-scale=1'></head>"
-                     "<body style='margin:0;background:#ffffff;'></body></html>")
-            rec = views_registry.record_open(
-                self.config.data_dir, frame.chatId,
-                title=p.title or "Empty canvas", html=blank,
-                persistent=True, allow_external=False, kind="blank")
+    async def _h_unsubscribe_chat(self, conn_id, frame, p, meta):
+        self.hub.unsubscribe(conn_id, frame.chatId)
+        return
+
+    async def _h_get_log(self, conn_id, frame, p, meta):
+        payload: dict[str, Any] = {
+            "events": self.store.read_transcript_tail(frame.chatId, p.tail)}
+        if self.store.transcript_limit(frame.chatId) <= 0:
+            payload["disabled"] = True  # чат создан с log_kb=0
+        await self.hub.send_global(conn_id, make_frame(
+            "log_response", payload, frame.chatId))
+        return
+
+    async def _h_get_status(self, conn_id, frame, p, meta):
+        await self.hub.send_global(conn_id, make_frame(
+            "status_response",
+            self._chat_status(frame.chatId, with_result=True),
+            frame.chatId))
+        return
+
+    async def _h_ack(self, conn_id, frame, p, meta):
+        self.store.ack(frame.chatId, p.last_seen_id)
+        log.info("chat.ack", chat_id=frame.chatId,
+                 last_seen=(p.last_seen_id or "")[-6:])
+        return
+
+    async def _h_resume(self, conn_id, frame, p, meta):
+        # M7: отставший девайс тянет хвост вечного транскрипта — читаем в
+        # отдельном потоке, чтобы дисковый разбор не стопорил event loop.
+        events, full_replay = await asyncio.to_thread(
+            self.store.events_after, frame.chatId, p.last_seen_id)
+        log.info("chat.resume", conn_id=conn_id, chat_id=frame.chatId,
+                 events=len(events), full=full_replay,
+                 last_seen=(p.last_seen_id or "")[-6:])
+        payload: dict[str, Any] = {
+            "events": events,
+            "cursor": events[-1]["id"] if events else p.last_seen_id,
+            "full_replay": full_replay,
+        }
+        if self.store.had_partial_loss(frame.chatId):
+            payload["partial_loss"] = True
+            self.store.clear_partial_loss(frame.chatId)
+        # Прямой ответ, не через журнал — иначе resume зациклится.
+        await self.hub.send_global(
+            conn_id, make_frame("resume_response", payload, frame.chatId))
+        return
+
+    async def _h_user_msg(self, conn_id, frame, p, meta):
+        # §models M1: пришёл ход → гасим фоновую пробу /model, чтобы не
+        # держать второй CLI-процесс рядом с единственной авторизацией.
+        self._cancel_models_probe()
+        # Эхо (§4.15): в чат пишут несколько писателей (устройства
+        # пользователя, менеджер-агент, cron) — журналим и рассылаем
+        # входящее ДО исполнения, чтобы все клиенты видели полную ленту.
+        # Вложения (§7.3): эхо несёт их для чипов в ленте; агенту в промпт
+        # дописываем абсолютные пути (Claude читает их Read'ом). Без
+        # вложений поведение идентично прежнему.
+        session = await self._ensure_session(meta)
+        # /btw (§btw-interrupt A1): агент занят → сообщение ПРЕРВЁТ текущий
+        # ход (handle_user_msg → client.interrupt()) и поедет следующим
+        # ходом с контекстом. Помечаем эхо флагом btw — клиенты показывают
+        # реплику как «дослано» (уточнение/«стой»).
+        is_btw = (isinstance(session, ClaudeSession)
+                  and session.status == "busy")
+        await self.hub.publish(frame.chatId, "user_msg_echo", {
+            "content": p.content,
+            "sender": p.sender,
+            "related": frame.id,
+            "attachments": [a.model_dump() for a in p.attachments],
+            "btw": is_btw,
+        })
+        resolved = fileserver.resolve_attachment_paths(
+            self.config.chats_dir, frame.chatId, p.attachments)
+        prompt = fileserver.compose_prompt(p.content, resolved)
+        # §draw: если сообщение несёт разметку окна — подкладываем её агенту
+        # (скриншот + координаты + подсказка по HTML).
+        if p.draw_view_id:
+            note = self._draw_note(frame.chatId, p.draw_view_id)
+            if note:
+                prompt = f"{prompt}\n\n{note}" if prompt.strip() else note
+        await session.handle_user_msg(prompt)
+        return
+
+    async def _h_pty_write(self, conn_id, frame, p, meta):
+        ftype = frame.type
+        if meta.addressee != "broker_shell":
+            await self.hub.send_global(conn_id, make_error(
+                Err.BAD_FRAME, f"{ftype} is only valid for broker_shell chats",
+                chat_id=frame.chatId, related=frame.id))
+            return
+        session = await self._ensure_session(meta)
+        if ftype == "pty_write":
+            await session.write(p.data)
+        else:
+            await session.resize(p.rows, p.cols)
+        return
+
+    async def _h_ui_event(self, conn_id, frame, p, meta):
+        # §ui async: действие в постоянном окне (hedgehog.notify) →
+        # полноценный ход агента, как обычное сообщение. Окна открывает только
+        # ClaudeSession (ui_open — её инструмент) → для bash-чата ui_event
+        # мусорный, сессию зря не поднимаем.
+        if meta.addressee != "claude":
+            return
+        # §models M1: как в user_msg — гасим фоновую пробу /model, чтобы не
+        # держать второй CLI-процесс рядом с единственной авторизацией.
+        self._cancel_models_probe()
+        # M: поднимаем сессию (после рестарта Ёжика окно ре-пушится клиенту
+        # из views_registry, а sessions пуст — с sessions.get нажатие молча
+        # терялось бы).
+        session = await self._ensure_session(meta)
+        if isinstance(session, ClaudeSession):
+            await session.handle_ui_event(p.data)
+        return
+
+    async def _h_ui_list(self, conn_id, frame, p, meta):
+        # §views: список окон чата (текущее + история закрытых) БЕЗ html —
+        # клиент строит меню «переоткрыть». Ответ только спросившему.
+        await self.hub.send_global(conn_id, make_frame(
+            "ui_list_response",
+            views_registry.summary(self.config.data_dir, frame.chatId),
+            frame.chatId))
+        return
+
+    async def _h_ui_reopen(self, conn_id, frame, p, meta):
+        # §views: детерминированный пушер — сервер сам повторно шлёт
+        # сохранённый ui_request в чат, БЕЗ хода агента (ноль токенов).
+        # Уходит всем подписчикам чата (мультидевайс) + в журнал.
+        rec = views_registry.reopen(self.config.data_dir, frame.chatId, p.id)
+        if rec:
             await self.hub.publish(frame.chatId, "ui_request", {
-                "html": blank, "title": rec.get("title", "Empty canvas"),
-                "persistent": True, "allow_external": False,
-                "view_id": rec.get("id", ""), "kind": "blank",
+                "html": rec.get("html", ""),
+                "title": rec.get("title", "Interactive"),
+                "persistent": True,
+                "allow_external": bool(rec.get("allow_external", False)),
+                "view_id": rec.get("id", ""),
+                "kind": rec.get("kind", "app"),
             })
-            return
+        else:
+            await self.hub.send_global(conn_id, make_error(
+                Err.BAD_FRAME, f"no view {p.id}",
+                chat_id=frame.chatId, related=frame.id))
+        return
 
-        if ftype == "ui_draw_apply":
-            # §draw: «Применить» — сохранить рисунок (координаты + скриншот) на view.
-            try:
-                figs = json.loads(p.figures or "[]")
-            except ValueError:
-                figs = []
-            res = views_registry.set_drawing(
-                self.config.data_dir, frame.chatId, p.view_id,
-                size={"w": p.width, "h": p.height}, figures=figs,
-                image=p.image_id or "")
-            if res and res.get("old_image"):
-                self._delete_chat_file(frame.chatId, res["old_image"])
-            return
+    async def _h_ui_forget(self, conn_id, frame, p, meta):
+        # §views: убрать окно из истории; вернуть обновлённый список.
+        views_registry.forget(self.config.data_dir, frame.chatId, p.id)
+        # §handlers: ручки, привязанные к этому окну, тоже стираем.
+        handlers_registry.unregister_by_view(
+            self.config.data_dir, frame.chatId, p.id)
+        await self.hub.send_global(conn_id, make_frame(
+            "ui_list_response",
+            views_registry.summary(self.config.data_dir, frame.chatId),
+            frame.chatId))
+        return
 
-        if ftype == "ui_draw_clear":
-            # §draw: «Очистить/Стереть» — снять рисунок с view (+ удалить картинку).
-            old = views_registry.clear_drawing(
-                self.config.data_dir, frame.chatId, p.view_id)
-            if old:
-                self._delete_chat_file(frame.chatId, old)
-            return
+    async def _h_ui_closed(self, conn_id, frame, p, meta):
+        # §views: пользователь закрыл ПОСТОЯННОЕ окно крестиком с телефона →
+        # архивируем текущее в историю (агентский ui_close делает это же
+        # серверно). Возвращаем свежий список спросившему.
+        views_registry.record_close(self.config.data_dir, frame.chatId)
+        await self.hub.send_global(conn_id, make_frame(
+            "ui_list_response",
+            views_registry.summary(self.config.data_dir, frame.chatId),
+            frame.chatId))
+        return
 
-        if ftype in ("permission_response", "picker_response", "ui_response"):
-            session = self.sessions.get(frame.chatId)
-            resolved = False
-            if isinstance(session, ClaudeSession):
-                # значение ответа зависит от типа фрейма; резолв — единый (§req).
-                value = (p.decision if ftype == "permission_response"
-                         else p.option_id if ftype == "picker_response"
-                         else p.data)
-                resolved = session.resolve(p.related, value)
-            if not resolved:
-                await self.hub.send_global(conn_id, make_error(
-                    Err.BAD_FRAME, f"no pending request {p.related}",
-                    chat_id=frame.chatId, related=frame.id))
+    async def _h_ui_call(self, conn_id, frame, p, meta):
+        # §handlers Ф-2: окно зовёт серверную ручку — детерминированно, БЕЗ
+        # хода агента. Находим ручку в реестре чата, запускаем подпроцессом
+        # (stdin=args → stdout=JSON), результат — тем же callId спросившему.
+        rec = handlers_registry.get(
+            self.config.data_dir, frame.chatId, p.name)
+        if rec is None:
+            await self.hub.send_global(conn_id, make_frame(
+                "ui_call_result",
+                {"callId": p.callId, "ok": False,
+                 "error": f"no handler '{p.name}'"}, frame.chatId))
             return
+        try:
+            args_obj = json.loads(p.args or "{}")
+        except ValueError:
+            await self.hub.send_global(conn_id, make_frame(
+                "ui_call_result",
+                {"callId": p.callId, "ok": False,
+                 "error": "args not JSON"}, frame.chatId))
+            return
+        res = await handler_runner.run(meta.cwd, rec["script"], args_obj)
+        if res.get("ok"):
+            payload = {"callId": p.callId, "ok": True,
+                       "data": json.dumps(res.get("data"),
+                                          ensure_ascii=False)}
+        else:
+            payload = {"callId": p.callId, "ok": False,
+                       "error": res.get("error", "handler error")}
+        await self.hub.send_global(
+            conn_id, make_frame("ui_call_result", payload, frame.chatId))
+        return
 
-        raise AssertionError(f"unrouted frame type {ftype}")  # защита от рассинхрона с protocol.py
+    async def _h_ui_new_blank(self, conn_id, frame, p, meta):
+        # §draw: пользователь нажал ＋ — создаём пустое белое §views-окно
+        # (холст для свободного рисунка) и пушим его как обычное окно.
+        blank = ("<!DOCTYPE html><html><head><meta charset='UTF-8'>"
+                 "<meta name='viewport' content='width=device-width,"
+                 "initial-scale=1,maximum-scale=1'></head>"
+                 "<body style='margin:0;background:#ffffff;'></body></html>")
+        rec = views_registry.record_open(
+            self.config.data_dir, frame.chatId,
+            title=p.title or "Empty canvas", html=blank,
+            persistent=True, allow_external=False, kind="blank")
+        await self.hub.publish(frame.chatId, "ui_request", {
+            "html": blank, "title": rec.get("title", "Empty canvas"),
+            "persistent": True, "allow_external": False,
+            "view_id": rec.get("id", ""), "kind": "blank",
+        })
+        return
+
+    async def _h_ui_draw_apply(self, conn_id, frame, p, meta):
+        # §draw: «Применить» — сохранить рисунок (координаты + скриншот) на view.
+        try:
+            figs = json.loads(p.figures or "[]")
+        except ValueError:
+            figs = []
+        res = views_registry.set_drawing(
+            self.config.data_dir, frame.chatId, p.view_id,
+            size={"w": p.width, "h": p.height}, figures=figs,
+            image=p.image_id or "")
+        if res and res.get("old_image"):
+            self._delete_chat_file(frame.chatId, res["old_image"])
+        return
+
+    async def _h_ui_draw_clear(self, conn_id, frame, p, meta):
+        # §draw: «Очистить/Стереть» — снять рисунок с view (+ удалить картинку).
+        old = views_registry.clear_drawing(
+            self.config.data_dir, frame.chatId, p.view_id)
+        if old:
+            self._delete_chat_file(frame.chatId, old)
+        return
+
+    async def _h_permission_response(self, conn_id, frame, p, meta):
+        ftype = frame.type
+        session = self.sessions.get(frame.chatId)
+        resolved = False
+        if isinstance(session, ClaudeSession):
+            # значение ответа зависит от типа фрейма; резолв — единый (§req).
+            value = (p.decision if ftype == "permission_response"
+                     else p.option_id if ftype == "picker_response"
+                     else p.data)
+            resolved = session.resolve(p.related, value)
+        if not resolved:
+            await self.hub.send_global(conn_id, make_error(
+                Err.BAD_FRAME, f"no pending request {p.related}",
+                chat_id=frame.chatId, related=frame.id))
+        return
 
     # ---------- §draw: файлы разметки + инъекция в промпт ----------
 
