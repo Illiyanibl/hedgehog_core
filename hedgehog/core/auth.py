@@ -45,7 +45,11 @@ _READ_CHUNK = 65536
 _PTY_ROWS, _PTY_COLS = 50, 1000
 
 _ANSI_RE = re.compile(
-    r"\x1b(?:\[[0-9;?>=]*[A-Za-z@]"      # CSI (цвет, курсор, приватные ?…h)
+    r"\x1b(?:\[[0-9:;<=>?]*[ -/]*[@-~]"  # CSI: параметры 0x30-0x3F (вкл. :< для
+                                         # colon-SGR) + интермедиаты 0x20-0x2F +
+                                         # финал @..~ (0x40-0x7E) — весь спектр
+                                         # ECMA-48, не только буквы (bracketed
+                                         # paste ~, DECSCUSR `ESC[2 q` и т.п.)
     r"|\][^\x07\x1b]*(?:\x07|\x1b\\)"    # OSC (заголовок окна и т.п.)
     r"|[()][0-9A-B]"                     # выбор charset
     r"|[a-zA-Z0-9=<>78])")               # одиночные ESC (save/restore cursor…)
@@ -174,10 +178,10 @@ class AuthManager:
         """Останов при shutdown сервера (auth_result не шлём)."""
         if self._task:
             self._task.cancel()
-            try:
-                await self._task
-            except (asyncio.CancelledError, Exception):
-                pass
+            # L: gather(return_exceptions) поглощает отмену/исключение самого
+            # флоу, но пробрасывает отмену НАШЕГО stop() (прежний except
+            # (CancelledError, Exception) глотал и её).
+            await asyncio.gather(self._task, return_exceptions=True)
             self._task = None
 
     # ---------- флоу ----------
@@ -188,16 +192,19 @@ class AuthManager:
         loop = asyncio.get_running_loop()
         master, slave = os.openpty()
         self._master_fd = master
-        os.set_blocking(master, False)
-        fcntl.ioctl(master, termios.TIOCSWINSZ,
-                    struct.pack("HHHH", _PTY_ROWS, _PTY_COLS, 0, 0))
-        env = dict(os.environ)
-        env["TERM"] = "xterm-256color"
+        # L: set_blocking/ioctl между openpty и try могли бросить → slave утекал
+        # (master подмёл бы _cleanup, slave — нет). Всё под одним try: на любой
+        # ранней ошибке закрываем slave и чистим master.
         try:
+            os.set_blocking(master, False)
+            fcntl.ioctl(master, termios.TIOCSWINSZ,
+                        struct.pack("HHHH", _PTY_ROWS, _PTY_COLS, 0, 0))
+            env = dict(os.environ)
+            env["TERM"] = "xterm-256color"
             self._proc = await asyncio.create_subprocess_exec(
                 "claude", "setup-token",
                 stdin=slave, stdout=slave, stderr=slave,
-                env=env, preexec_fn=os.setsid,
+                env=env, start_new_session=True,   # setsid без preexec_fn (fork-safe)
             )
         except OSError as e:
             os.close(slave)
@@ -205,6 +212,13 @@ class AuthManager:
                 "ok": False, "error": f"failed to run claude CLI: {e}"})
             self._cleanup()
             return
+        except BaseException:
+            # L: отмена (stop() на только что стартовавшем флоу) или не-OSError в
+            # окне openpty→spawn миновала бы except OSError → оба fd утекли бы.
+            # Закрываем slave + чистим master и пробрасываем (auth_result не шлём).
+            os.close(slave)
+            self._cleanup()
+            raise
         os.close(slave)
         log.info("auth.started", pid=self._proc.pid,
                  timeout=self._config.auth_timeout)
