@@ -105,6 +105,12 @@ async def fetch_limits(config: Config) -> dict:
                 log.info("limits.fetched", five=result["fiveHour"],
                          seven=result["sevenDay"], status=result["status"])
                 return result
+    except TimeoutError:
+        # L: ClientTimeout(total=20) кидает TimeoutError, а НЕ aiohttp.ClientError
+        # → раньше пролетал мимо и ронял вызывающего. (В 3.11 asyncio.TimeoutError
+        # — это builtin TimeoutError.)
+        log.warning("limits.timeout")
+        return {"error": "network", "message": "таймаут запроса лимитов"}
     except aiohttp.ClientError as e:
         log.warning("limits.fetch_failed", err=str(e))
         return {"error": "network", "message": str(e)}

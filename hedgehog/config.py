@@ -43,13 +43,27 @@ def ensure_secure_dir(path: Path) -> None:
         pass
 
 
+def _env_int(name: str, default: int) -> int:
+    """int из env с фолбэком на default при пустом/битом значении (L: кривой
+    HEDGEHOG_PORT=abc не должен ронять старт непонятным ValueError из поля)."""
+    raw = os.environ.get(name, "")
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        import sys
+        print(f"hedgehog.config: некорректный int {name}={raw!r}, беру {default}",
+              file=sys.stderr)
+        return default
+
+
 @dataclass
 class Config:
     host: str = field(default_factory=lambda: os.environ.get("HEDGEHOG_HOST", "127.0.0.1"))
-    port: int = field(default_factory=lambda: int(os.environ.get("HEDGEHOG_PORT", "8765")))
+    port: int = field(default_factory=lambda: _env_int("HEDGEHOG_PORT", 8765))
     # §7 Файлы — ОТДЕЛЬНЫЙ aiohttp-порт (WS-чаты не трогаем). Общий токен+серт.
-    file_port: int = field(default_factory=lambda: int(
-        os.environ.get("HEDGEHOG_FILE_PORT", "8767")))
+    file_port: int = field(default_factory=lambda: _env_int("HEDGEHOG_FILE_PORT", 8767))
     # TLS для файл-сервера (в бою без туннеля обязателен). Локально за
     # туннелем можно оставить выключенным (plain http). HEDGEHOG_TLS=1 → on.
     tls_enabled: bool = field(default_factory=lambda: os.environ.get(
@@ -83,24 +97,19 @@ class Config:
     neko_swap_image: str = field(default_factory=lambda: os.environ.get(
         "HEDGEHOG_NEKO_SWAP_IMAGE", "alpine:3"))
     # Порт HTTPS/WSS-сигналинга neko (TLS терминирует сам neko нашим сертом).
-    neko_https_port: int = field(default_factory=lambda: int(
-        os.environ.get("HEDGEHOG_NEKO_PORT", "8766")))
+    neko_https_port: int = field(default_factory=lambda: _env_int("HEDGEHOG_NEKO_PORT", 8766))
     # WebRTC одним портом: udp-mux (медиа) + tcp-mux (fallback на строгих сетях).
-    neko_udpmux_port: int = field(default_factory=lambda: int(
-        os.environ.get("HEDGEHOG_NEKO_UDPMUX", "59000")))
-    neko_tcpmux_port: int = field(default_factory=lambda: int(
-        os.environ.get("HEDGEHOG_NEKO_TCPMUX", "59000")))
+    neko_udpmux_port: int = field(default_factory=lambda: _env_int("HEDGEHOG_NEKO_UDPMUX", 59000))
+    neko_tcpmux_port: int = field(default_factory=lambda: _env_int("HEDGEHOG_NEKO_TCPMUX", 59000))
     # §AI-control: порт MCP-плейна @playwright/mcp внутри контейнера neko. НЕ
     # публикуется наружу (-p) — доступен только агенту по ВЫДЕЛЕННОЙ docker-сети
     # hedgehog↔neko (см. neko._ensure_network). Агент ходит на
     # http://hedgehog-neko:<port>/mcp.
-    neko_mcp_port: int = field(default_factory=lambda: int(
-        os.environ.get("HEDGEHOG_NEKO_MCP_PORT", "9250")))
+    neko_mcp_port: int = field(default_factory=lambda: _env_int("HEDGEHOG_NEKO_MCP_PORT", 9250))
     # §AI-control: swap на ХОСТЕ под neko (браузер память-тяжёлый; без swap на
     # слабых серверах OOM убивает chrome). Ставится Ёжиком через привилегированный
     # one-shot контейнер (host-ресурс — контейнер сам не создаст). 0 = выключить.
-    neko_swap_mb: int = field(default_factory=lambda: int(
-        os.environ.get("HEDGEHOG_NEKO_SWAP_MB", "1024")))
+    neko_swap_mb: int = field(default_factory=lambda: _env_int("HEDGEHOG_NEKO_SWAP_MB", 1024))
     neko_screen: str = field(default_factory=lambda: os.environ.get(
         "HEDGEHOG_NEKO_SCREEN", "1280x800@30"))
     # Публичный IP сервера — для NEKO_NAT1TO1 (ICE-кандидат WebRTC). В контейнере
