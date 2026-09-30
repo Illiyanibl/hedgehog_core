@@ -37,6 +37,13 @@ log = structlog.get_logger("skills")
 _SAFE_NAME = re.compile(r"^(?=.*[A-Za-z0-9])[A-Za-z0-9._-]+$")
 _GH_RE = re.compile(r"^https?://github\.com/([^/]+)/([^/#?]+)")
 
+# L (zip-bomb / OOM-disk): капы на скачиваемый архив скилл-репо. Сжатый — чтобы
+# r.read() не тянул гигабайты в память; распакованный (сумма деклар. размеров) +
+# число записей — чтобы extractall не забил диск бомбой при маленьком .zip.
+_MAX_ZIP_DOWNLOAD = 50 * 1024 * 1024      # 50 МБ сжатого
+_MAX_UNCOMPRESSED = 200 * 1024 * 1024     # 200 МБ распакованного суммарно
+_MAX_ZIP_ENTRIES = 10000                  # число файлов в архиве
+
 
 def _user_skills_dir() -> Path:
     return Path.home() / ".claude" / "skills"
@@ -147,9 +154,17 @@ class SkillSources:
         with tempfile.TemporaryDirectory(prefix="skillsrc-") as tmp:
             try:
                 with zipfile.ZipFile(io.BytesIO(raw)) as z:
+                    infos = z.infolist()
+                    if len(infos) > _MAX_ZIP_ENTRIES:
+                        raise SkillInstallError("в архиве слишком много файлов")
+                    total = sum(zi.file_size for zi in infos)
+                    if total > _MAX_UNCOMPRESSED:
+                        raise SkillInstallError(
+                            f"распакованный размер превышает лимит "
+                            f"{_MAX_UNCOMPRESSED // (1024 * 1024)} МБ (zip-bomb?)")
                     z.extractall(tmp)
             except zipfile.BadZipFile:
-                raise SkillInstallError("скачанный архив повреждён/не zip")
+                raise SkillInstallError("скачанный архив повреждён/не zip") from None
             seen: set[str] = set()
             for skill_md in sorted(Path(tmp).rglob("SKILL.md")):
                 fm = _read_frontmatter(skill_md)
@@ -224,7 +239,14 @@ def _download_zip(owner: str, repo: str) -> bytes:
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "hedgehog"})
             with urllib.request.urlopen(req, timeout=90) as r:
-                return r.read()
+                data = r.read(_MAX_ZIP_DOWNLOAD + 1)   # L: не тянем гигабайты в память
+                if len(data) > _MAX_ZIP_DOWNLOAD:
+                    raise SkillInstallError(
+                        f"архив репозитория больше лимита "
+                        f"{_MAX_ZIP_DOWNLOAD // (1024 * 1024)} МБ")
+                return data
+        except SkillInstallError:
+            raise                                      # свой лимит не маскируем сетевой ошибкой
         except Exception as e:  # noqa: BLE001 — покажем пользователю причину
             last = e
     raise SkillInstallError(f"не удалось скачать архив репозитория: {last}")
