@@ -58,24 +58,39 @@ class PtySession:
 
         master, slave = os.openpty()
         self._master_fd = master
-        os.set_blocking(master, False)
-        self._set_winsize(24, 80)
 
-        env = dict(os.environ)
-        env["TERM"] = "xterm-256color"
-
-        def _child_setup():
-            # Новая сессия + PTY становится controlling terminal: иначе
-            # ^C (0x03 в pty_write) не доставит SIGINT foreground-группе.
-            os.setsid()
+        def _set_ctty():
+            # setsid делает C-слой subprocess (start_new_session=True, ДО
+            # preexec_fn) — в preexec_fn остаётся только сделать PTY
+            # controlling terminal, иначе ^C (0x03 в pty_write) не доставит
+            # SIGINT foreground-группе. Минимум в preexec_fn — он бежит после
+            # fork в (возможно) многопоточном процессе (to_thread/executor).
             fcntl.ioctl(0, termios.TIOCSCTTY, 0)
 
-        self._proc = await asyncio.create_subprocess_exec(
-            "bash", "-i",
-            stdin=slave, stdout=slave, stderr=slave,
-            cwd=self.meta.cwd, env=env,
-            preexec_fn=_child_setup,
-        )
+        # L: set_blocking/ioctl/spawn под одним try — ранняя ошибка больше не
+        # оставляет открытыми master+slave (и transcript-fd).
+        try:
+            os.set_blocking(master, False)
+            self._set_winsize(24, 80)
+            env = dict(os.environ)
+            env["TERM"] = "xterm-256color"
+            self._proc = await asyncio.create_subprocess_exec(
+                "bash", "-i",
+                stdin=slave, stdout=slave, stderr=slave,
+                cwd=self.meta.cwd, env=env,
+                start_new_session=True, preexec_fn=_set_ctty,
+            )
+        except BaseException:
+            os.close(slave)
+            try:
+                os.close(master)
+            except OSError:
+                pass
+            self._master_fd = None
+            if self._history is not None:
+                self._history.close()
+                self._history = None
+            raise
         os.close(slave)
 
         loop = asyncio.get_running_loop()
@@ -87,10 +102,10 @@ class PtySession:
     async def stop(self):
         if self._flusher:
             self._flusher.cancel()
-            try:
-                await self._flusher
-            except (asyncio.CancelledError, Exception):
-                pass
+            # L: gather(return_exceptions) поглощает отмену/исключение флашера,
+            # но пробрасывает отмену самого stop() (прежний except
+            # (CancelledError, Exception) глотал и её).
+            await asyncio.gather(self._flusher, return_exceptions=True)
             self._flusher = None
         self._detach_reader()
         if self._proc is not None and self._proc.returncode is None:
