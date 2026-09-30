@@ -219,6 +219,10 @@ class SchedulerService:
         self._dblock = threading.Lock()          # сериализуем доступ к соединению
         self._loop_task: asyncio.Task | None = None
         self._running: set[str] = set()          # job_id, чьё действие сейчас идёт
+        # L: держим ссылки на fire-and-forget _fire-задачи — иначе GC может
+        # собрать их до завершения, а stop() закрыл бы БД под идущим _fire
+        # (обращение к закрытому соединению).
+        self._fire_tasks: set[asyncio.Task] = set()
 
     # --- жизненный цикл ---------------------------------------------------
 
@@ -231,12 +235,27 @@ class SchedulerService:
     async def stop(self) -> None:
         if self._loop_task:
             self._loop_task.cancel()
-            try:
-                await self._loop_task
-            except asyncio.CancelledError:
-                pass
+            await asyncio.gather(self._loop_task, return_exceptions=True)
+            self._loop_task = None
+        # Гасим in-flight _fire. ВАЖНО: отмена задачи, висящей на
+        # `await asyncio.to_thread(<db op>)`, поднимает CancelledError СРАЗУ, а
+        # сама DB-операция продолжает крутиться в потоке detached → gather её НЕ
+        # дожидается. Поэтому закрываем БД ПОД _dblock (_close_db): лок держат
+        # detached-потоки на время своей операции, close() их дождётся.
+        if self._fire_tasks:
+            for t in list(self._fire_tasks):
+                t.cancel()
+            await asyncio.gather(*self._fire_tasks, return_exceptions=True)
         if self._conn is not None:
-            await asyncio.to_thread(self._conn.close)
+            await asyncio.to_thread(self._close_db)
+            self._conn = None
+
+    def _close_db(self) -> None:
+        # Под локом: ждём detached DB-операцию отменённого _fire, потом закрываем
+        # (поток, схвативший лок уже ПОСЛЕ close, молча получит ProgrammingError —
+        # приемлемо на shutdown).
+        with self._dblock:
+            self._conn.close()
 
     def _init_db(self) -> None:
         self._artifacts_dir.mkdir(parents=True, exist_ok=True)
@@ -276,7 +295,9 @@ class SchedulerService:
             try:
                 jobs = await asyncio.to_thread(self._claim_due, time.time())
                 for job in jobs:
-                    asyncio.create_task(self._fire(job))
+                    t = asyncio.create_task(self._fire(job))
+                    self._fire_tasks.add(t)          # L: ссылка (GC) + ждём в stop()
+                    t.add_done_callback(self._fire_tasks.discard)
             except asyncio.CancelledError:
                 raise
             except Exception as e:                # петля не должна умирать
