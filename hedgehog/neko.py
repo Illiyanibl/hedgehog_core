@@ -177,11 +177,15 @@ def _seed_tls_volume(config: Config) -> bool:
 
 # ---------- сборка docker run (чистая функция — юнит-тестируемо) ----------
 
-def build_run_cmd(config: Config, user_pw: str, admin_pw: str,
+def build_run_cmd(config: Config, env_file: str,
                   network: str | None, nat_ip: str | None) -> list[str]:
+    """argv для `docker run`. ПАРОЛИ (NEKO_PASSWORD*) НЕ здесь — они в env_file
+    (L: иначе секреты видны в host `ps`/argv любому локальному юзеру). env_file
+    пишет вызывающий (0600) и удаляет после запуска; docker читает его при старте."""
     screen = config.neko_screen
     args = [
         "docker", "run", "-d", "--name", CONTAINER,
+        "--env-file", env_file,          # NEKO_PASSWORD / NEKO_PASSWORD_ADMIN (секреты)
         "--shm-size=2gb", "--cap-add=SYS_ADMIN", "--restart", "unless-stopped",
         # сигналинг HTTPS/WSS (TLS терминирует neko нашим сертом)
         "-p", f"{config.neko_https_port}:8080/tcp",
@@ -193,8 +197,6 @@ def build_run_cmd(config: Config, user_pw: str, admin_pw: str,
         "-e", "NEKO_SERVER_KEY=/tls/key.pem",
         "-e", f"NEKO_SCREEN={screen}",
         "-e", f"NEKO_DESKTOP_SCREEN={screen}",
-        "-e", f"NEKO_PASSWORD={user_pw}",
-        "-e", f"NEKO_PASSWORD_ADMIN={admin_pw}",
         "-e", f"NEKO_WEBRTC_UDPMUX={config.neko_udpmux_port}",
         "-e", f"NEKO_WEBRTC_TCPMUX={config.neko_tcpmux_port}",
         "-e", "NEKO_CAPTURE_AUDIO_CODEC=opus",
@@ -329,8 +331,18 @@ def _provision_locked(config: Config) -> NekoResult:
     _run(["docker", "run", "--rm", "-v", f"{PROFILE_VOLUME}:/p",
           config.neko_image, "sh", "-c", "rm -f /p/Singleton*"], timeout=60)
 
-    cmd = build_run_cmd(config, user_pw, admin_pw, network, nat_ip)
-    code, out = _run(cmd, timeout=120)
+    # L: пароли NEKO кладём в env-file (0600 через write_secret_file), не в argv —
+    # иначе секреты видны в host `ps`/argv любому локальному юзеру. docker читает
+    # файл при старте; удаляем сразу после (в inspect env всё равно останется —
+    # это свойство env-конфига neko, устранимо только file-секретами самого neko).
+    env_file = config.data_dir / ".neko.env"
+    try:
+        write_secret_file(
+            env_file, f"NEKO_PASSWORD={user_pw}\nNEKO_PASSWORD_ADMIN={admin_pw}\n")
+        cmd = build_run_cmd(config, str(env_file), network, nat_ip)
+        code, out = _run(cmd, timeout=120)
+    finally:
+        env_file.unlink(missing_ok=True)   # секрет не остаётся на диске
     if code != 0:
         _set_stage(STAGE_ERROR)
         if recreate:
