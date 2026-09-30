@@ -70,9 +70,6 @@ class Hub:
         if conn_id in self._conns:
             self._conns[conn_id][1].discard(chat_id)
 
-    def has_subscribers(self, chat_id: str) -> bool:
-        return any(chat_id in subs for _, subs in self._conns.values())
-
     def devices_subscribed(self, chat_id: str) -> set[str]:
         """§push: deviceId устройств с живым соединением, ПОДПИСАННЫМ на этот чат
         (т.е. получат событие напрямую по WS). Соединения без известного deviceId
