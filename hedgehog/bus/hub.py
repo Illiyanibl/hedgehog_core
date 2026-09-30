@@ -39,6 +39,13 @@ class Hub:
         self._conn_close: dict[int, CloseFn] = {}
         self._close_tasks: set[asyncio.Task] = set()   # держим ссылки на fire-and-forget
         self._next_conn_id = 1
+        # §publish hot-path: журнальные записи (append pending/transcript, вкл.
+        # _shed_pending — перезапись до 100МБ) выносим в поток, чтобы диск-I/O не
+        # держал общий event loop. Но порядок записей в ОДИН чат должен
+        # сохраняться (resume реплеит по порядку), а в чат параллельно пишут
+        # воркер сессии и серверные хендлеры → сериализуем per-chat. asyncio.Lock
+        # FIFO + отсутствие await между make_frame и acquire → файл в ULID-порядке.
+        self._write_locks: dict[str, asyncio.Lock] = {}
 
     # ---------- соединения ----------
 
@@ -96,20 +103,40 @@ class Hub:
     # (wss subscribe_chat). transcript и так пропускает snapshot.
     _PENDING_SKIP = {"screen_snapshot"}
 
+    def _write_lock(self, chat_id: str) -> asyncio.Lock:
+        lock = self._write_locks.get(chat_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._write_locks[chat_id] = lock
+        return lock
+
+    def _journal(self, chat_id: str, ftype: str, frame: dict) -> None:
+        """Синхронные журнальные записи — исполняются в фоновом потоке (to_thread).
+        Порядок per-chat гарантирует lock вызывающего; append в РАЗНЫЕ chat-файлы
+        тред-безопасен (отдельные файлы, без общего изменяемого состояния)."""
+        if ftype not in self._PENDING_SKIP:
+            try:
+                self._store.append_pending(chat_id, frame)
+            except OSError as e:
+                # Чат могли удалить под ногами — событие только в сокеты.
+                log.warning("journal.append_failed", chat_id=chat_id, err=str(e))
+        if ftype not in self._TRANSCRIPT_SKIP:
+            self._store.append_transcript(chat_id, frame)
+
     async def publish(self, chat_id: str, ftype: str, payload: dict[str, Any],
                       journal: bool = True) -> dict:
         """Событие чата: журнал + постоянный транскрипт + рассылка подписчикам."""
         frame = make_frame(ftype, payload, chat_id)
-        if journal:
-            if ftype not in self._PENDING_SKIP:
-                try:
-                    self._store.append_pending(chat_id, frame)
-                except OSError as e:
-                    # Чат могли удалить под ногами — событие только в сокеты.
-                    log.warning("journal.append_failed", chat_id=chat_id,
-                                err=str(e))
-            if ftype not in self._TRANSCRIPT_SKIP:
-                self._store.append_transcript(chat_id, frame)
+        # Фреймы, пропускаемые ОБОИМИ журналами (snapshot, ~12/с в shell-чате),
+        # не берут lock и не прыгают в поток — у них нет претензии на порядок
+        # файлов, иначе они копились бы за идущим _shed_pending (до ~100МБ).
+        if journal and (ftype not in self._PENDING_SKIP
+                        or ftype not in self._TRANSCRIPT_SKIP):
+            # Сериализуем журнал чата и выносим его в поток: _shed_pending и
+            # обычный append больше не держат общий loop; порядок — под per-chat
+            # lock. fanout — ПОСЛЕ (инвариант §5.1 «журнал до отправки»).
+            async with self._write_lock(chat_id):
+                await asyncio.to_thread(self._journal, chat_id, ftype, frame)
         delivered = await self._fanout(chat_id, frame)
         # §obs: кадр сгенерён, но подписчиков нет → лёг только в журнал (уедет
         # на resume). Рост таких строк = очередь копится (клиент отвалился/в фоне).
@@ -117,6 +144,15 @@ class Hub:
             log.info("publish.journaled_only", chat_id=chat_id, type=ftype,
                      id=frame.get("id", "")[-6:])
         return frame
+
+    async def ack(self, chat_id: str, last_seen_id: str) -> None:
+        """§5.1 шаг 6: подрезать pending. ПОД ТЕМ ЖЕ per-chat lock, что и журнал:
+        иначе ack-rewrite (read → tmp+replace = НОВЫЙ inode) гонялся бы с append в
+        потоке (open("a") держит СТАРЫЙ inode) → добавленная строка ушла бы в
+        осиротевший inode и пропала для оффлайн-устройства. Сам rewrite (до ~100МБ)
+        — тот же класс loop-блокирующего I/O, тоже в поток."""
+        async with self._write_lock(chat_id):
+            await asyncio.to_thread(self._store.ack, chat_id, last_seen_id)
 
     # M(backpressure): медленный/зависший подписчик (полный TCP-буфер, ушёл в
     # фон без чтения) не должен держать publish и блокировать доставку остальным.

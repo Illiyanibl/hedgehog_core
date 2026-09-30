@@ -83,6 +83,11 @@ class ChatStore:
         # chat_id → лимит транскрипта в байтах (0 = выкл). Кэш, чтобы не
         # читать meta.json на каждом событии; инвалидация в update_meta/delete.
         self._log_limits: dict[str, int] = {}
+        # §6.2: чаты, где pending переполнился и был подрезан (_shed_pending) —
+        # клиент получит маркер «дыры». Инициализируем ЗДЕСЬ (а не ленивым
+        # getattr): _shed_pending теперь бежит в потоке (hub journal to_thread),
+        # и ленивая RMW-инициализация гонялась бы между чатами, теряя флаг.
+        self._partial_loss: set[str] = set()
 
     # ---------- meta ----------
 
@@ -477,13 +482,13 @@ class ChatStore:
         """Страховка §6.2: дроп болтливых типов, важные события остаются."""
         events = self.read_pending(chat_id)
         kept = [ev for ev in events if ev.get("type") not in DROP_FIRST_TYPES]
-        # Пометка дыры для следующего resume (§6.2: partial_loss).
-        self._partial_loss = getattr(self, "_partial_loss", set())
+        # Пометка дыры для следующего resume (§6.2: partial_loss). set.add —
+        # атомарен под GIL, безопасен из потока (инициализация в __init__).
         self._partial_loss.add(chat_id)
         self._rewrite_pending(chat_id, kept)
 
     def had_partial_loss(self, chat_id: str) -> bool:
-        return chat_id in getattr(self, "_partial_loss", set())
+        return chat_id in self._partial_loss
 
     def clear_partial_loss(self, chat_id: str):
-        getattr(self, "_partial_loss", set()).discard(chat_id)
+        self._partial_loss.discard(chat_id)

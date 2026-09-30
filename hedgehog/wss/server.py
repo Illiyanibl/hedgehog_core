@@ -1274,7 +1274,9 @@ class HedgehogServer:
         return
 
     async def _h_ack(self, conn_id, frame, p, meta):
-        self.store.ack(frame.chatId, p.last_seen_id)
+        # ack под per-chat lock Hub'а (сериализация с журналом-в-потоке) + сам
+        # rewrite в поток — иначе гонка с append терял бы свежий фрейм (§5.1).
+        await self.hub.ack(frame.chatId, p.last_seen_id)
         log.info("chat.ack", chat_id=frame.chatId,
                  last_seen=(p.last_seen_id or "")[-6:])
         return
