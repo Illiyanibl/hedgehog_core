@@ -74,7 +74,11 @@ class PushKeys:
         except OSError as e:
             log.warning("push.keys_save_failed", err=str(e))
 
-    def _prune(self) -> None:
+    def _prune(self) -> bool:
+        """Отсев протухших + кап. True, если состав изменился (→ вызывающий
+        сохранит: без этого мёртвые записи оставались на диске и отсеивались
+        заново при каждом вызове)."""
+        before = len(self._devs)
         cutoff = time.time() - KEY_TTL
         self._devs = {d: r for d, r in self._devs.items()
                       if r.get("ts", 0) >= cutoff}
@@ -83,6 +87,7 @@ class PushKeys:
         if len(self._devs) > MAX_KEYS:
             tail = list(self._devs.items())[-MAX_KEYS:]
             self._devs = dict(tail)
+        return len(self._devs) != before
 
     def remember(self, notify_key: str, device_id: str = "") -> None:
         if not notify_key:
@@ -103,12 +108,14 @@ class PushKeys:
 
     def devices(self) -> list[tuple[str, str]]:
         """Список (deviceId, notifyKey) живых (не протухших) устройств."""
-        self._prune()
+        if self._prune():          # L: отсев протухших персистим (редко, по факту)
+            self._save()
         return [(d, r["notifyKey"]) for d, r in self._devs.items()]
 
     def keys(self) -> list[str]:
-        """Только notifyKey'и (совместимость)."""
-        self._prune()
+        """Только notifyKey'и (прод ходит через devices(); используется тестами)."""
+        if self._prune():          # L: как devices() — отсев персистим
+            self._save()
         return [r["notifyKey"] for r in self._devs.values()]
 
 
@@ -144,30 +151,38 @@ async def send(relay_urls: list[str], notify_key: str, title: str, body: str,
     if chat_id:
         payload["chatId"] = chat_id
     timeout = aiohttp.ClientTimeout(total=10)
-    for base in _ordered(relay_urls, notify_key):
-        url = base.rstrip("/") + "/v1/notify"
-        try:
-            async with aiohttp.ClientSession(timeout=timeout) as s:
-                async with s.post(url, json=payload) as r:
-                    data = {}
-                    try:
-                        data = await r.json(content_type=None)
-                    except Exception:  # noqa: BLE001
-                        data = {}
-                    if r.status == 200 and data.get("sent"):
-                        log.info("push.sent", url=base)
-                        return True
-                    reason = str(data.get("reason", "")) if isinstance(data, dict) else ""
-                    if reason == "quota":
-                        log.info("push.quota", url=base)
-                        return False
-                    if isinstance(data, dict) and data.get("apns_status") == 410:
-                        # Мёртвый токен (Unregistered) — идентичен на всех релеях.
-                        log.info("push.token_dead", url=base)
-                        return False
-                    log.info("push.relay_skip", url=base, status=r.status,
-                             reason=reason)
-        except Exception as e:  # noqa: BLE001 — сеть/таймаут → следующий релей
-            log.warning("push.relay_failed", url=base, err=str(e))
+    # L: одна ClientSession на весь failover (а не по штуке на релей) — переиспуем
+    # коннект-пул/резолвер по связке. Внешний try — контракт модуля «ошибки не
+    # пробрасываем» (создание сессии теперь вне per-relay try).
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as s:
+            for base in _ordered(relay_urls, notify_key):
+                url = base.rstrip("/") + "/v1/notify"
+                try:
+                    async with s.post(url, json=payload) as r:
+                        try:
+                            data = await r.json(content_type=None)
+                        except Exception:  # noqa: BLE001
+                            data = {}
+                        if not isinstance(data, dict):   # L: тело не dict → .get упал бы
+                            data = {}
+                        if r.status == 200 and data.get("sent"):
+                            log.info("push.sent", url=base)
+                            return True
+                        reason = str(data.get("reason", ""))
+                        if reason == "quota":
+                            log.info("push.quota", url=base)
+                            return False
+                        if data.get("apns_status") == 410:
+                            # Мёртвый токен (Unregistered) — одинаков на всех релеях.
+                            log.info("push.token_dead", url=base)
+                            return False
+                        log.info("push.relay_skip", url=base, status=r.status,
+                                 reason=reason)
+                except Exception as e:  # noqa: BLE001 — сеть/таймаут → следующий релей
+                    log.warning("push.relay_failed", url=base, err=str(e))
+    except Exception as e:  # noqa: BLE001 — контракт: пуш не роняет notify-путь
+        log.warning("push.send_failed", err=str(e))
+        return False
     log.warning("push.all_relays_failed", key=notify_key[-6:])
     return False
