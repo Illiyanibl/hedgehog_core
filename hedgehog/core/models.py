@@ -107,11 +107,11 @@ async def probe_models(config, cwd: str,
     texts: list[str] = []
     result_text = ""
     auth_state = "OK"
+    agen = query(prompt="/model", options=ClaudeAgentOptions(**kwargs))
     try:
         async def _run() -> None:
             nonlocal result_text
-            async for msg in query(prompt="/model",
-                                   options=ClaudeAgentOptions(**kwargs)):
+            async for msg in agen:
                 if isinstance(msg, AssistantMessage):
                     for b in msg.content:
                         if isinstance(b, TextBlock):
@@ -127,6 +127,16 @@ async def probe_models(config, cwd: str,
         else:
             log.warning("models.probe_failed", err=repr(e))
             auth_state = "ERROR"
+    finally:
+        # L/M: явно закрываем генератор SDK (→ его CLI-подпроцесс), не полагаясь
+        # на отмену wait_for/GC — иначе по таймауту висячие claude-процессы
+        # копятся. aclose идемпотентен (на исчерпанном генераторе — no-op).
+        aclose = getattr(agen, "aclose", None)
+        if aclose is not None:
+            try:
+                await aclose()
+            except Exception:  # noqa: BLE001 — teardown не должен ронять пробу
+                pass
 
     raw = "\n".join([*texts, result_text]).strip()
     # Явный признак незалогиненности в тексте (без исключения).
@@ -154,12 +164,21 @@ def cache_path(config, cli_type: str = DEFAULT_CLI_TYPE) -> Path:
     return config.data_dir / f"models.{safe}.json"
 
 
+def _valid_cache(data: Any) -> bool:
+    """L: минимальная валидация формы — старый/битый кэш (не dict, models не
+    список строк) игнорируем как отсутствующий → фон перечитает. cliType не
+    требуем: тип уже закодирован в имени файла (models.<cliType>.json)."""
+    return (isinstance(data, dict)
+            and isinstance(data.get("models"), list)
+            and all(isinstance(x, str) for x in data["models"]))
+
+
 def load_cache(config, cli_type: str = DEFAULT_CLI_TYPE) -> dict[str, Any] | None:
     try:
         data = json.loads(cache_path(config, cli_type).read_text())
-        return data if isinstance(data, dict) else None
     except (OSError, ValueError):
         return None
+    return data if _valid_cache(data) else None
 
 
 def save_cache(config, data: dict[str, Any],
