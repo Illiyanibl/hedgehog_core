@@ -138,17 +138,29 @@ async def _upload(request: web.Request) -> web.Response:
     file_id = new_ulid()
     safe = _safe_name(name)
     dest = files_dir / f"{file_id}__{safe}"
+    # L: пишем во временный файл и переименовываем атомарно — иначе OSError/
+    # дисконнект посреди загрузки оставлял бы ЧАСТИЧНЫЙ dest, уже скачиваемый.
+    # Имя temp (ведущая точка, без «__») не попадает под download-glob file_id__*.
+    tmp = files_dir / f".{file_id}.part"
 
     size = 0
     limit = config.max_upload_bytes
-    with open(dest, "wb") as f:
-        async for chunk in request.content.iter_chunked(1 << 16):
-            size += len(chunk)
-            if size > limit:
-                f.close()
-                dest.unlink(missing_ok=True)
-                return web.json_response({"error": "file too large"}, status=413)
-            f.write(chunk)
+    try:
+        with open(tmp, "wb") as f:
+            async for chunk in request.content.iter_chunked(1 << 16):
+                size += len(chunk)
+                if size > limit:
+                    f.close()
+                    tmp.unlink(missing_ok=True)
+                    return web.json_response({"error": "file too large"}, status=413)
+                f.write(chunk)
+        tmp.replace(dest)
+    except OSError as e:
+        tmp.unlink(missing_ok=True)
+        raise web.HTTPBadRequest(text=str(e))
+    except BaseException:          # дисконнект/отмена — не оставляем .part
+        tmp.unlink(missing_ok=True)
+        raise
 
     log.info("file.uploaded", chat=chat_id, file=file_id, name=safe,
              size=size, mime=mime)
@@ -221,6 +233,8 @@ async def _tree(request: web.Request) -> web.Response:
                 if len(entries) >= MAX_ENTRIES:
                     truncated = True
                     break
+                if de.name.endswith(".part"):   # L: временные загрузки не показываем
+                    continue
                 try:
                     st = de.stat(follow_symlinks=False)
                     is_link = de.is_symlink()
@@ -269,7 +283,9 @@ async def _put(request: web.Request) -> web.Response:
 
     size = 0
     limit = config.max_upload_bytes
-    tmp = d / (name + ".part")
+    # L: уникальный .part (ULID) — иначе две параллельные загрузки одного имени
+    # делили бы один temp (интерливинг записи + replace чужого недописанного).
+    tmp = d / f"{name}.{new_ulid()}.part"
     try:
         with open(tmp, "wb") as f:
             async for chunk in request.content.iter_chunked(1 << 16):
@@ -283,6 +299,9 @@ async def _put(request: web.Request) -> web.Response:
     except OSError as e:
         tmp.unlink(missing_ok=True)
         raise web.HTTPBadRequest(text=str(e))
+    except BaseException:          # дисконнект/отмена — не оставляем .part (как _upload)
+        tmp.unlink(missing_ok=True)
+        raise
     log.info("file.put", dir=str(d), name=name, size=size)
     return web.json_response({"name": name, "path": str(dest), "size": size})
 
@@ -293,7 +312,8 @@ async def _write(request: web.Request) -> web.Response:
     if p.exists() and p.is_dir():
         raise web.HTTPBadRequest(text="is a directory")
     data = await request.read()  # ограничен client_max_size
-    tmp = p.with_name(p.name + ".part")
+    # L: уникальный .part (ULID) — защита от коллизии параллельных записей.
+    tmp = p.with_name(f"{p.name}.{new_ulid()}.part")
     try:
         tmp.write_bytes(data)
         tmp.replace(p)
@@ -472,6 +492,8 @@ async def _zip(request: web.Request) -> web.Response:
     # каждый путь — через предохранитель (потолок/traversal), затем разворот.
     items: list[tuple[Path, str]] = []
     for rp in raw_paths[:1000]:
+        if not isinstance(rp, str):   # L: не-строка в paths → Path(rp) кидал 500
+            raise web.HTTPBadRequest(text="path must be a string")
         p = _resolve(config, rp, must_exist=True)
         items += _zip_items(p)
     if not items:
