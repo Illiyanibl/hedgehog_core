@@ -2070,10 +2070,12 @@ class HedgehogServer:
             idset = set(ids)
             active = p.active_id if p.active_id in idset else ids[0]
             small = p.small_fast_id if p.small_fast_id in idset else active
-            ok, err = await self._probe_auth(p.base_url, p.api_key, active)
-            self._mark_committing(op_id)   # §netwait H2: сетевая фаза прошла
-            if not ok:
-                return False, err
+            # §omni: активацию НЕ блокируем probe'ом шлюза. base_url+ключ уже
+            # подтверждены шагом omniroute_probe_models (каталог моделей), а probe
+            # КОНКРЕТНОЙ модели хрупок — free-провайдеры (deepseek/gemini) флапают
+            # 5xx и зря роняли активацию «сервер недоступен (500)». Пишем конфиг
+            # так же, как omniroute_set_models («Изменить модели») — без шлюза.
+            self._mark_committing(op_id)
             self.config.save_auth_config({
                 "mode": "omniroute", "api_key": p.api_key, "base_url": p.base_url,
                 "models": self._clean_omni_models(p.models),
@@ -2082,15 +2084,12 @@ class HedgehogServer:
                      new=True, n=len(ids), active=active)
         else:
             # Легаси-вид: 3 слота + алиас default_tier (как раньше).
-            probe_model = {
+            tier_model = {
                 "opus": p.opus_model, "sonnet": p.sonnet_model,
             }.get(p.default_tier, p.haiku_model)
-            if not probe_model:
+            if not tier_model:
                 return False, "не заданы модели шлюза"
-            ok, err = await self._probe_auth(p.base_url, p.api_key, probe_model)
-            self._mark_committing(op_id)   # §netwait H2: сетевая фаза прошла
-            if not ok:
-                return False, err
+            self._mark_committing(op_id)   # активацию не блокируем probe'ом шлюза
             self.config.save_auth_config({
                 "mode": "omniroute", "api_key": p.api_key, "base_url": p.base_url,
                 "opus_model": p.opus_model, "sonnet_model": p.sonnet_model,
