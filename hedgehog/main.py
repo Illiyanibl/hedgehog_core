@@ -54,6 +54,11 @@ async def _amain():
     )
     server.scheduler = scheduler
     await scheduler.start()
+    # §ctl: локальная «ручка» MCP-тулов (unix-сокет в data_dir) — чтобы модель
+    # за шлюзом-коверкателем имён (omniroute) звала тулы через Bash. Сессии
+    # регистрируются в ней по токену при старте клиента. См. core/ctl_server.py.
+    from .core import ctl_server
+    ctl = await ctl_server.start(config.data_dir / "ctl.sock")
     log.info("hedgehog.start", version=config.server_version,
              data_dir=str(config.data_dir), token_file=str(config.token_file))
 
@@ -86,6 +91,11 @@ async def _amain():
         except asyncio.CancelledError:
             pass
     await file_runner.cleanup()
+    ctl.close()
+    try:
+        await ctl.wait_closed()
+    except Exception:  # noqa: BLE001
+        pass
     await server.shutdown()
     if serve_exc is not None:
         raise serve_exc   # ненулевой код выхода → перезапуск супервизором

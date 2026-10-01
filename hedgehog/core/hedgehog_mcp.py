@@ -626,12 +626,16 @@ def build_hedgehog_mcp(session):
                 note = " (target is busy; queued for its next turn)"
         return _text(f"delivered to {chat_id}{note}")
 
-    return create_sdk_mcp_server(
-        name="hedgehog",
-        tools=[attach_file, ask_ui, ui_open, ui_update, ui_close,
-               ui_current, ui_reopen, ui_drawing,
-               handler_register, handler_list, handler_unregister,
-               handler_call, kv_set, kv_get, notify,
-               schedule_add, remind, schedule_list, schedule_cancel,
-               artifact_put, artifact_get, artifact_list,
-               list_chats, send_to_chat])
+    tools = [attach_file, ask_ui, ui_open, ui_update, ui_close,
+             ui_current, ui_reopen, ui_drawing,
+             handler_register, handler_list, handler_unregister,
+             handler_call, kv_set, kv_get, notify,
+             schedule_add, remind, schedule_list, schedule_cancel,
+             artifact_put, artifact_get, artifact_list,
+             list_chats, send_to_chat]
+    # §ctl: один источник правды — ровно те же хендлеры, что и нативный MCP,
+    # доступны локальной «ручке» (ctl_server → Bash-клиент), чтобы модель за
+    # шлюзом-коверкателем имён звала их через Bash. SdkMcpTool.handler — та же
+    # замкнутая на session корутина. См. core/ctl_server.py.
+    session._ctl_tools = {t.name: t.handler for t in tools}
+    return create_sdk_mcp_server(name="hedgehog", tools=tools)

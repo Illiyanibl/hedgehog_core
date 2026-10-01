@@ -33,6 +33,7 @@ import json
 import mimetypes
 import os
 import re
+import secrets
 import shutil
 import time
 from collections import deque
@@ -64,6 +65,7 @@ from ..store.chats import ChatMeta
 from ..store import views_registry
 from ..store import handlers_registry
 from .session_base import PublishFn
+from . import ctl_server
 # P3: MCP-тулы вынесены в hedgehog_mcp; кросс-чат константы живут там. Ре-экспорт
 # для обратной совместимости (тесты импортируют их из этого модуля).
 from .hedgehog_mcp import (  # noqa: F401 — константы ре-экспортим для тестов
@@ -119,28 +121,54 @@ Bottom line: the user sees results through your text, `notify`, `attach_file` an
 UI windows — keep the interaction inside Hedgehog's tools.
 """
 
-# §text-tools: под omniroute шлюз может коверкать имена MCP-функций
-# (mcp__hedgehog__notify → mcp_hedgehog_notify_<hex>) — тогда CLI их не находит
-# и нативный tool-use недоступен. Fallback: модель выводит маркер в тексте,
-# сервер его парсит и исполняет (fire-and-forget, MVP: notify). Аппендится к
-# системному промпту ТОЛЬКО когда _text_tools_enabled (см. вычисление флага).
+# §ctl/§text-tools: под omniroute шлюз может коверкать имена MCP-функций
+# (mcp__hedgehog__notify → mcp_hedgehog_notify_<hex>_ide) — тогда нативный
+# tool-use недоступен («No such tool available»). Два обходных пути, оба
+# аппендятся к системному промпту ТОЛЬКО когда _text_tools_enabled:
+#   1) §ctl — ЛЮБОЙ hedgehog-тул через Bash-CLI (ctl_client.py → unix-сокет →
+#      реальный хендлер); результат синхронно в stdout. Основной путь.
+#   2) §text-tools — fire-and-forget маркер ```hedgehog {json}``` (только notify),
+#      резерв на случай, если Bash недоступен.
 HEDGEHOG_TEXT_TOOLS_APPEND = """\
 
-## Sending a notification (text protocol)
+## Hedgehog tools when native MCP is unavailable
 
-Your current model may be UNABLE to call `mcp__hedgehog__notify` via normal tool
-calls. To send the user a push notification, output a fenced code block whose
-info string is `hedgehog`, containing one JSON object. The server detects it,
-sends the notification, and removes the block from your visible reply:
+Your model is reached through a gateway that may MANGLE MCP tool names, so
+`mcp__hedgehog__*` tool calls can fail with "No such tool available". When that
+happens, call the SAME tools through Bash instead — this path is not mangled:
+
+    python3 "$HEDGEHOG_CALL" <tool> '<json-args>'
+
+The tool's result is printed to stdout (use it as you would the MCP result).
+For large arguments (e.g. ui_open/ask_ui HTML) pass JSON on stdin with `-`:
+
+    python3 "$HEDGEHOG_CALL" ask_ui - <<'JSON'
+    {"title": "...", "html": "<!doctype html>..."}
+    JSON
+
+`<tool>` is any hedgehog tool WITHOUT the `mcp__hedgehog__` prefix: notify,
+attach_file, ask_ui, ui_open, ui_update, ui_close, ui_current, ui_reopen,
+ui_drawing, handler_register, handler_list, handler_unregister, handler_call,
+kv_get, kv_set, schedule_add, remind, schedule_list, schedule_cancel,
+artifact_put, artifact_get, artifact_list, list_chats, send_to_chat. Args are the
+same JSON object the MCP tool takes. For ask_ui (it waits for the user) give the
+Bash call a long timeout. Example — send a push:
+
+    python3 "$HEDGEHOG_CALL" notify '{"title": "Done", "body": "Build finished"}'
+
+Prefer the normal `mcp__hedgehog__*` tools if they work; use this Bash path only
+when they fail. Last-resort fallback for notify ONLY (if even Bash is unavailable):
+output a fenced block whose info string is `hedgehog` with one JSON object — the
+server executes it and strips it from your reply:
 
 ```hedgehog
 {"tool": "notify", "args": {"title": "<short headline>", "body": "<one or two lines>"}}
 ```
-
-Rules: emit this block ONLY when you really want to notify (never quote it as an
-example), one tool per block, at the start of a line. Only `notify` is available
-this way. Prefer the normal `mcp__hedgehog__notify` tool if it works for you.
 """
+
+# Абсолютный путь к CLI-клиенту «ручки» (hedgehog/ctl_client.py) — кладём в env
+# агента как $HEDGEHOG_CALL. claude_session.py лежит в hedgehog/core/.
+_CTL_CLIENT = str(Path(__file__).resolve().parent.parent / "ctl_client.py")
 
 # ```hedgehog\n{...}\n``` — трейлинг-фенс дизамбигуирует вложенные } (лениво
 # расширяемся до последней } перед ```). re.M — фенс с начала строки.
@@ -364,6 +392,10 @@ class ClaudeSession:
         # вычисляется при старте клиента; счётчик ограничивает исполнения за ход.
         self._text_tools_enabled = False
         self._text_tool_count = 0
+        # §ctl: {name: handler} встроенных MCP-тулов (заполняет build_hedgehog_mcp)
+        # + per-session токен «ручки» (ctl_server). Токен — секрет в env агента.
+        self._ctl_tools: dict = {}
+        self._ctl_token: str | None = None
         # related frame id → future ответа (round-trip request/response, §req)
         self._pending: dict[str, asyncio.Future] = {}
         # Ответы, пришедшие раньше регистрации future: publish() уже отдал
@@ -398,6 +430,9 @@ class ClaudeSession:
                 pass
             self._worker = None
         await self._disconnect()
+        # §ctl: снимаем регистрацию «ручки» — токен сессии больше не валиден.
+        ctl_server.unregister(self._ctl_token)
+        self._ctl_token = None
         for fut in self._pending.values():
             if not fut.done():
                 fut.cancel()
@@ -896,6 +931,22 @@ class ClaudeSession:
             if self._text_tools_enabled:
                 opts["system_prompt"]["append"] = (
                     HEDGEHOG_SYSTEM_APPEND + HEDGEHOG_TEXT_TOOLS_APPEND)
+                # §ctl: регистрируем сессию по секретному токену и кладём в env
+                # агента координаты «ручки» — CLI зовёт реальные хендлеры по
+                # unix-сокету (тот же build_hedgehog_mcp уже заполнил _ctl_tools).
+                # Токен per-session, стабильный между реконнектами; снимаем в stop().
+                if self._ctl_token is None:
+                    self._ctl_token = secrets.token_urlsafe(18)
+                ctl_server.register(self._ctl_token, self)
+                env["HEDGEHOG_CTL_SOCK"] = str(self._config.data_dir / "ctl.sock")
+                env["HEDGEHOG_CTL_TOKEN"] = self._ctl_token
+                env["HEDGEHOG_CALL"] = _CTL_CLIENT
+                # Таймаут клиента сокета тянем за ui_timeout (+запас), иначе ask_ui
+                # мог упереться в клиентский таймаут раньше серверного «нет ответа».
+                env["HEDGEHOG_CTL_TIMEOUT"] = str(int(self._config.ui_timeout + 120))
+                # Bash-таймаут должен позволить ask_ui дождаться юзера (ui_timeout).
+                env.setdefault("BASH_MAX_TIMEOUT_MS",
+                               str(int((self._config.ui_timeout + 60) * 1000)))
             # §tool-search (progressive disclosure): при большом числе MCP-тулов
             # (напр. чат с браузером neko ~40 тулов) CLI откладывает их схемы из
             # начального списка и подгружает по требованию через tool-search —
