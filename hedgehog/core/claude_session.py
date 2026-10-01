@@ -66,6 +66,7 @@ from ..store import views_registry
 from ..store import handlers_registry
 from .session_base import PublishFn
 from . import ctl_server
+from .neko_proxy import NekoProxy
 # P3: MCP-тулы вынесены в hedgehog_mcp; кросс-чат константы живут там. Ре-экспорт
 # для обратной совместимости (тесты импортируют их из этого модуля).
 from .hedgehog_mcp import (  # noqa: F401 — константы ре-экспортим для тестов
@@ -156,7 +157,10 @@ attach_file, ask_ui, ui_open, ui_update, ui_close, ui_current, ui_reopen,
 ui_drawing, handler_register, handler_list, handler_unregister, handler_call,
 kv_get, kv_set, schedule_add, remind, schedule_list, schedule_cancel,
 artifact_put, artifact_get, artifact_list, list_chats, send_to_chat. Args are the
-same JSON object the MCP tool takes. For ask_ui (it waits for the user) give the
+same JSON object the MCP tool takes. If this chat has the neko browser, its
+tools are ALSO available here under their bare names (`browser_navigate`,
+`browser_click`, `browser_snapshot`, `browser_take_screenshot`, …) — run
+`--list` to see them; screenshots are saved to a file whose path is returned. For ask_ui (it waits for the user) give the
 Bash call a long timeout. Example — send a push:
 
     python3 "$HEDGEHOG_CALL" notify '{"title": "Done", "body": "Build finished"}'
@@ -402,6 +406,8 @@ class ClaudeSession:
         self._ctl_tools: dict = {}
         self._ctl_meta: dict = {}
         self._ctl_token: str | None = None
+        # §ctl-neko: прокси к браузерному MCP (neko), если он есть в mcp_servers.
+        self._neko_proxy: NekoProxy | None = None
         # related frame id → future ответа (round-trip request/response, §req)
         self._pending: dict[str, asyncio.Future] = {}
         # Ответы, пришедшие раньше регистрации future: publish() уже отдал
@@ -439,6 +445,10 @@ class ClaudeSession:
         # §ctl: снимаем регистрацию «ручки» — токен сессии больше не валиден.
         ctl_server.unregister(self._ctl_token)
         self._ctl_token = None
+        # §ctl-neko: гасим actor-таску прокси (владеет MCP-коннектом к neko).
+        if self._neko_proxy is not None:
+            await self._neko_proxy.aclose()
+            self._neko_proxy = None
         for fut in self._pending.values():
             if not fut.done():
                 fut.cancel()
@@ -953,6 +963,13 @@ class ClaudeSession:
                 # Bash-таймаут должен позволить ask_ui дождаться юзера (ui_timeout).
                 env.setdefault("BASH_MAX_TIMEOUT_MS",
                                str(int((self._config.ui_timeout + 60) * 1000)))
+                # §ctl-neko: если в чате есть браузер neko — поднимаем прокси,
+                # ctl-ручка проксирует его browser_* тулы (имена тоже коверкает
+                # шлюз). Создаём лениво один раз на сессию; живёт до stop().
+                neko = self._mcp_servers.get("neko_browser")
+                if (self._neko_proxy is None and isinstance(neko, dict)
+                        and neko.get("type") == "http" and neko.get("url")):
+                    self._neko_proxy = NekoProxy(neko["url"])
             # §tool-search (progressive disclosure): при большом числе MCP-тулов
             # (напр. чат с браузером neko ~40 тулов) CLI откладывает их схемы из
             # начального списка и подгружает по требованию через tool-search —
