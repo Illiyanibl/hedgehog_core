@@ -26,21 +26,29 @@ def main() -> None:
     if not sock or not token:
         _die("hedgehog-call: недоступно (нет HEDGEHOG_CTL_SOCK/TOKEN в env)", 2)
     if len(sys.argv) < 2:
-        _die("usage: hedgehog-call <tool> ['<json-args>'|-]   "
-             "(- читает JSON-аргументы из stdin)", 2)
-    tool = sys.argv[1]
-    arg = sys.argv[2] if len(sys.argv) > 2 else "{}"
-    if arg == "-":
-        arg = sys.stdin.read()
-    arg = arg.strip() or "{}"
-    try:
-        args = json.loads(arg)
-    except Exception as e:  # noqa: BLE001
-        _die(f"hedgehog-call: битый JSON аргументов: {e}", 2)
-    if not isinstance(args, dict):
-        _die("hedgehog-call: аргументы должны быть JSON-объектом", 2)
+        _die("usage:\n"
+             "  hedgehog-call --list                  — список тулов + описания\n"
+             "  hedgehog-call <tool> --schema         — JSON-схема аргументов тула\n"
+             "  hedgehog-call <tool> ['<json>'|-]     — вызвать тул (- = JSON со stdin)", 2)
 
-    req = json.dumps({"token": token, "tool": tool, "args": args})
+    # §ctl самоописание: --list и <tool> --schema не требуют аргументов.
+    if sys.argv[1] == "--list":
+        req = json.dumps({"token": token, "op": "list"})
+    elif len(sys.argv) > 2 and sys.argv[2] == "--schema":
+        req = json.dumps({"token": token, "op": "schema", "tool": sys.argv[1]})
+    else:
+        tool = sys.argv[1]
+        arg = sys.argv[2] if len(sys.argv) > 2 else "{}"
+        if arg == "-":
+            arg = sys.stdin.read()
+        arg = arg.strip() or "{}"
+        try:
+            args = json.loads(arg)
+        except Exception as e:  # noqa: BLE001
+            _die(f"hedgehog-call: битый JSON аргументов: {e}", 2)
+        if not isinstance(args, dict):
+            _die("hedgehog-call: аргументы должны быть JSON-объектом", 2)
+        req = json.dumps({"token": token, "op": "call", "tool": tool, "args": args})
     try:
         timeout = float(os.environ.get("HEDGEHOG_CTL_TIMEOUT") or 3660)
     except ValueError:

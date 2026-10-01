@@ -146,6 +146,11 @@ For large arguments (e.g. ui_open/ask_ui HTML) pass JSON on stdin with `-`:
     {"title": "...", "html": "<!doctype html>..."}
     JSON
 
+Discover tools and their arguments through the same CLI (no guessing):
+
+    python3 "$HEDGEHOG_CALL" --list              # all tools + one-line descriptions
+    python3 "$HEDGEHOG_CALL" <tool> --schema     # that tool's JSON arg schema
+
 `<tool>` is any hedgehog tool WITHOUT the `mcp__hedgehog__` prefix: notify,
 attach_file, ask_ui, ui_open, ui_update, ui_close, ui_current, ui_reopen,
 ui_drawing, handler_register, handler_list, handler_unregister, handler_call,
@@ -395,6 +400,7 @@ class ClaudeSession:
         # §ctl: {name: handler} встроенных MCP-тулов (заполняет build_hedgehog_mcp)
         # + per-session токен «ручки» (ctl_server). Токен — секрет в env агента.
         self._ctl_tools: dict = {}
+        self._ctl_meta: dict = {}
         self._ctl_token: str | None = None
         # related frame id → future ответа (round-trip request/response, §req)
         self._pending: dict[str, asyncio.Future] = {}

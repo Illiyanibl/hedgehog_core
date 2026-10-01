@@ -44,6 +44,15 @@ def unregister(token: str | None) -> None:
         _sessions.pop(token, None)
 
 
+def _first_line(s) -> str:
+    """Первая непустая строка описания (для --list)."""
+    for ln in str(s or "").splitlines():
+        ln = ln.strip()
+        if ln:
+            return ln
+    return ""
+
+
 def _text_of(res) -> str:
     """Склеить текстовые блоки MCP-ответа {"content":[{"type":"text",...}]}."""
     if isinstance(res, dict):
@@ -68,10 +77,26 @@ async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) ->
                 token = req.get("token")
                 tool = req.get("tool")
                 args = req.get("args") if isinstance(req.get("args"), dict) else {}
+                op = req.get("op") or "call"
                 session = _sessions.get(token) if token else None
                 if session is None:
                     resp = {"ok": False, "error": "unknown or expired session token"}
-                else:
+                elif op == "list":
+                    # Самоописание: имена + первая строка описания каждого тула.
+                    meta = getattr(session, "_ctl_meta", None) or {}
+                    lines = [f"{n} — {_first_line(m.get('description'))}"
+                             for n, m in meta.items()]
+                    resp = {"ok": True, "text": "\n".join(lines)}
+                elif op == "schema":
+                    meta = (getattr(session, "_ctl_meta", None) or {}).get(tool)
+                    if meta is None:
+                        resp = {"ok": False, "error": f"unknown tool: {tool!r}"}
+                    else:
+                        resp = {"ok": True, "text": json.dumps(
+                            {"name": tool, "description": meta.get("description"),
+                             "input_schema": meta.get("input_schema")},
+                            ensure_ascii=False, indent=2)}
+                else:   # op == "call"
                     fn = (getattr(session, "_ctl_tools", None) or {}).get(tool)
                     if fn is None:
                         resp = {"ok": False, "error": f"unknown tool: {tool!r}"}

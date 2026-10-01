@@ -20,6 +20,46 @@ from claude_agent_sdk import create_sdk_mcp_server, tool
 
 from . import handler_runner
 
+# §ctl: SdkMcpTool.input_schema хранит СЫРОЙ аргумент декоратора — у наших тулов
+# это шорткат вида {"path": str} (питоновские типы, НЕ JSON-сериализуемо). SDK
+# превращает его в JSON-схему только внутри create_sdk_mcp_server и не пишет
+# обратно. Для ctl --schema конвертируем САМИ, тем же маппингом SDK (чтобы схема
+# совпадала с нативным MCP), с мягким фолбэком, если внутренние хелперы уедут.
+try:
+    from claude_agent_sdk import (  # type: ignore
+        _python_type_to_json_schema as _sdk_pts,
+        _typeddict_to_json_schema as _sdk_tts,
+    )
+except Exception:   # noqa: BLE001 — версия SDK без этих хелперов
+    _sdk_pts = _sdk_tts = None
+
+_PY_JSON = {str: "string", int: "integer", float: "number",
+            bool: "boolean", list: "array", dict: "object"}
+
+
+def _to_json_schema(raw) -> dict:
+    """Сырой input_schema тула → JSON-схема (как у нативного MCP)."""
+    try:
+        if isinstance(raw, dict):
+            # Уже готовая JSON-схема — отдаём как есть.
+            if ("type" in raw and "properties" in raw
+                    and isinstance(raw["type"], str)):
+                return raw
+            if _sdk_pts is not None:
+                props = {k: _sdk_pts(v) for k, v in raw.items()}
+            else:
+                props = {k: {"type": _PY_JSON.get(v, "string")}
+                         for k, v in raw.items()}
+            return {"type": "object", "properties": props,
+                    "required": list(props.keys())}
+        if _sdk_tts is not None:
+            from typing import is_typeddict
+            if is_typeddict(raw):
+                return _sdk_tts(raw)
+    except Exception:   # noqa: BLE001 — не роняем сборку MCP из-за интроспекции
+        pass
+    return {"type": "object"}
+
 log = structlog.get_logger("hedgehog_mcp")
 
 # §roster: потолок длины кросс-чат впрыска (send_to_chat). Эхо уходит в
@@ -636,6 +676,11 @@ def build_hedgehog_mcp(session):
     # §ctl: один источник правды — ровно те же хендлеры, что и нативный MCP,
     # доступны локальной «ручке» (ctl_server → Bash-клиент), чтобы модель за
     # шлюзом-коверкателем имён звала их через Bash. SdkMcpTool.handler — та же
-    # замкнутая на session корутина. См. core/ctl_server.py.
+    # замкнутая на session корутина. _ctl_meta — для самоописания (--list/
+    # --schema): описание + JSON-схема аргументов, чтобы модель узнала тулы и их
+    # аргументы через Bash, не завися от шлюза/tool-search. См. core/ctl_server.py.
     session._ctl_tools = {t.name: t.handler for t in tools}
+    session._ctl_meta = {t.name: {"description": t.description,
+                                  "input_schema": _to_json_schema(t.input_schema)}
+                         for t in tools}
     return create_sdk_mcp_server(name="hedgehog", tools=tools)
