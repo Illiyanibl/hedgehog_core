@@ -119,6 +119,35 @@ Bottom line: the user sees results through your text, `notify`, `attach_file` an
 UI windows — keep the interaction inside Hedgehog's tools.
 """
 
+# §text-tools: под omniroute шлюз может коверкать имена MCP-функций
+# (mcp__hedgehog__notify → mcp_hedgehog_notify_<hex>) — тогда CLI их не находит
+# и нативный tool-use недоступен. Fallback: модель выводит маркер в тексте,
+# сервер его парсит и исполняет (fire-and-forget, MVP: notify). Аппендится к
+# системному промпту ТОЛЬКО когда _text_tools_enabled (см. вычисление флага).
+HEDGEHOG_TEXT_TOOLS_APPEND = """\
+
+## Sending a notification (text protocol)
+
+Your current model may be UNABLE to call `mcp__hedgehog__notify` via normal tool
+calls. To send the user a push notification, output a fenced code block whose
+info string is `hedgehog`, containing one JSON object. The server detects it,
+sends the notification, and removes the block from your visible reply:
+
+```hedgehog
+{"tool": "notify", "args": {"title": "<short headline>", "body": "<one or two lines>"}}
+```
+
+Rules: emit this block ONLY when you really want to notify (never quote it as an
+example), one tool per block, at the start of a line. Only `notify` is available
+this way. Prefer the normal `mcp__hedgehog__notify` tool if it works for you.
+"""
+
+# ```hedgehog\n{...}\n``` — трейлинг-фенс дизамбигуирует вложенные } (лениво
+# расширяемся до последней } перед ```). re.M — фенс с начала строки.
+_TEXT_TOOL_RE = re.compile(
+    r"^```hedgehog[ \t]*\r?\n(\{.*?\})\r?\n[ \t]*```", re.M | re.S)
+_TEXT_TOOL_MAX_PER_TURN = 3
+
 # Маркеры auth-ошибок SDK/CLI (логаут, протухший/отозванный токен) —
 # такие падения классифицируются как AUTH_REQUIRED, а не AGENT_CRASH.
 _AUTH_ERROR_MARKERS = (
@@ -330,6 +359,11 @@ class ClaudeSession:
         # его поля, чтобы найти дискриминатор query↔result для точного фикса
         # рассинхрона тайминга (корреляции в stream-json пока нет).
         self._awaiting_result = 0
+        # §text-tools: текстовый протокол тулов как fallback под omniroute
+        # (шлюз может коверкать имена → нативный MCP недоступен). Флаг
+        # вычисляется при старте клиента; счётчик ограничивает исполнения за ход.
+        self._text_tools_enabled = False
+        self._text_tool_count = 0
         # related frame id → future ответа (round-trip request/response, §req)
         self._pending: dict[str, asyncio.Future] = {}
         # Ответы, пришедшие раньше регистрации future: publish() уже отдал
@@ -564,6 +598,54 @@ class ClaudeSession:
         core/hedgehog_mcp.build_hedgehog_mcp (метод был ~590 строк)."""
         return build_hedgehog_mcp(self)
 
+    async def _notify(self, title: str, body: str) -> bool:
+        """§notify: общий путь для MCP-тула notify и текстового протокола
+        (_run_text_tools) — чтобы поведение не расходилось. Триммим+обрезаем,
+        пустое пропускаем. True, если отправлено."""
+        title = str(title or "").strip()[:200]
+        body = str(body or "").strip()[:1000]
+        if not title and not body:
+            return False
+        await self._publish("notification", {"title": title, "body": body})
+        log.info("notify.sent", chat=self.meta.chatId,
+                 title=title[:40], size=len(body))
+        return True
+
+    async def _run_text_tools(self, text: str) -> str:
+        """§text-tools: исполнить маркеры ```hedgehog {...}``` из текста модели
+        (под omniroute). Исполненные вырезаем, битые/неизвестные/сверх
+        капа оставляем видимыми. Fire-and-forget (MVP: notify). Исключения НЕ
+        пробрасываем — иначе упал бы _reader_loop (живой клиент + мёртвый ридер)."""
+        out: list[str] = []
+        last = 0
+        for m in _TEXT_TOOL_RE.finditer(text):
+            if self._text_tool_count >= _TEXT_TOOL_MAX_PER_TURN:
+                break   # остаток (включая этот маркер) оставляем видимым
+            try:
+                spec = json.loads(m.group(1))
+            except Exception:  # noqa: BLE001
+                log.warning("text_tool.bad_json", chat=self.meta.chatId)
+                continue       # битый JSON — оставляем маркер видимым
+            executed = False
+            if isinstance(spec, dict):
+                tool = spec.get("tool")
+                args = spec.get("args") if isinstance(spec.get("args"), dict) else {}
+                if tool == "notify":
+                    try:
+                        await self._notify(args.get("title", ""), args.get("body", ""))
+                        self._text_tool_count += 1
+                        executed = True
+                    except Exception as e:  # noqa: BLE001 — не роняем ридер
+                        log.warning("text_tool.notify_failed",
+                                    chat=self.meta.chatId, err=repr(e))
+                else:
+                    log.info("text_tool.unknown", chat=self.meta.chatId, tool=tool)
+            if executed:
+                out.append(text[last:m.start()])
+                last = m.end()
+        out.append(text[last:])
+        return "".join(out)
+
     # §views: тонкие обёртки над реестром окон (data_dir/views.json). Реестр —
     # источник правды «какое окно запущено» + история явных закрытий; на нём
     # держится детерминированный пушер переоткрытия (клиентский ui_reopen) и
@@ -794,6 +876,19 @@ class ClaudeSession:
             # §models: явно выбранная в чате модель перекрывает дефолт тира.
             if self.meta.model:
                 opts["model"] = self.meta.model
+            # §text-tools: под omniroute шлюз может коверкать имена MCP-тулов
+            # (`mcp__hedgehog__X` → `mcp_hedgehog_X_<hash>`) — замечено у провайдера
+            # antigravity (`agy/*`), ломает нативный tool-use даже для Claude; у
+            # cline/openai-формата имена сохраняются и тулы работают. Провайдер по
+            # id модели надёжно не определить → включаем текстовый протокол для
+            # ВСЕГО omniroute (безвреден, если нативные тулы живы: промпт велит
+            # модели предпочитать нативный mcp__hedgehog__notify). Под oauth/apikey
+            # (прямой Anthropic) нативный MCP работает — протокол не нужен.
+            mode = self._config.load_auth_config().get("mode", "oauth")
+            self._text_tools_enabled = (mode == "omniroute")
+            if self._text_tools_enabled:
+                opts["system_prompt"]["append"] = (
+                    HEDGEHOG_SYSTEM_APPEND + HEDGEHOG_TEXT_TOOLS_APPEND)
             # §tool-search (progressive disclosure): при большом числе MCP-тулов
             # (напр. чат с браузером neko ~40 тулов) CLI откладывает их схемы из
             # начального списка и подгружает по требованию через tool-search —
@@ -868,6 +963,7 @@ class ClaudeSession:
         # раньше, чем проверка живости успеет её увидеть.
         self._turn_auth_needed = False
         self._turn_rate_limited = False
+        self._text_tool_count = 0      # §text-tools: кап исполнений на ход
         self._turn_done.clear()
         # M1: окно прерывания начинается с ЭТОГО хода — стухший запрос (message
         # пришёл до старта хода) не должен оборвать только что начатое сообщение.
@@ -974,8 +1070,18 @@ class ClaudeSession:
         elif isinstance(msg, AssistantMessage):
             for block in msg.content:
                 if isinstance(block, TextBlock):
+                    # §text-tools: один TextBlock = один готовый блок (НЕ токен-
+                    # стрим), поэтому маркер целиком в руках ДО публикации —
+                    # сканируем/вырезаем/исполняем синхронно, без буферизации.
+                    # ВАЖНО: если включить include_partial_messages, инвариант
+                    # сломается (маркер разорвёт по чанкам) — нужна буферизация.
+                    text = block.text
+                    if self._text_tools_enabled and "```hedgehog" in text:
+                        text = await self._run_text_tools(text)
+                        if not text.strip():
+                            continue   # блок был только маркером — пустой delta не шлём
                     await self._publish("text_delta", {
-                        "delta": block.text,
+                        "delta": text,
                         "agent_msg_id": self._agent_msg_id,
                     })
                 elif isinstance(block, ToolUseBlock):

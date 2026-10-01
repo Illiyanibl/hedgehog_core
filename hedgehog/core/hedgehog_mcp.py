@@ -402,16 +402,12 @@ def build_hedgehog_mcp(session):
         {"title": str, "body": str},
     )
     async def notify(args: dict[str, Any]) -> dict[str, Any]:
-        title = str(args.get("title", "") or "").strip()
-        body = str(args.get("body", "") or "").strip()
-        if not title and not body:
+        # Общий путь с текстовым протоколом (§text-tools) — session._notify:
+        # триммит/обрезает, журналируемый фрейм (store-and-forward + ack, офлайн-
+        # клиент получит на resume), логирует. Поведение не должно расходиться.
+        sent = await session._notify(args.get("title", ""), args.get("body", ""))
+        if not sent:
             return {"content": [{"type": "text", "text": "notify: empty, skipped"}]}
-        # Журналируемый фрейм (§clear-подобный путь): store-and-forward +
-        # ack бесплатно — офлайн-клиент получит на resume. id фрейма = id
-        # уведомления (клиент дедупит по нему).
-        await session._publish("notification", {"title": title, "body": body})
-        log.info("notify.sent", chat=session.meta.chatId,
-                 title=title[:40], size=len(body))
         return {"content": [{"type": "text", "text": "notification sent"}]}
 
     # §sched: планировщик задач ------------------------------------------
