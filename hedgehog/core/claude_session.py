@@ -844,6 +844,13 @@ class ClaudeSession:
                     "preset": "claude_code",
                     "append": HEDGEHOG_SYSTEM_APPEND,
                 },
+                # §no-pushtool: встроенный Claude Code тул PushNotification в
+                # headless/SDK-контексте Ёжика — ловушка: считает «терминал
+                # активен» и молча НИЧЕГО не шлёт («Not sent — this terminal is
+                # active»), а модель думает, что уведомила юзера. Реальный канал
+                # пушей — только mcp__hedgehog__notify (→ фрейм notification →
+                # устройство). Убираем ложный тул, чтобы модель брала наш.
+                "disallowed_tools": ["PushNotification"],
             }
             self._stderr_tail.clear()
             # permission_mode обрабатываем САМИ в _can_use_tool, а не через
