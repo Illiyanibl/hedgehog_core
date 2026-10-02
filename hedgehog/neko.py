@@ -200,6 +200,12 @@ def build_run_cmd(config: Config, env_file: str,
         "-e", f"NEKO_WEBRTC_UDPMUX={config.neko_udpmux_port}",
         "-e", f"NEKO_WEBRTC_TCPMUX={config.neko_tcpmux_port}",
         "-e", "NEKO_CAPTURE_AUDIO_CODEC=opus",
+        # JPEG-скринкаст как fallback видео: на мобиле UDP WebRTC к нестандартному
+        # порту часто режется → без фолбэка клиент чернеет (cast.jpg → 400). Rate/
+        # quality держим скромными (пайплайн ест CPU постоянно на слабом VPS).
+        "-e", "NEKO_CAPTURE_SCREENCAST_ENABLED=true",
+        "-e", "NEKO_CAPTURE_SCREENCAST_RATE=10/1",
+        "-e", "NEKO_CAPTURE_SCREENCAST_QUALITY=60",
         "-v", f"{TLS_VOLUME}:/tls:ro",
         "-v", f"{PROFILE_VOLUME}:/home/neko/.config/chromium",
     ]

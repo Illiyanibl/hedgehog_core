@@ -110,8 +110,11 @@ class Config:
     # слабых серверах OOM убивает chrome). Ставится Ёжиком через привилегированный
     # one-shot контейнер (host-ресурс — контейнер сам не создаст). 0 = выключить.
     neko_swap_mb: int = field(default_factory=lambda: _env_int("HEDGEHOG_NEKO_SWAP_MB", 1024))
+    # 15 fps по умолчанию: удалённый браузер смотрят в основном с мобилы по
+    # нестабильному каналу — 15 к/с заметно режут битрейт/CPU стрима без ущерба
+    # для веб-форм (переопределяется HEDGEHOG_NEKO_SCREEN).
     neko_screen: str = field(default_factory=lambda: os.environ.get(
-        "HEDGEHOG_NEKO_SCREEN", "1280x800@30"))
+        "HEDGEHOG_NEKO_SCREEN", "1280x800@15"))
     # Публичный IP сервера — для NEKO_NAT1TO1 (ICE-кандидат WebRTC). В контейнере
     # bootstrap выставляет SERVER_IP; иначе neko сам заберёт через ipfetch.
     server_ip: str | None = field(default_factory=lambda: os.environ.get(
