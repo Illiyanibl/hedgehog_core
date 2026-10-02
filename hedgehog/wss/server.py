@@ -1758,7 +1758,7 @@ class HedgehogServer:
 
             session = ClaudeSession(meta, publish, chat_error, self.config,
                                     mcp_servers=mcp_servers,
-                                    on_auth_required=self.auth.start,
+                                    on_auth_required=self._on_chat_auth_required,
                                     on_session_id=save_session_id,
                                     on_status=self._chat_status_notifier(meta.chatId),
                                     scheduler=self.scheduler,
@@ -1948,6 +1948,32 @@ class HedgehogServer:
         await self._auth_broadcast(
             "auth_result", {"ok": False, "error": reason})
 
+    async def _quiet_stop_login(self):
+        """Погасить идущий OAuth-флоу подписки БЕЗ broadcast auth_result.
+        Нужно при активации omniroute/apikey: осиротевший setup-token (его мог
+        авто-поднять on_auth_required до перехода на шлюз) иначе дожил бы до
+        внутреннего 600с в auth.py и выстрелил глобальным «...600s». В отличие от
+        _abort_login НЕ шлём ok:false — иначе ошибка мигнула бы сразу после
+        auth_result{ok:true} активации."""
+        if self.auth.running or self._login_op is not None:
+            self._cancel_login_timers()
+            self._login_op = None
+            await self.auth.stop()
+            log.info("auth.quiet_stop_login")
+
+    async def _on_chat_auth_required(self):
+        """Хук claude-сессии при AUTH_REQUIRED. Для omniroute/apikey НЕ поднимаем
+        OAuth-флоу подписки: AUTH_REQUIRED в этих режимах = отказ шлюза/ключа, а
+        не повод запускать setup-token, который юзер не завершит → через 600с
+        ложный глобальный auth_result «...600s» (а модель при этом отвечает). Чат
+        уже получил Err.AUTH_REQUIRED до вызова хука. Для подписки/без режима —
+        прежнее поведение (авто-старт)."""
+        mode = self.config.load_auth_config().get("mode")
+        if mode in ("omniroute", "apikey"):
+            log.info("auth.skip_oauth_on_alt_mode", mode=mode)
+            return
+        await self.auth.start()
+
     def _login_broadcast_hook(self, ftype: str):
         """Гасит login-таймеры по шагам (M2): start-фазу — auth_link|auth_result,
         code-фазу — только auth_result. Идемпотентно."""
@@ -2097,6 +2123,7 @@ class HedgehogServer:
                 "default_tier": p.default_tier or "haiku"})
             log.info("auth.omniroute_activated", base_url=p.base_url,
                      new=False, default_tier=p.default_tier)
+        await self._quiet_stop_login()   # убить осиротевший setup-token (ложный «600s»)
         self._reset_all_chat_models()    # §models L2: выбор мог протухнуть
         await self._restart_claude_sessions()
         self._invalidate_models_cache()   # §models: список зависит от шлюза
@@ -2178,6 +2205,7 @@ class HedgehogServer:
         if not ok:
             return False, err
         self.config.save_auth_config({**auth, "api_key": api_key})
+        await self._quiet_stop_login()   # убить осиротевший setup-token (ложный «600s»)
         await self._restart_claude_sessions()   # новый ключ в env новой сессии
         self._invalidate_models_cache()
         log.info("omni.key_updated", base_url=base)
