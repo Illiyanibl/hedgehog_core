@@ -23,7 +23,11 @@ import asyncio
 import structlog
 
 from mcp import ClientSession
-from mcp.client.streamable_http import streamablehttp_client
+try:
+    from mcp.client.streamable_http import streamablehttp_client
+except ImportError:   # старые версии mcp: символ назывался иначе
+    from mcp.client.streamable_http import (
+        streamable_http_client as streamablehttp_client)
 
 log = structlog.get_logger("neko_proxy")
 

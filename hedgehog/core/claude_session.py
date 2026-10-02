@@ -66,7 +66,9 @@ from ..store import views_registry
 from ..store import handlers_registry
 from .session_base import PublishFn
 from . import ctl_server
-from .neko_proxy import NekoProxy
+# NekoProxy импортируем ЛЕНИВО (в _ensure_client, только если в чате есть neko) —
+# его зависимость `mcp` может отсутствовать/иметь другую версию на боксе без
+# браузера; безусловный импорт на уровне модуля ронял бы весь сервер.
 # P3: MCP-тулы вынесены в hedgehog_mcp; кросс-чат константы живут там. Ре-экспорт
 # для обратной совместимости (тесты импортируют их из этого модуля).
 from .hedgehog_mcp import (  # noqa: F401 — константы ре-экспортим для тестов
@@ -969,7 +971,12 @@ class ClaudeSession:
                 neko = self._mcp_servers.get("neko_browser")
                 if (self._neko_proxy is None and isinstance(neko, dict)
                         and neko.get("type") == "http" and neko.get("url")):
-                    self._neko_proxy = NekoProxy(neko["url"])
+                    try:
+                        from .neko_proxy import NekoProxy
+                        self._neko_proxy = NekoProxy(neko["url"])
+                    except Exception as e:  # noqa: BLE001 — mcp-клиент недоступен
+                        log.warning("neko_proxy.unavailable",
+                                    chat=self.meta.chatId, err=repr(e))
             # §tool-search (progressive disclosure): при большом числе MCP-тулов
             # (напр. чат с браузером neko ~40 тулов) CLI откладывает их схемы из
             # начального списка и подгружает по требованию через tool-search —
