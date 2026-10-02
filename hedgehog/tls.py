@@ -12,10 +12,13 @@ import hashlib
 import ssl
 from pathlib import Path
 
+import structlog
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
+
+log = structlog.get_logger("tls")
 
 
 def ensure_cert(cert_path: Path, key_path: Path) -> str:
@@ -25,7 +28,15 @@ def ensure_cert(cert_path: Path, key_path: Path) -> str:
     """
     cert_path.parent.mkdir(parents=True, exist_ok=True)
     cert_path.parent.chmod(0o700)  # приватный ключ рядом — каталог только владельцу
-    if not (cert_path.exists() and key_path.exists()):
+    cert_exists, key_exists = cert_path.exists(), key_path.exists()
+    if cert_exists != key_exists:
+        # Уцелел ровно ОДИН файл → перегенерируем ОБА, но отпечаток сменится и у
+        # всех клиентов сломается пиннинг. Раньше это происходило молча — теперь
+        # громко предупреждаем (повод пере-провижинить клиентов новым отпечатком).
+        log.warning("tls.regenerating_pin_breaks",
+                    cert_exists=cert_exists, key_exists=key_exists,
+                    note="fingerprint changes; clients must re-pin")
+    if not (cert_exists and key_exists):
         key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
         name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "hedgehog")])
         now = datetime.datetime.now(datetime.timezone.utc)
