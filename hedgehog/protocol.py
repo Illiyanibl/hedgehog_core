@@ -454,12 +454,15 @@ def parse_client_frame(raw: str | bytes) -> ClientFrame:
     if not isinstance(obj, dict):
         raise BadFrame("frame must be a JSON object")
 
+    # Версию проверяем ПЕРВОЙ: на несовместимой версии набор/семантика типов
+    # может отличаться, и «unknown type» ввёл бы в заблуждение — правильный
+    # диагноз «unsupported protocol version».
+    if obj.get("v") != PROTOCOL_V:
+        raise BadFrame(f"unsupported protocol version: {obj.get('v')!r}")
+
     ftype = obj.get("type")
     if not isinstance(ftype, str) or ftype not in CLIENT_FRAME_TYPES:
         raise BadFrame(f"unknown type: {ftype!r}")
-
-    if obj.get("v") != PROTOCOL_V:
-        raise BadFrame(f"unsupported protocol version: {obj.get('v')!r}")
 
     payload_model, needs_chat = CLIENT_FRAME_TYPES[ftype]
     try:
