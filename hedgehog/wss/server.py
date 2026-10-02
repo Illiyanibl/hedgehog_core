@@ -474,13 +474,18 @@ class HedgehogServer:
         self._cancel_models_probe()
         self._models_refresh_now.set()
 
-    def _reset_all_chat_models(self) -> None:
+    async def _reset_all_chat_models(self) -> None:
         """§models L2: смена режима авторизации → per-chat выбор модели может
         стать невалидным (напр. полный id из oauth не существует в шлюзе).
-        Сбрасываем meta.model во всех чатах — пользователь выберет заново."""
+        Сбрасываем meta.model во всех чатах и шлём chat_updated на каждый
+        изменённый — клиент сразу видит сброс, а не ждёт рефетча (раньше
+        молча расходилось: в CLI-view висела протухшая модель)."""
         for m in self.store.list():
             if getattr(m, "model", None):
-                self.store.update_meta(m.chatId, model=None)
+                updated = self.store.update_meta(m.chatId, model=None)
+                if updated is not None:
+                    await self.hub.broadcast_global(
+                        make_frame("chat_updated", vars(updated)))
 
     # ---------- HTTP-этап (§1.1) ----------
 
@@ -749,7 +754,7 @@ class HedgehogServer:
         # §omni шаг 1: сохранить выбор моделей (без тир-лимита — режет клиент).
         ok, err = self._save_omniroute_models(p)
         if ok:
-            self._reset_all_chat_models()   # выбор мог протухнуть (§models L2)
+            await self._reset_all_chat_models()   # выбор мог протухнуть (§models L2)
             await self._restart_claude_sessions()
             self._invalidate_models_cache()
         await self.hub.send_global(conn_id, make_frame(
@@ -771,7 +776,7 @@ class HedgehogServer:
             log.warning("auth.logout_unlink_failed", err=str(e))
         # §altauth: разлогин сбрасывает и альт-способ (API-ключ/OmniRoute).
         self.config.clear_auth_config()
-        self._reset_all_chat_models()    # §models L2: выбор мог протухнуть
+        await self._reset_all_chat_models()    # §models L2: выбор мог протухнуть
         for chat_id, session in list(self.sessions.items()):
             if isinstance(session, ClaudeSession):
                 await self._stop_session(chat_id)
@@ -1603,7 +1608,7 @@ class HedgehogServer:
             # по подписке в CLI-view висели omniroute-модели). Только OAuth идёт
             # через этот колбэк — apikey/omniroute шлют auth_result напрямую.
             self.config.clear_auth_config()
-            self._reset_all_chat_models()      # per-chat выбор мог быть omniroute-id
+            await self._reset_all_chat_models()      # per-chat выбор мог быть omniroute-id
             # Новый OAuth-токен: пересоздаём claude-сессии, чтобы SDK
             # подхватил env CLAUDE_CODE_OAUTH_TOKEN на следующем user_msg.
             for chat_id, session in list(self.sessions.items()):
@@ -2071,7 +2076,7 @@ class HedgehogServer:
             return False, err
         self.config.save_auth_config({
             "mode": "apikey", "api_key": api_key, "base_url": base_url or None})
-        self._reset_all_chat_models()    # §models L2: выбор мог протухнуть
+        await self._reset_all_chat_models()    # §models L2: выбор мог протухнуть
         await self._restart_claude_sessions()
         self._invalidate_models_cache()   # §models: список зависит от ключа
         log.info("auth.apikey_activated", base_url=base_url or "anthropic")
@@ -2124,7 +2129,7 @@ class HedgehogServer:
             log.info("auth.omniroute_activated", base_url=p.base_url,
                      new=False, default_tier=p.default_tier)
         await self._quiet_stop_login()   # убить осиротевший setup-token (ложный «600s»)
-        self._reset_all_chat_models()    # §models L2: выбор мог протухнуть
+        await self._reset_all_chat_models()    # §models L2: выбор мог протухнуть
         await self._restart_claude_sessions()
         self._invalidate_models_cache()   # §models: список зависит от шлюза
         return True, None
