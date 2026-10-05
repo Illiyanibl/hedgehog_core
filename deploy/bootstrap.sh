@@ -162,8 +162,18 @@ mark firewall ok
 # 4) IP + токен -------------------------------------------------------------
 PUBLIC_IP="${SERVER_IP:-$(curl -fsS https://api.ipify.org 2>/dev/null || true)}"
 [ -n "$PUBLIC_IP" ] || PUBLIC_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
-TOKEN="${HEDGEHOG_TOKEN:-$(openssl rand -hex 32)}"
-log "IP=$PUBLIC_IP, WS=$WS_PORT FILE=$FILE_PORT, токен сгенерирован"
+# D2: идемпотентность токена. env-токен важнее файла в томе (config.load_token), и
+# Ёжик его не персистит — значит при повторном bootstrap без HEDGEHOG_TOKEN старый
+# токен надо достать из env ЕЩЁ ЖИВОГО контейнера (его сносит шаг 5 ниже), иначе
+# свежий рандом отрубил бы уже настроенные клиенты.
+# `|| OLD_TOKEN=""` ОБЯЗАТЕЛЕН: на чистой установке контейнера нет, docker inspect
+# выходит с кодом 1 → под `set -euo pipefail` присваивание убило бы скрипт здесь.
+OLD_TOKEN="$(docker inspect hedgehog --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null | sed -n 's/^HEDGEHOG_TOKEN=//p' | head -1)" || OLD_TOKEN=""
+TOKEN="${HEDGEHOG_TOKEN:-${OLD_TOKEN:-$(openssl rand -hex 32)}}"
+if [ -n "${HEDGEHOG_TOKEN:-}" ]; then   log "токен: из HEDGEHOG_TOKEN";
+elif [ -n "$OLD_TOKEN" ]; then          log "токен: переиспользован из текущего контейнера";
+else                                    log "токен: сгенерирован новый"; fi
+log "IP=$PUBLIC_IP, WS=$WS_PORT FILE=$FILE_PORT"
 
 # 5) сеть + тома ------------------------------------------------------------
 mark network begin

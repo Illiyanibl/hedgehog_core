@@ -143,12 +143,36 @@ class PtySession:
             # bash умер (exit/kill) — следующий ввод лениво поднимает свежий.
             await self._restart()
         await self.start()
-        if self._master_fd is None:
+        fd = self._master_fd        # E2: захватываем локально — self._master_fd
+        if fd is None:              # может обнулиться (_restart/stop), пока мы ждём
             return
-        try:
-            os.write(self._master_fd, data.encode())
-        except OSError as e:
-            log.warning("pty.write_failed", chat=self.meta.chatId, err=str(e))
+        # E2: nonblocking-мастер принимает буфер ЧАСТЯМИ — os.write возвращает число
+        # принятых байт; раньше оно игнорировалось и хвост большой команды молча
+        # терялся (команда могла исполниться обрезанной). Дописываем остаток, а на
+        # полный буфер (bash не вычитывает) ждём записываемости — но с таймаутом,
+        # иначе остановленный bash (^S/SIGSTOP) заморозил бы обработку кадров.
+        buf = data.encode()
+        loop = asyncio.get_running_loop()
+        while buf:
+            try:
+                n = os.write(fd, buf)
+                buf = buf[n:]
+            except BlockingIOError:
+                fut = loop.create_future()
+                loop.add_writer(fd, lambda: fut.done() or fut.set_result(None))
+                try:
+                    await asyncio.wait_for(fut, timeout=10)
+                except asyncio.TimeoutError:
+                    log.warning("pty.write_stalled", chat=self.meta.chatId,
+                                dropped=len(buf))
+                    return
+                finally:
+                    loop.remove_writer(fd)
+                if self._master_fd != fd:   # fd закрыт/пересоздан (restart/stop)
+                    return                  # пока ждали — не пишем в чужой fd
+            except OSError as e:
+                log.warning("pty.write_failed", chat=self.meta.chatId, err=str(e))
+                return
 
     async def _restart(self):
         log.info("pty.restart", chat=self.meta.chatId)
