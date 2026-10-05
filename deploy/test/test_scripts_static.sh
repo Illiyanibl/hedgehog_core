@@ -54,6 +54,10 @@ check "$SELF" 'json\.dump' "JSON собирается python-ом (числа/bo
 check "$SELF" 'chmod 600 "\$OUT"' "файл-конфиг 600 (Bearer+отпечаток)"
 check "$SELF" 'HH_TLS" = "1"' "tls — сквозной флаг (отпечаток только при tls)"
 check "$LIB"  'chmod 600 "\$src/run-loop.sh"' "run-loop.sh 600 (токен внутри)"
+# D1: супервизор запускается через `bash <файл>` (не execve без x-бита) + health-gate.
+check "$LIB"  'setsid nohup bash "\$src/run-loop\.sh"' "D1: run-loop через bash (не EACCES на 600)"
+check "$LIB"  'kill -0 "\$pid"' "D1: health-gate живости супервизора"
+check "$SELF" 'hh_start_supervised "\$SRC_DIR" \|\|' "D1: провал запуска → exit 1 (не ложный успех)"
 
 echo "== Итог =="
 if [ "$FAILED" = "0" ]; then echo "PASS ✅"; exit 0; else echo "FAIL ❌"; exit 1; fi

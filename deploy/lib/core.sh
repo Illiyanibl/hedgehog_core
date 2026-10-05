@@ -51,13 +51,24 @@ EOF
 }
 
 # Перезапуск supervisor-loop (нет init в контейнере — держим через setsid nohup).
+# D1: запускаем через `bash <файл>`, а НЕ напрямую — run-loop.sh лежит с правами
+# 600 (внутри Bearer-токен), прямой execve без x-бита дал бы EACCES даже под root
+# и установка «молча» падала. Возврат 1, если supervisor не поднялся (health-gate;
+# pgrep недоступен в чистом контейнере — проверяем живость по PID через kill -0).
+# ВАЖНО: звать только из скрипта (не из интерактивного шелла) — иначе фоновая job
+# станет лидером группы, setsid форкнет и $! укажет на мёртвую обёртку.
 hh_start_supervised(){ # <src_dir>
   local src="$1"
   pkill -f "hedgehog.main" 2>/dev/null || true
   pkill -f "run-loop.sh"   2>/dev/null || true
   sleep 1
-  setsid nohup "$src/run-loop.sh" >/dev/null 2>&1 &
+  setsid nohup bash "$src/run-loop.sh" >/dev/null 2>&1 &
+  local pid=$!
   sleep 4
+  if ! kill -0 "$pid" 2>/dev/null; then
+    echo "run-loop.sh не поднялся (pid $pid мёртв)" >&2
+    return 1
+  fi
 }
 
 # Ждёт серт и печатает SHA-256 отпечаток (stdout). Пусто, если не дождались.

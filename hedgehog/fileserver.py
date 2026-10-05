@@ -336,6 +336,24 @@ async def _mkdir(request: web.Request) -> web.Response:
     return web.json_response({"path": str(p)})
 
 
+def _guard_dst(config: Config, src: Path, dst: Path) -> None:
+    """F1/F2: защита приёмника move/copy ДО любых разрушающих операций.
+
+    `_clear_dst(dst)` при overwrite делает rmtree/unlink приёмника — без этой
+    проверки клиент с валидным токеном мог снести корень browse-дерева (dst=/),
+    собственный источник (src==dst) или всё поддерево (dst — предок src). `_rm`
+    давно защищает корень — move/copy эту защиту обходили."""
+    root, proj = _browse_root(config), config.projects_root
+    if dst == root or dst == proj:
+        raise web.HTTPForbidden(text="refuse to overwrite root")
+    if src == dst:
+        raise web.HTTPBadRequest(text="source and destination are the same")
+    if dst in src.parents:          # dst — предок src: rmtree(dst) снёс бы и src
+        raise web.HTTPForbidden(text="destination contains source")
+    if src in dst.parents:          # dst внутри src: copytree ушёл бы в рекурсию
+        raise web.HTTPBadRequest(text="destination is inside source")
+
+
 def _prepare_dst(dst: Path, overwrite: bool) -> web.Response | None:
     """Проверка приёмника для move/copy (без разрушающих операций — они в потоке,
     _clear_dst). None → можно писать."""
@@ -360,6 +378,7 @@ async def _move(request: web.Request) -> web.Response:
     dst = _resolve(config, _dec(request, "X-To"))
     if src == _browse_root(config):
         raise web.HTTPForbidden(text="refuse to move root")
+    _guard_dst(config, src, dst)
     overwrite = request.headers.get("X-Overwrite", "") == "1"
     if (resp := _prepare_dst(dst, overwrite)):
         return resp
@@ -380,6 +399,7 @@ async def _copy(request: web.Request) -> web.Response:
     config: Config = request.app[CONFIG_KEY]
     src = _resolve(config, _dec(request, "X-From"), must_exist=True)
     dst = _resolve(config, _dec(request, "X-To"))
+    _guard_dst(config, src, dst)
     overwrite = request.headers.get("X-Overwrite", "") == "1"
     if (resp := _prepare_dst(dst, overwrite)):
         return resp

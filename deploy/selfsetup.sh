@@ -79,7 +79,10 @@ EXTRA=""
 log "run-loop.sh (TLS=$HH_TLS, WS=$HH_WS FILE=$HH_FILE)"
 hh_write_runloop "$SRC_DIR" "$HH_DATA" "$HH_WS" "$HH_FILE" "$HH_TLS" "$HH_TOKEN" "$EXTRA"
 log "запуск Ёžika"
-hh_start_supervised "$SRC_DIR"
+hh_start_supervised "$SRC_DIR" || {
+  echo "ОШИБКА: Ёžik не запустился — см. $HH_DATA/hedgehog.log" >&2
+  exit 1
+}
 
 # 6) отпечаток TLS (сквозной флаг: только при tls) --------------------------
 FP=""
