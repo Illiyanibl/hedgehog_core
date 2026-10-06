@@ -67,6 +67,13 @@ WS_PATH = "/v1/connect"
 # рестарте после update_self (git reset --hard), поэтому кэшируем один раз.
 _SERVER_COMMIT = updater.current_sha()
 
+# §reply: доставка ответа адресату для send_to_chat. Кап одновременно ожидающих
+# reply-армов на чат-инициатор (память + амплификация ходов/подпроцессов) и TTL,
+# после которого «повисший» арм (ход цели так и не дал результат — трейлер-гонка/
+# смерть сессии) освобождает слот лениво (при следующем арме / на доставке).
+_REPLY_PENDING_CAP = 8
+_REPLY_TTL = 600.0            # сек (monotonic)
+
 
 class ChatRoster:
     """§roster: узкий фасад для кросс-чат MCP-тулов (list_chats/send_to_chat).
@@ -95,9 +102,30 @@ class ChatRoster:
         return out
 
     async def inject(self, chat_id: str, text: str, sender: str,
-                     interrupt: bool = False) -> tuple[bool, Any]:
+                     interrupt: bool = False, on_result=None) -> tuple[bool, Any]:
         return await self._srv.inject_message(
-            chat_id, text, sender=sender, interrupt=interrupt)
+            chat_id, text, sender=sender, interrupt=interrupt, on_result=on_result)
+
+    # §reply: фасад reply-роутинга для send_to_chat (не светим весь сервер).
+    def chat_name(self, chat_id: str) -> str:
+        m = self._srv.store.get(chat_id)
+        return (m.name if m else "") or ""
+
+    def arm_reply(self, initiator: str, armed: float) -> bool:
+        """Зарезервировать слот reply-арма для чата-инициатора (prune TTL + cap).
+        False → слотов нет (слишком много ожидающих ответов)."""
+        return self._srv._reply_arm(initiator, armed)
+
+    def unarm_reply(self, initiator: str, armed: float) -> None:
+        self._srv._reply_unarm(initiator, armed)
+
+    def schedule_reply(self, *, initiator: str, mode: str, armed: float,
+                       sender: str = "", body: str = "",
+                       handler: str = "", args: dict | None = None) -> None:
+        """Запланировать доставку ответа (из воркера цели) — не блокирует воркер."""
+        self._srv._schedule_reply(initiator=initiator, mode=mode, armed=armed,
+                                  sender=sender, body=body, handler=handler,
+                                  args=args or {})
 
 
 class HedgehogServer:
@@ -115,6 +143,9 @@ class HedgehogServer:
         # Сильные ссылки на fire-and-forget задачи пуша: asyncio держит задачи
         # лишь слабо, без ссылки их может собрать GC до завершения.
         self._push_tasks: set[asyncio.Task] = set()
+        # §reply: ожидающие reply-армы по чату-инициатору (monotonic-таймстампы);
+        # cap+TTL в _reply_arm. См. send_to_chat/_deliver_reply.
+        self._reply_pending: dict[str, list[float]] = {}
         # §sched: планировщик задач + блэкборд. Ставится из main.py после
         # конструктора (нужны колбэки inject/notify, замкнутые на этот сервер).
         self.scheduler = None
@@ -163,7 +194,8 @@ class HedgehogServer:
 
     async def inject_message(self, chat_id: str, text: str,
                              sender: str = "cron",
-                             interrupt: bool = True) -> tuple[bool, Any]:
+                             interrupt: bool = True,
+                             on_result=None) -> tuple[bool, Any]:
         """Инъекция текста в чат как user-сообщения (агент отвечает штатно).
         Тот же путь, что WS user_msg: echo в ленту + handle_user_msg.
 
@@ -193,8 +225,74 @@ class HedgehogServer:
             "content": text, "sender": sender, "related": None,
             "attachments": [], "btw": False,
         })
-        await session.handle_user_msg(text, interrupt=interrupt)
+        await session.handle_user_msg(text, interrupt=interrupt,
+                                      on_result=on_result)
         return True, {"cold_started": not was_running, "was_busy": was_busy}
+
+    # ---------- §reply: доставка ответа адресату (send_to_chat reply-роутинг) ----
+
+    def _reply_arm(self, initiator: str, armed: float) -> bool:
+        """Зарезервировать слот reply-арма (prune протухших по TTL + проверка cap).
+        Ключ — чат-инициатор (получатель ответа). Хранится на СЕРВЕРЕ (не на
+        сессии): декремент случается в задаче доставки вне жизни сессии."""
+        now = time.monotonic()
+        lst = self._reply_pending.setdefault(initiator, [])
+        lst[:] = [t for t in lst if now - t < _REPLY_TTL]   # lazy-TTL
+        if len(lst) >= _REPLY_PENDING_CAP:
+            return False
+        lst.append(armed)
+        return True
+
+    def _reply_unarm(self, initiator: str, armed: float) -> None:
+        """Освободить слот (впрыск не удался / доставка состоялась). Best-effort."""
+        lst = self._reply_pending.get(initiator)
+        if not lst:
+            return
+        try:
+            lst.remove(armed)
+        except ValueError:
+            pass
+        if not lst:
+            self._reply_pending.pop(initiator, None)
+
+    def _schedule_reply(self, *, initiator: str, mode: str, armed: float,
+                        sender: str, body: str, handler: str,
+                        args: dict) -> None:
+        """Из воркера цели: освободить слот и запланировать доставку отдельной
+        задачей (воркер цели не блокируется). Протухший по TTL арм — дропаем."""
+        self._reply_unarm(initiator, armed)                 # слот свободен в любом исходе
+        if time.monotonic() - armed > _REPLY_TTL:
+            log.warning("reply.stale_dropped", initiator=initiator, mode=mode)
+            return
+        task = asyncio.create_task(self._deliver_reply(
+            initiator=initiator, mode=mode, sender=sender, body=body,
+            handler=handler, args=args))
+        self._push_tasks.add(task)
+        task.add_done_callback(self._push_tasks.discard)
+
+    async def _deliver_reply(self, *, initiator: str, mode: str, sender: str,
+                             body: str, handler: str, args: dict) -> None:
+        """Фактическая доставка ответа. Режим A — впрыск в чат-инициатор (БЕЗ
+        on_result → нет петли). Режим B — вызов зарегистрированной в чате-
+        инициаторе ручки (fire-and-forget, хода НЕ триггерит). Всё под try."""
+        try:
+            if mode == "A":
+                await self.inject_message(initiator, body,
+                                          sender=sender, interrupt=False)
+            elif mode == "B":
+                rec = handlers_registry.get(self.config.data_dir, initiator, handler)
+                meta = self.store.get(initiator)
+                if rec is None or meta is None:
+                    log.warning("reply.handler_gone", initiator=initiator,
+                                handler=handler)
+                    return
+                res = await handler_runner.run(meta.cwd, rec["script"], args)
+                if not res.get("ok"):
+                    log.warning("reply.handler_failed", initiator=initiator,
+                                handler=handler, err=str(res.get("error"))[:200])
+        except Exception as e:  # noqa: BLE001 — доставка reply не критична
+            log.warning("reply.deliver_failed", initiator=initiator,
+                        mode=mode, err=repr(e))
 
     async def _defer_failed(self, chat_id: str, job_id: str) -> None:
         """§defer S4-M3: отложенное НЕ отправлено — снимаем pending-чип

@@ -356,7 +356,13 @@ class ClaudeSession:
         self._stderr_tail: deque[str] = deque(maxlen=20)
 
         self._client: ClaudeSDKClient | None = None
-        self._queue: asyncio.Queue[str] = asyncio.Queue()
+        # §reply: очередь хранит (prompt, on_result|None). on_result — опциональный
+        # async-колбэк (result_text, ok), зовётся воркером РОВНО один раз на ход
+        # (вкл. крах) — несёт результат обратно инициатору send_to_chat (reply-роутинг).
+        self._queue: asyncio.Queue[tuple[str, object]] = asyncio.Queue()
+        # §reply: последний awaited-результат хода (текст, is_error) — ридер пишет,
+        # воркер читает после завершения _one_turn, чтобы отдать в on_result.
+        self._last_turn_result: tuple[str, bool] | None = None
         self._worker: asyncio.Task | None = None
         # True, пока агент обрабатывает user_msg (для get_status, §3.7c).
         self._busy = False
@@ -475,7 +481,8 @@ class ClaudeSession:
 
     # ---------- входящие фреймы ----------
 
-    async def handle_user_msg(self, content: str, interrupt: bool = True) -> bool:
+    async def handle_user_msg(self, content: str, interrupt: bool = True,
+                              on_result=None) -> bool:
         """Поставить сообщение в очередь. Всегда возвращает False.
 
         Каждое сообщение — отдельный ход строго по очереди: воркер ждёт
@@ -494,7 +501,7 @@ class ClaudeSession:
         встать в очередь, а не оборвать его ход).
         """
         await self.start()
-        await self._queue.put(content)
+        await self._queue.put((content, on_result))
         # A1 (M1): агент занят ходом → просим воркер прервать ТЕКУЩИЙ ход. НЕ зовём
         # interrupt() здесь: на стыке ходов прямой вызов мог оборвать ход нашего же
         # только что начатого сообщения (гонка). Воркер прерывает свой ход сам и
@@ -577,11 +584,25 @@ class ClaudeSession:
 
     async def _run(self):
         while True:
-            prompt = await self._queue.get()
+            prompt, on_result = await self._queue.get()
             self._busy = True
+            self._last_turn_result = None
+            reply_text, reply_ok = "", False
             try:
                 await self._one_turn(prompt)
+                # §reply: успех хода — берём последний awaited-результат; ok, только
+                # если это не ошибка/auth-слёт/rate-limit (иначе инициатору уедет
+                # пометка о неудаче, а не сырой текст ошибки).
+                if self._last_turn_result is not None:
+                    _rtext, _ierr = self._last_turn_result
+                    reply_text = _rtext
+                    reply_ok = not (_ierr or self._turn_auth_needed
+                                    or self._turn_rate_limited)
             except asyncio.CancelledError:
+                # §reply M1: шатдаун/отмена — НЕ доставляем ответ (иначе доставка в
+                # finally могла бы холодно поднять сессию инициатора после
+                # sessions.clear() → осиротевший CLI). Слот арма освободит TTL.
+                on_result = None
                 raise
             except Exception as e:
                 # H1: сам обработчик ошибки (send_chat_error/on_auth_required/
@@ -625,6 +646,17 @@ class ClaudeSession:
                 except Exception as e4:  # noqa: BLE001 — статус не критичен
                     log.warning("status.emit_failed", chat=self.meta.chatId,
                                 err=repr(e4))
+                # §reply: РОВНО один раз на ход отдаём результат инициатору
+                # (reply-роутинг). Колбэк лишь планирует доставку (create_task на
+                # сервере) — воркер не блокируется; ошибка колбэка его не роняет.
+                if on_result is not None:
+                    try:
+                        await on_result(reply_text, reply_ok)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e5:  # noqa: BLE001
+                        log.warning("reply.on_result_failed",
+                                    chat=self.meta.chatId, err=repr(e5))
 
     @property
     def status(self) -> str:
@@ -1262,6 +1294,10 @@ class ClaudeSession:
             # Хангов не добавляет: закрытие потока/ошибка ридера взводят
             # _turn_done в _reader_loop независимо.
             if awaited:
+                # §reply: запомнить результат ЭТОГО хода для on_result (воркер
+                # прочитает после _one_turn). Трейлеры (awaited=False) не пишут —
+                # результат хода не перезатрётся фоновым хвостом субагента.
+                self._last_turn_result = (msg.result or "", bool(msg.is_error))
                 self._turn_done.set()          # разбудить ждущий _turn
             # Следующий ответ (в т.ч. фоновый хвост) — своя группа. Косметика:
             # если ТЕКСТ хвоста прошлого хода придёт вперемешку с текстом
