@@ -344,8 +344,11 @@ def _guard_dst(config: Config, src: Path, dst: Path) -> None:
     собственный источник (src==dst) или всё поддерево (dst — предок src). `_rm`
     давно защищает корень — move/copy эту защиту обходили."""
     root, proj = _browse_root(config), config.projects_root
-    if dst == root or dst == proj:
-        raise web.HTTPForbidden(text="refuse to overwrite root")
+    # F1: отклоняем не только РАВЕНСТВО корню/projects_root, но и ПРЕДКОВ
+    # projects_root (напр. при дефолтном browse_root=/ это /data — родитель
+    # /data/chats): rmtree предка снёс бы чаты/данные целиком.
+    if dst == root or dst == proj or dst in proj.parents:
+        raise web.HTTPForbidden(text="refuse to overwrite root or projects ancestor")
     if src == dst:
         raise web.HTTPBadRequest(text="source and destination are the same")
     if dst in src.parents:          # dst — предок src: rmtree(dst) снёс бы и src
@@ -422,8 +425,10 @@ async def _copy(request: web.Request) -> web.Response:
 async def _rm(request: web.Request) -> web.Response:
     config: Config = request.app[CONFIG_KEY]
     p = _resolve(config, _dec(request, "X-Path"), must_exist=True)
-    # Запрет на снос потолка обзора и «домашнего» корня проектов.
-    if p == _browse_root(config) or p == config.projects_root:
+    # Запрет на снос потолка обзора, «домашнего» корня проектов И ЕГО ПРЕДКОВ
+    # (F1: при browse_root=/ это /data — родитель /data/chats; rmtree снёс бы всё).
+    proj = config.projects_root
+    if p == _browse_root(config) or p == proj or p in proj.parents:
         raise web.HTTPForbidden(text="refuse to delete root")
     def _do():                       # S5-M6: rmtree крупной папки — в поток
         if p.is_dir() and not p.is_symlink():

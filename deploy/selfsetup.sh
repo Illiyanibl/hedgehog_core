@@ -74,8 +74,10 @@ HH_TOKEN="${HH_TOKEN_SET:-$(openssl rand -hex 32)}"
 mkdir -p "$HH_DATA"
 chmod 700 "$HH_DATA" 2>/dev/null || true
 EXTRA=""
-[ -n "$HH_BROWSE" ] && EXTRA="$EXTRA"$'\n'"export HEDGEHOG_BROWSE_ROOT=\"$HH_BROWSE\""
-[ -n "$HH_DEFCWD" ] && EXTRA="$EXTRA"$'\n'"export HEDGEHOG_DEFAULT_CWD=\"$HH_DEFCWD\""
+# D1: значения из конфига — через hh_shq (одиночные кавычки + escape), иначе
+# $(...)/$VAR в browse_root/default_cwd исполнились бы при запуске run-loop.sh.
+[ -n "$HH_BROWSE" ] && EXTRA="$EXTRA"$'\n'"export HEDGEHOG_BROWSE_ROOT=$(hh_shq "$HH_BROWSE")"
+[ -n "$HH_DEFCWD" ] && EXTRA="$EXTRA"$'\n'"export HEDGEHOG_DEFAULT_CWD=$(hh_shq "$HH_DEFCWD")"
 log "run-loop.sh (TLS=$HH_TLS, WS=$HH_WS FILE=$HH_FILE)"
 hh_write_runloop "$SRC_DIR" "$HH_DATA" "$HH_WS" "$HH_FILE" "$HH_TLS" "$HH_TOKEN" "$EXTRA"
 log "запуск Ёžika"

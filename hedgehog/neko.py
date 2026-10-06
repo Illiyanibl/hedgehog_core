@@ -100,7 +100,7 @@ def _docker_ok() -> bool:
     return code == 0
 
 
-def _ensure_network() -> str | None:
+def _ensure_network() -> tuple[str | None, bool]:
     """Выделенная docker-сеть ТОЛЬКО hedgehog↔neko (§AI-control).
 
     Смысл: MCP-плейн (порт 9250) без аутентификации → его должен видеть лишь
@@ -110,19 +110,23 @@ def _ensure_network() -> str | None:
     hedgehog-neko:9250) и выход в интернет (браузеру нужен доступ к сайтам).
 
     Идемпотентно: повторные create/connect не роняют провижининг.
+    Возврат (network, connected): network=None → сеть не создана (fail-closed,
+    neko не поднимаем). connected=False (N3) → сам Ёжик к сети не подключился,
+    агент НЕ достучится до MCP → ai_control honest=False (не ложный True).
     """
     code, out = _run(["docker", "network", "create", NETWORK], timeout=30)
     if code != 0 and "already exists" not in out.lower():
         log.error("neko.network.create_failed", out=out[-200:])
-        return None
+        return None, False
     host = socket.gethostname()  # hostname контейнера Ёжика = его id
     code, out = _run(["docker", "network", "connect", NETWORK, host], timeout=30)
     low = out.lower()
-    if code != 0 and "already exists" not in low and "already in network" not in low:
-        # не фатально: если connect не прошёл — neko всё равно поднимется, просто
-        # агент не достучится до mcp (AI-control будет недоступен, но не крах).
+    connected = (code == 0 or "already exists" in low or "already in network" in low)
+    if not connected:
+        # не крах: neko поднимется изолированно, но AI-control недоступен — честно
+        # вернём это флагом (N3), а не рапортуем рабочий MCP.
         log.warning("neko.network.connect_self_failed", out=out[-200:])
-    return NETWORK
+    return NETWORK, connected
 
 
 def _container_status(name: str) -> str:
@@ -312,9 +316,9 @@ def _provision_locked(config: Config) -> NekoResult:
         return NekoResult(ok=False, status="error", stage=STAGE_ERROR,
                           message="не удалось подготовить TLS-серт для neko")
 
-    network = _ensure_network()
+    network, net_connected = _ensure_network()
     if network is None:
-        # N2: fail-closed. Раньше при провале создания выделенной сети neko
+        # fail-closed. Раньше при провале создания выделенной сети neko
         # запускался БЕЗ --network → уходил в default bridge, где его
         # неаутентифицированный MCP-плейн (:9250) видели app-контейнеры агента.
         # Нет изоляции — не запускаем браузер вовсе.
@@ -355,8 +359,17 @@ def _provision_locked(config: Config) -> NekoResult:
             env_file, f"NEKO_PASSWORD={user_pw}\nNEKO_PASSWORD_ADMIN={admin_pw}\n")
         cmd = build_run_cmd(config, str(env_file), network, nat_ip)
         code, out = _run(cmd, timeout=120)
+    except OSError as e:
+        # N1: сбой записи env-файла (диск/права) — раньше исключение улетало из
+        # provision МИМО отката: старый контейнер оставался в `-old`, stage застревал
+        # в DEPLOYING. Теперь направляем в общий rollback-путь (code!=0 ниже).
+        code, out = 1, f"env-file: {e}"
     finally:
         env_file.unlink(missing_ok=True)   # секрет не остаётся на диске
+    # N2: `docker run -d` rc=0 не гарантирует живость — контейнер мог сразу упасть.
+    # Проверяем статус ДО сноса старого; если новый не «running» — трактуем как сбой.
+    if code == 0 and _container_status(CONTAINER) != "running":
+        code, out = 1, "new neko container is not running (exited immediately?)"
     if code != 0:
         _set_stage(STAGE_ERROR)
         if recreate:
@@ -378,10 +391,12 @@ def _provision_locked(config: Config) -> NekoResult:
     log.info("neko.provisioned", port=config.neko_https_port, network=network,
              nat=nat_ip or "ipfetch")
     # Клиент логинится как admin (host + контроль экрана), как devolution.
+    # N3: ai_control честно отражает, подключился ли сам Ёжик к neko-сети —
+    # иначе агент не достучится до MCP, а мы бы рапортовали рабочий AI-control.
     return NekoResult(ok=True, status="running", stage=STAGE_READY,
                       https_port=config.neko_https_port,
                       user_password=admin_pw, server_ip=config.server_ip or "",
-                      mcp_port=config.neko_mcp_port, ai_control=True)
+                      mcp_port=config.neko_mcp_port, ai_control=net_connected)
 
 
 def teardown(config: Config) -> NekoResult:

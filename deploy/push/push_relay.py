@@ -651,14 +651,20 @@ async def handle_notify(request: web.Request) -> web.Response:
     # BadDeviceToken (400) НЕ удаляем: частая причина — рассинхрон env, снесёт живое.
     if resp.status_code == 410 or reason == "Unregistered":
         async with request.app["wlock"]:
+            # A1: гасим/удаляем ТОЛЬКО если apns_token всё ещё тот, что получил
+            # 410. Иначе конкурентная перерегистрация (новый apns_token записан
+            # между SELECT и ответом Apple) была бы затёрта — потеряли бы ЖИВОЙ токен.
             if v2_device is not None:
                 # v2: строку НЕ удаляем (в ней deviceToken-авторизация) — снимаем
                 # только apns_token; клиент перерегистрирует при следующем запуске.
                 await db.execute(
-                    "UPDATE user_devices SET apns_token=NULL WHERE user_id=? AND device_id=?",
-                    v2_device)
+                    "UPDATE user_devices SET apns_token=NULL "
+                    "WHERE user_id=? AND device_id=? AND apns_token=?",
+                    (*v2_device, apns_token))
             else:
-                await db.execute("DELETE FROM devices WHERE notify_key=?", (nkey,))
+                await db.execute(
+                    "DELETE FROM devices WHERE notify_key=? AND apns_token=?",
+                    (nkey, apns_token))
             await db.commit()
     # Клиенту отдаём apns_status (нужен для failover-логики связки: 410=мёртвый
     # токен), но НЕ сырой текст Apple (минимизируем рекон для хостильного Ёžika).

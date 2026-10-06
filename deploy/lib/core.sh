@@ -7,6 +7,12 @@
 
 hh_log(){ echo "[$1] $2"; }
 
+# D1: single-quote + escape для безопасной подстановки значения в генерируемый
+# shell-скрипт. Значения конфига (data_dir/token/browse_root/…) могут содержать
+# $(...)/$VAR — без этого они исполнились бы при запуске run-loop.sh (вторичная
+# shell-инъекция «конфиг = код»). `a'b` → `'a'\''b'`.
+hh_shq(){ local s=$1; s=${s//\'/\'\\\'\'}; printf "'%s'" "$s"; }
+
 # apt-зависимости для процесс-режима (без docker).
 hh_install_deps(){
   export DEBIAN_FRONTEND=noninteractive
@@ -33,17 +39,24 @@ hh_make_venv(){ # <src_dir>
 # поэтому не 755 (иначе токен читаем другими пользователями машины).
 hh_write_runloop(){ # <src> <data_dir> <ws> <file_port> <tls01> <token> [extra_env]
   local src="$1" data="$2" ws="$3" fport="$4" tls="$5" tok="$6" extra="${7:-}"
+  # D1: все значения — через hh_shq (одиночные кавычки + экранирование), чтобы
+  # `$(...)`/`$VAR` в data_dir/token и т.п. НЕ исполнялись при запуске run-loop.sh.
+  # $extra (блок export'ов) формирует вызывающий — он тоже обязан экранировать
+  # значения (см. selfsetup.sh). Порты/tls тоже квотим — дёшево и безопасно.
+  local q_src q_data q_tok q_ws q_fp q_tls
+  q_src=$(hh_shq "$src"); q_data=$(hh_shq "$data"); q_tok=$(hh_shq "$tok")
+  q_ws=$(hh_shq "$ws"); q_fp=$(hh_shq "$fport"); q_tls=$(hh_shq "$tls")
   cat > "$src/run-loop.sh" <<EOF
 #!/usr/bin/env bash
 export HEDGEHOG_HOST=0.0.0.0
-export HEDGEHOG_PORT=$ws
-export HEDGEHOG_FILE_PORT=$fport
-export HEDGEHOG_DATA_DIR="$data"
-export HEDGEHOG_TOKEN="$tok"
-export HEDGEHOG_TLS=$tls$extra
-cd "$src"
+export HEDGEHOG_PORT=$q_ws
+export HEDGEHOG_FILE_PORT=$q_fp
+export HEDGEHOG_DATA_DIR=$q_data
+export HEDGEHOG_TOKEN=$q_tok
+export HEDGEHOG_TLS=$q_tls$extra
+cd $q_src
 while true; do
-  .venv/bin/python -m hedgehog.main >> "$data/hedgehog.log" 2>&1 || true
+  .venv/bin/python -m hedgehog.main >> $q_data/hedgehog.log 2>&1 || true
   sleep 3
 done
 EOF
