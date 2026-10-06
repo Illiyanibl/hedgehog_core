@@ -287,7 +287,14 @@ for _ in $(seq 1 40); do
   fi
   sleep 2
 done
-[ -n "$FP" ] || log "предупреждение: TLS-отпечаток не получен (проверь: docker logs hedgehog)"
+# D6: bootstrap всегда поднимает TLS (tls:true ниже) — пустой отпечаток значит
+# сервер не стартовал. НЕ рапортуем успех: клиент получил бы tls:true без пиннинга.
+if [ -z "$FP" ]; then
+  log "ОШИБКА: TLS-отпечаток не получен — сервер не поднялся? (docker logs hedgehog)"
+  mark tls fail
+  [ -n "$STATE" ] && echo fail > "$STATE/status" 2>/dev/null || true
+  exit 1
+fi
 mark tls ok
 
 # 9) JSON коннекта ----------------------------------------------------------

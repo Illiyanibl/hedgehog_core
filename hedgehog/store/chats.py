@@ -330,7 +330,13 @@ class ChatStore:
             # Отрезаем первую (возможно оборванную) строку.
             nl = tail.find(b"\n")
             if nl != -1:
-                tail = tail[nl + 1:]
+                trimmed = tail[nl + 1:]
+                # F4: если после отрезания ничего не осталось — единственная запись
+                # длиннее limit; НЕ обнуляем транскрипт (потеряли бы всю историю),
+                # оставляем файл как есть (временно > limit, срежется на след. записи).
+                if not trimmed:
+                    return
+                tail = trimmed
             tmp = path.with_suffix(".jsonl.tmp")
             tmp.write_bytes(tail)
             tmp.replace(path)
@@ -408,7 +414,12 @@ class ChatStore:
                 return events[i + 1:], False
         # 2) курсор не в pending, но pending начинается ПОСЛЕ курсора → pending и
         #    есть новое (заакан ровно до курсора). Быстро, без чтения транскрипта.
-        if events and str(events[0].get("id", "")) > last_seen_id:
+        #    F3: только когда транскрипта НЕТ (limit<=0) — иначе допущение «заакан
+        #    ровно до курсора» ломается при мульти-девайсе (ack другого устройства
+        #    мог срезать pending дальше курсора), и события в дыре терялись бы;
+        #    при живом транскрипте проваливаемся в ветку 4 и добираем их оттуда.
+        if (events and str(events[0].get("id", "")) > last_seen_id
+                and self.transcript_limit(chat_id) <= 0):
             return events, False
         # 3) pending пуст ИЛИ его первый ≤ курсора (курсор в «дыре» — типично при
         #    мульти-девайсе). Дешёвый short-circuit: курсор == последнему в
@@ -479,9 +490,23 @@ class ChatStore:
         tmp.replace(path)
 
     def _shed_pending(self, chat_id: str):
-        """Страховка §6.2: дроп болтливых типов, важные события остаются."""
+        """Страховка §6.2: дроп болтливых типов, важные события остаются.
+
+        F6: если после дропа болтливых типов размер всё ещё выше cap — режем
+        старейшие события ЛЮБЫХ типов до cap/2. Иначе при потоке важных событий
+        (напр. долгий scheduled-прогон без клиента) cap не держался: файл рос без
+        потолка, а _shed на каждом append перечитывал/переписывал весь 100+ МиБ
+        (квадратичный I/O). Размер считаем в БАЙТАХ (ensure_ascii=False → кириллица)."""
         events = self.read_pending(chat_id)
         kept = [ev for ev in events if ev.get("type") not in DROP_FIRST_TYPES]
+        sizes = [len(json.dumps(ev, ensure_ascii=False).encode()) + 1 for ev in kept]
+        total = sum(sizes)
+        if total > PENDING_HARD_CAP // 2:
+            cut = 0                      # сколько старейших выкинуть (срез с начала)
+            while cut < len(kept) and total > PENDING_HARD_CAP // 2:
+                total -= sizes[cut]
+                cut += 1
+            kept = kept[cut:]
         # Пометка дыры для следующего resume (§6.2: partial_loss). set.add —
         # атомарен под GIL, безопасен из потока (инициализация в __init__).
         self._partial_loss.add(chat_id)

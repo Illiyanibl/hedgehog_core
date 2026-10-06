@@ -96,7 +96,7 @@ while true; do
   sleep 3
 done
 EOF
-chmod +x "$SRC_DIR/run-loop.sh"
+chmod 700 "$SRC_DIR/run-loop.sh"   # D5: внутри Bearer-токен → не 755 (не читаем others); x-бит нужен (запуск напрямую ниже)
 
 log "запуск Ёжика (WS=$WS_PORT FILE=$FILE_PORT)"
 pkill -f "hedgehog.main" 2>/dev/null || true
@@ -119,7 +119,14 @@ for _ in $(seq 1 30); do
   fi
   sleep 2
 done
-[ -n "$FP" ] || log "предупреждение: TLS-отпечаток не получен (см. $DATA_DIR/hedgehog.log)"
+# D6: TLS здесь всегда включён (tls:true в CONNECT_JSON) — пустой отпечаток значит
+# сервер не поднялся. НЕ рапортуем успех: клиент получил бы tls:true без пиннинга.
+if [ -z "$FP" ]; then
+  log "ОШИБКА: TLS-отпечаток не получен — сервер не поднялся? (см. $DATA_DIR/hedgehog.log)"
+  mark tls fail
+  [ -n "$STATE" ] && echo fail > "$STATE/status" 2>/dev/null || true
+  exit 1
+fi
 mark tls ok
 
 # 7) JSON коннекта ------------------------------------------------------------

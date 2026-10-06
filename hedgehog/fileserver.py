@@ -452,15 +452,29 @@ async def _attach(request: web.Request) -> web.Response:
     if not src.is_file():
         raise web.HTTPBadRequest(text="not a file")
 
+    # F5: лимит размера (как в _upload/_put) — иначе attach гигантского файла
+    # раздувал бы диск без потолка.
+    if src.stat().st_size > config.max_upload_bytes:
+        return web.json_response({"error": "file too large"}, status=413)
+
     files_dir = chat_dir / "files"
     files_dir.mkdir(parents=True, exist_ok=True)
     file_id = new_ulid()
     safe = _safe_name(src.name)
     dest = files_dir / f"{file_id}__{safe}"
+    # F5: копируем В ПОТОКЕ (shutil.copy2 блокирующий — на loop морозил бы все чаты)
+    # во временный ".{file_id}.part" (вне download-glob file_id__*), затем атомарный
+    # replace; на любой сбой/отмену убираем .part, чтобы не копить мусор.
+    tmp = files_dir / f".{file_id}.part"
     try:
-        shutil.copy2(src, dest)
+        await asyncio.to_thread(shutil.copy2, src, tmp)
+        tmp.replace(dest)
     except OSError as e:
+        tmp.unlink(missing_ok=True)
         raise web.HTTPBadRequest(text=str(e))
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
     mime = mimetypes.guess_type(src.name)[0] or "application/octet-stream"
     log.info("file.attach", chat=chat_id, file=file_id, name=safe)
     return web.json_response({

@@ -29,15 +29,21 @@ MAX_STDERR = 256 * 1024          # S5-M5: stderr тоже ограничен (и
 def _kill_group(proc: asyncio.subprocess.Process) -> None:
     """S5-M5: убить ВСю группу процессов ручки (внуков тоже). Ручка стартует в
     своей сессии (start_new_session), поэтому pgid == pid."""
-    if proc.returncode is not None:
-        return                    # L1: уже завершён/reaped — не бьём чужой pid
+    # E4: бьём группу по pid (== pgid, т.к. start_new_session) НАПРЯМУЮ, без раннего
+    # возврата при reaped-лидере. Раньше `if proc.returncode is not None: return`
+    # делал no-op, если asyncio-childwatcher уже пожал прямого ребёнка — а внук,
+    # державший stdout/stderr (демонизировавшийся потомок), переживал таймаут.
+    # pgid остаётся валидным, пока жив ЛЮБОЙ член группы, в т.ч. после смерти лидера.
     try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-    except (ProcessLookupError, PermissionError, OSError):
-        try:
-            proc.kill()
-        except (ProcessLookupError, OSError):
-            pass
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass                      # группы уже нет — всё завершилось
+    except OSError:
+        if proc.returncode is None:
+            try:
+                proc.kill()
+            except (ProcessLookupError, OSError):
+                pass
 
 
 async def _read_capped(stream: asyncio.StreamReader, limit: int) -> tuple[bytes, bool]:

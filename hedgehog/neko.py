@@ -313,6 +313,14 @@ def _provision_locked(config: Config) -> NekoResult:
                           message="не удалось подготовить TLS-серт для neko")
 
     network = _ensure_network()
+    if network is None:
+        # N2: fail-closed. Раньше при провале создания выделенной сети neko
+        # запускался БЕЗ --network → уходил в default bridge, где его
+        # неаутентифицированный MCP-плейн (:9250) видели app-контейнеры агента.
+        # Нет изоляции — не запускаем браузер вовсе.
+        _set_stage(STAGE_ERROR)
+        return NekoResult(ok=False, status="error", stage=STAGE_ERROR,
+                          message="не удалось создать изолированную сеть neko")
     _ensure_swap(config)      # §AI-control: host-swap под память браузера (best-effort)
     nat_ip = config.server_ip
 

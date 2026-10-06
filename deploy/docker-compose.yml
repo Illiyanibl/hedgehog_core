@@ -51,11 +51,13 @@ services:
       DOCKER_HOST: tcp://socket-proxy:2375
       HEDGEHOG_HOST: 0.0.0.0
       HEDGEHOG_DEFAULT_CWD: /apps
-      # Bearer-токен и TLS файл-сервера задаёт bootstrap через .env (пусто →
-      # Ёжик сам сгенерит токен, TLS выключен). config.load_token игнорирует
-      # пустую строку, поэтому дефолт безопасен.
+      # Bearer-токен задаёт bootstrap через .env (пусто → Ёжик сам сгенерит,
+      # config.load_token игнорирует пустую строку — дефолт безопасен).
       HEDGEHOG_TOKEN: ${HEDGEHOG_TOKEN:-}
-      HEDGEHOG_TLS: ${HEDGEHOG_TLS:-}
+      # N1: TLS по умолчанию ВКЛЮЧЁН — порты публикуются на 0.0.0.0, без TLS Bearer
+      # шёл бы по открытому каналу. Выключать только явным HEDGEHOG_TLS=0 и только
+      # за доверенным туннелем/localhost (серт Ёжик генерит сам, self-signed).
+      HEDGEHOG_TLS: ${HEDGEHOG_TLS:-1}
       # Диапазон портов приложений (для агента; firewall открывает его в bootstrap).
       APP_PORT_MIN: 8000
       APP_PORT_MAX: 8099
