@@ -178,7 +178,12 @@ def _compute_next(kind: str, spec: str, after_ts: float) -> float | None:
 def _initial_next(kind: str, spec: str, now_ts: float) -> float:
     """next_run при создании задачи."""
     if kind == "once":
-        return float(spec)             # epoch момента срабатывания
+        v = float(spec)                # epoch момента срабатывания
+        # S4: nan/inf → next_run никогда не сработает, но займёт слот из лимита
+        # на чат (как и interval-ветка ниже, где проверка уже есть).
+        if not math.isfinite(v):
+            raise ValueError("once timestamp must be a finite number")
+        return v
     if kind == "cron":
         return _cron_next(spec, datetime.fromtimestamp(now_ts)).timestamp()
     if kind == "interval":
@@ -342,7 +347,16 @@ class SchedulerService:
             action = job["action"]
             chat_id = job["chat_id"]
             if action == "inject_text":
-                await self._inject(chat_id, str(payload.get("text", "")))
+                # S1: _inject возвращает (ok, info) — раньше игнорировали, и
+                # недоставка (чат удалён/сменил addressee/пустой текст) писалась
+                # в job_runs как ok. Теперь отражаем реальный исход.
+                ok, info = await self._inject(chat_id, str(payload.get("text", "")))
+                if not ok:
+                    await asyncio.to_thread(self._record_run, jid, "error",
+                                            str(info)[:300])
+                    log.warning("sched.inject_failed", job=jid, chat=chat_id,
+                                reason=str(info)[:120])
+                    return
             elif action == "inject_user":
                 # §defer: отложенное сообщение пользователя (текст + вложения).
                 if self._inject_user is None:
@@ -352,8 +366,13 @@ class SchedulerService:
                                         atts if isinstance(atts, list) else [],
                                         jid)
             elif action in ("notify", "remind"):
-                await self._notify(chat_id, str(payload.get("title", "")),
-                                   str(payload.get("body", "")))
+                ok = await self._notify(chat_id, str(payload.get("title", "")),
+                                        str(payload.get("body", "")))
+                if ok is False:          # S1: чата нет — не рапортуем успех
+                    await asyncio.to_thread(self._record_run, jid, "error",
+                                            "chat not found")
+                    log.warning("sched.notify_failed", job=jid, chat=chat_id)
+                    return
             else:
                 raise ValueError(f"unknown action: {action}")
             await asyncio.to_thread(self._record_run, jid, "ok", action)

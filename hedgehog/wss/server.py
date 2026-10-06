@@ -252,13 +252,15 @@ class HedgehogServer:
                                        "Не удалось отправить после сброса лимита")
             raise   # чтобы планировщик записал error в job_runs
 
-    async def notify_chat(self, chat_id: str, title: str, body: str) -> None:
-        """Уведомление (баннер/инбокс) в чат по расписанию — журналируемый фрейм."""
+    async def notify_chat(self, chat_id: str, title: str, body: str) -> bool:
+        """Уведомление (баннер/инбокс) в чат по расписанию — журналируемый фрейм.
+        S1: возвращает False, если чата нет (планировщик запишет error, а не ok)."""
         if self.store.get(chat_id) is None:
-            return
+            return False
         await self.hub.publish(chat_id, "notification",
                                {"title": title or "", "body": body or ""})
         self._push_offline(chat_id, title or "", body or "")
+        return True
 
     def _push_offline(self, chat_id: str, title: str, body: str) -> None:
         """§push: доставить уведомление КАЖДОМУ известному устройству ровно один
@@ -494,7 +496,11 @@ class HedgehogServer:
         path = request.path.split("?", 1)[0]
         if path != WS_PATH:
             return connection.respond(http.HTTPStatus.NOT_FOUND, "not found\n")
-        auth = request.headers.get("Authorization", "")
+        # N3: берём ВСЕ значения — дублированный Authorization раньше кидал
+        # websockets.MultipleValuesError (LookupError, не KeyError → .get дефолт
+        # не срабатывал) → 500 в обход 401+fail2ban-лога. Дубль/отсутствие → "".
+        vals = request.headers.get_all("Authorization")
+        auth = vals[0] if len(vals) == 1 else ""
         # L: сравнение constant-time (hmac.compare_digest) — не даём тайминг-оракул
         # для подбора токена. Клиентский заголовок декодится с surrogateescape
         # (лон-суррогаты на битых байтах) → кодируем ИМ ЖЕ, иначе strict .encode()
