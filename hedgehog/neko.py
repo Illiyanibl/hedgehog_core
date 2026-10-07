@@ -268,9 +268,27 @@ def _ensure_swap(config: Config) -> None:
 # ---------- публичное API ----------
 
 def is_running() -> bool:
-    """Лёгкая проверка «поднят ли neko» — для авто-выдачи браузерного MCP агенту
-    (§AI-control, _ensure_session). Один docker inspect, без паролей/докер-инфо."""
+    """Лёгкая проверка «поднят ли контейнер neko» — один docker inspect."""
     return _container_status(CONTAINER) == "running"
+
+
+def _self_on_network() -> bool:
+    """В neko-сети ли САМ контейнер Ёжика (живой аналог net_connected из
+    provision). Если нет — агент не достучится до MCP-плейна neko, значит
+    AI-control фактически недоступен (N3: не рапортуем ложный True)."""
+    host = socket.gethostname()
+    code, out = _run(["docker", "inspect", "-f",
+                      "{{json .NetworkSettings.Networks}}", host], timeout=20)
+    if code != 0:
+        return False
+    return f'"{NETWORK}"' in out
+
+
+def ai_control_available() -> bool:
+    """Честный гейт AI-control: контейнер neko жив И Ёжик подключён к его сети.
+    Используется и для авто-выдачи браузерного MCP (_ensure_session), и в status()
+    — чтобы честный False из provision (N3) не перетирался при опросе get_neko."""
+    return _container_status(CONTAINER) == "running" and _self_on_network()
 
 
 def status(config: Config) -> NekoResult:
@@ -291,7 +309,8 @@ def status(config: Config) -> NekoResult:
         return NekoResult(ok=True, status="running", stage=STAGE_READY,
                           https_port=config.neko_https_port,
                           user_password=admin, server_ip=config.server_ip or "",
-                          mcp_port=config.neko_mcp_port, ai_control=True)
+                          mcp_port=config.neko_mcp_port,
+                          ai_control=_self_on_network())   # N3: честный статус
     return NekoResult(ok=True, status="absent" if st == "absent" else "error",
                       stage=STAGE_IDLE if st == "absent" else STAGE_ERROR,
                       message="" if st == "absent" else "контейнер остановлен")

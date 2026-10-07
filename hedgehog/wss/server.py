@@ -1856,7 +1856,10 @@ class HedgehogServer:
             # пока neko жив; применяется при (пере)старте сессии. Порт наружу не
             # публикуется — достижим только отсюда.
             from .. import neko
-            if await asyncio.to_thread(neko.is_running):
+            # N3: выдаём браузерный MCP только если AI-control РЕАЛЬНО доступен
+            # (контейнер жив И Ёжик в neko-сети) — иначе агент получил бы
+            # недостижимый MCP (клиент не публикует порт наружу).
+            if await asyncio.to_thread(neko.ai_control_available):
                 mcp_servers = {**mcp_servers, "neko_browser": {
                     "type": "http",
                     "url": f"http://{neko.CONTAINER}:{self.config.neko_mcp_port}/mcp",
@@ -1874,12 +1877,12 @@ class HedgehogServer:
                                     roster=self._roster)
         else:
             session = PtySession(meta, publish, self.config)
-        # M6: пока строили сессию (await neko.is_running / build_auth_env), в неё
+        # M6: пока строили сессию (await neko.ai_control_available / build_auth_env), в неё
         # мог параллельно впрыснуть cron/roster и уже поднять её — не плодим
         # второй CLI-процесс. re-check→assign без await между ними → атомарно.
         # S1-M: за время await'ов чат мог начать удаляться ИЛИ уже удалиться
         # целиком (delete пробежал и снял tombstone, пока мы висели на
-        # neko.is_running) — проверяем и метку, и наличие в сторе. store.get
+        # neko.ai_control_available) — проверяем и метку, и наличие в сторе. store.get
         # синхронный, между ним и assign нет await → атомарно.
         if meta.chatId in self._deleting or self.store.get(meta.chatId) is None:
             raise RuntimeError(f"chat {meta.chatId} is being deleted")
