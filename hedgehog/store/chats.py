@@ -353,7 +353,9 @@ class ChatStore:
         path = self._pending_path(chat_id)
         line = json.dumps(frame, ensure_ascii=False) + "\n"
         try:
-            if path.stat().st_size + len(line) > PENDING_HARD_CAP:
+            # F11a: cap — в БАЙТАХ (ensure_ascii=False → кириллица крупнее символа);
+            # раньше len(line) в символах занижал размер и кап превышался.
+            if path.stat().st_size + len(line.encode("utf-8")) > PENDING_HARD_CAP:
                 self._shed_pending(chat_id)
         except OSError:
             pass  # файла ещё нет — нечего проверять

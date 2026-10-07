@@ -318,24 +318,34 @@ class SchedulerService:
             rows = self._conn.execute(
                 "SELECT * FROM jobs WHERE enabled=1 AND next_run<=? ORDER BY next_run",
                 (now,)).fetchall()
+            dirty = False
             for r in rows:
                 if r["id"] in self._running:
                     continue             # предыдущий запуск ещё идёт — пропускаем
+                bad = False
                 try:
                     nxt = _compute_next(r["kind"], r["spec"], now)
                 except Exception as e:
                     log.warning("sched.next_bad", job=r["id"], err=str(e))
                     nxt = None
+                    bad = True           # S4: невалидный spec (исключение расчёта)
                 if nxt is None:
                     self._conn.execute(
                         "UPDATE jobs SET enabled=0, last_run=? WHERE id=?",
                         (now, r["id"]))
+                    dirty = True
+                    if bad:
+                        # S4: recurring с битым spec выключаем и НЕ стреляем (раньше
+                        # был один последний запуск с невалидным расписанием). Для
+                        # once nxt=None — штатно (bad=False), задача срабатывает.
+                        continue
                 else:
                     self._conn.execute(
                         "UPDATE jobs SET next_run=?, last_run=? WHERE id=?",
                         (nxt, now, r["id"]))
+                    dirty = True
                 claimed.append(dict(r))
-            if claimed:
+            if dirty:
                 self._conn.commit()
         return claimed
 
@@ -385,9 +395,12 @@ class SchedulerService:
 
     def _record_run(self, job_id: str, status: str, detail: str) -> None:
         with self._dblock:
+            # S5: пишем историю ТОЛЬКО если задача ещё существует — иначе purge
+            # между claim и _record_run оставлял бы сиротскую строку job_runs.
             self._conn.execute(
-                "INSERT INTO job_runs(id, job_id, ts, status, detail) VALUES(?,?,?,?,?)",
-                (new_ulid(), job_id, time.time(), status, detail))
+                "INSERT INTO job_runs(id, job_id, ts, status, detail) "
+                "SELECT ?,?,?,?,? WHERE EXISTS (SELECT 1 FROM jobs WHERE id=?)",
+                (new_ulid(), job_id, time.time(), status, detail, job_id))
             # M4: retention — держим только последние _JOB_RUNS_KEEP на задачу,
             # иначе история запусков частой interval-задачи растёт неограниченно.
             self._conn.execute(

@@ -538,6 +538,21 @@ async def _zip(request: web.Request) -> web.Response:
     if not items:
         raise web.HTTPBadRequest(text="nothing to zip")
 
+    # F11b: развести одинаковые arcname (напр. /a/x и /b/x → оба "x") — иначе при
+    # извлечении второй перезаписал бы первый. Вставляем _N перед расширением.
+    seen: set[str] = set()
+    uniq: list[tuple[Path, str]] = []
+    for f, arc in items:
+        a, n = arc, 1
+        while a in seen:
+            head, sep, tail = arc.rpartition("/")
+            base, dot, ext = tail.partition(".")
+            a = f"{head}{sep}{base}_{n}{dot}{ext}"
+            n += 1
+        seen.add(a)
+        uniq.append((f, a))
+    items = uniq
+
     total = sum(f.stat().st_size for f, _ in items)
     if total > MAX_ZIP_BYTES:
         return web.json_response({"error": "archive too large"}, status=413)

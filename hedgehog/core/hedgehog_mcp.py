@@ -660,7 +660,8 @@ def build_hedgehog_mcp(session):
                              if mono - t < _CC_RATE_WINDOW]
         if len(session._cc_sends) >= _CC_RATE_MAX:
             return _text("rate limit: too many cross-chat messages, slow down")
-        session._cc_sends.append(mono)
+        # R5: слот rate-limit СПИСЫВАЕМ только перед реальной отправкой (ниже, после
+        # всех валидаций) — иначе отказ по длине/ручке/arm-cap впустую тратил бы 1/20.
         src = session.meta.chatId
         # L2: имя чата может содержать кавычки/переводы строк — не даём
         # сломать строку-провенанс (первая строка, кавычки → одинарные).
@@ -724,6 +725,7 @@ def build_hedgehog_mcp(session):
                               "ok": bool(ok), "result": rtext,
                               "truncated": truncated})
 
+        session._cc_sends.append(mono)   # R5: все проверки пройдены — списываем слот
         try:
             ok, info = await roster.inject(
                 chat_id, prefixed, sender=f"agent:{src}", interrupt=False,

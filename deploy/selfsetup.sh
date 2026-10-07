@@ -114,6 +114,10 @@ if [ -z "$OUT" ]; then
   SAFE="$(printf '%s' "$HOST" | sed 's/[^A-Za-z0-9._-]/_/g')"
   OUT="$HH_DATA/hedgehog-$SAFE.json"
 fi
+# D2: umask 077 ДО создания файла — внутри Bearer+отпечаток, не должен быть
+# world-readable даже на миг (кастомный out в общем каталоге). chmod 600 ниже —
+# подстраховка. Subshell, чтобы umask не протёк на остальной скрипт.
+( umask 077
 python3 - "$OUT" "$HOST" "$HH_WS" "$HH_FILE" "$HH_TLS" "$FP" "$HH_DOMAIN" "$HH_TOKEN" <<'PY'
 import json, sys
 out, host, ws, fport, tls, fp, domain, token = sys.argv[1:9]
@@ -133,6 +137,7 @@ if domain:
 with open(out, "w") as f:
     json.dump(cfg, f, indent=2, ensure_ascii=False)
 PY
+)
 chmod 600 "$OUT"
 
 # 9) итог -------------------------------------------------------------------

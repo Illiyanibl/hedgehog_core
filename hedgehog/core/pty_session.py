@@ -48,12 +48,22 @@ class PtySession:
         self._dirty = asyncio.Event()
         self._flusher: asyncio.Task | None = None
         self._eof = False
+        # P1/P2: single-flight запуска (два конкурентных start не поднимут 2 PTY)
+        # и сериализация записи (перекрывающиеся write не делят один add_writer).
+        self._start_lock = asyncio.Lock()
+        self._write_lock = asyncio.Lock()
 
     # ---------- lifecycle ----------
 
     async def start(self):
         if self._proc is not None:
             return
+        async with self._start_lock:
+            if self._proc is not None:   # P1: пока ждали лок — другой start успел
+                return
+            await self._do_start()
+
+    async def _do_start(self):
         self._history = HistoryWriter(Path(self.meta.cwd) / "transcript.log")
 
         master, slave = os.openpty()
@@ -139,6 +149,13 @@ class PtySession:
         await self.write(content + "\n")
 
     async def write(self, data: str):
+        # P2: сериализуем записи — иначе перекрывающиеся write делят один
+        # add_writer(fd): второй колбэк вытесняет первый, тот висит до таймаута
+        # (дроп хвоста). Лок охватывает и restart/start (конкурентный ввод).
+        async with self._write_lock:
+            await self._write_locked(data)
+
+    async def _write_locked(self, data: str):
         if self._eof:
             # bash умер (exit/kill) — следующий ввод лениво поднимает свежий.
             await self._restart()

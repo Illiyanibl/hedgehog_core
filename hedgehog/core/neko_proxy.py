@@ -101,6 +101,12 @@ class NekoProxy:
                                 if tool is None:
                                     if not fut.done():
                                         fut.set_result(None)   # прогрев
+                                elif fut.done():
+                                    # N4: вызывающий уже отвалился по таймауту
+                                    # (wait_for отменил fut) — НЕ выполняем побочное
+                                    # действие (click/navigate) впустую на живом
+                                    # браузере, оно бы случилось «в никуда» позже.
+                                    log.info("neko.skip_timed_out", tool=tool)
                                 else:
                                     res = await s.call_tool(tool, args)
                                     if not fut.done():
