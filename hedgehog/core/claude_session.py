@@ -901,6 +901,31 @@ class ClaudeSession:
                  name=safe, size=size)
         return f"file '{safe}' sent to the user in the chat"
 
+    async def _attach_bytes_to_chat(self, name: str, data: bytes,
+                                    mime: str | None = None) -> str:
+        """§image: доставить СЫРЫЕ байты (сгенерированная картинка) карточкой в
+        чат — тем же путём, что _attach_file_to_chat (agent_file-фрейм), но без
+        файла-источника: пишем сразу в files_dir (без temp и двойного копирования
+        многомегабайтных байтов). `name` — осмысленное имя с расширением."""
+        files_dir = self._config.chats_dir / self.meta.chatId / "files"
+        files_dir.mkdir(parents=True, exist_ok=True)
+        file_id = new_ulid()
+        safe = _safe_name(name) or "image.png"
+        dest = files_dir / f"{file_id}__{safe}"
+        try:
+            dest.write_bytes(data)
+        except OSError as e:
+            return f"failed to write image: {e}"
+        size = dest.stat().st_size
+        if not mime:
+            mime = mimetypes.guess_type(safe)[0] or "application/octet-stream"
+        await self._publish("agent_file", {
+            "fileId": file_id, "name": safe, "mime": mime, "size": size,
+        })
+        log.info("agent.file_sent", chat=self.meta.chatId, file=file_id,
+                 name=safe, size=size, src="bytes")
+        return f"image '{safe}' sent to the user in the chat"
+
     async def _ensure_client(self) -> ClaudeSDKClient:
         # §reader (BUG1): ридер мог умереть при живом клиенте (битый фрейм →
         # MessageParseError, сбой _publish/колбэка). Тогда клиент не None, но

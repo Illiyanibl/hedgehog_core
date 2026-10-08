@@ -229,6 +229,36 @@ class Config:
         except OSError:
             pass
 
+    # --- §image: генерация картинок (per-server) -----------------------------
+    # Настройки генератора картинок живут в data/image.json (по одному на сервер,
+    # как auth.json). Секрет (api_key) → 0600. {} если файла нет/битый ⇒ тул
+    # generate_image объявляет себя ненастроенным (агент его не зовёт).
+    @property
+    def image_config_file(self) -> Path:
+        return self.data_dir / "image.json"
+
+    def load_image_config(self) -> dict:
+        """Конфиг генерации картинок. {} если файла нет/битый."""
+        try:
+            data = json.loads(self.image_config_file.read_text())
+        except (OSError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def save_image_config(self, data: dict) -> None:
+        """Записать конфиг картинок. chmod 600 — внутри api_key."""
+        ensure_secure_dir(self.data_dir)   # 0o700: внутри секреты
+        tmp = self.image_config_file.with_suffix(".json.tmp")
+        write_secret_file(tmp, json.dumps(data, ensure_ascii=False))  # 0o600 без окна
+        tmp.replace(self.image_config_file)
+
+    def clear_image_config(self) -> None:
+        """Выключить генерацию картинок (удалить image.json)."""
+        try:
+            self.image_config_file.unlink(missing_ok=True)
+        except OSError:
+            pass
+
     @property
     def token_file(self) -> Path:
         return self.data_dir / "auth_token"

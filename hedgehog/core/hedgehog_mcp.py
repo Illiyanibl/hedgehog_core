@@ -11,6 +11,7 @@ _scheduler, _roster, _view_*, _handler_*, _kv_* и т.д.).
 from __future__ import annotations
 
 import json
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -18,7 +19,7 @@ from typing import Any
 import structlog
 from claude_agent_sdk import create_sdk_mcp_server, tool
 
-from . import handler_runner
+from . import handler_runner, image_gen
 
 # §ctl: SdkMcpTool.input_schema хранит СЫРОЙ аргумент декоратора — у наших тулов
 # это шорткат вида {"path": str} (питоновские типы, НЕ JSON-сериализуемо). SDK
@@ -750,13 +751,83 @@ def build_hedgehog_mcp(session):
             note += f"; reply will call handler '{reply_handler}'"
         return _text(f"delivered to {chat_id}{note}")
 
+    # §image: генерация растровых картинок настраиваемым провайдером (image.json
+    # per-server). Описание ДИНАМИЧЕСКОЕ из конфига — агент либо знает активную
+    # модель (пишет промпт под неё), либо знает, что генерация НЕ настроена и не
+    # зовёт тул. Сборка MCP идёт на каждый reconnect → описание освежается; на
+    # случай смены конфига ПОСРЕДИ сессии хендлер перечитывает конфиг при вызове.
+    def _img_configured(c: dict) -> bool:
+        return bool(c.get("enabled", True)
+                    and (c.get("format") or c.get("provider"))
+                    and c.get("api_key") and c.get("model"))
+
+    _img_cfg_obj = getattr(session, "_config", None)
+    try:
+        _img_cfg = _img_cfg_obj.load_image_config() or {} if _img_cfg_obj else {}
+    except Exception:   # noqa: BLE001 — сборка MCP не должна падать из-за конфига
+        _img_cfg = {}
+    if _img_configured(_img_cfg):
+        _img_label = str(_img_cfg.get("label") or _img_cfg.get("model")
+                         or "image model")
+        _img_model = str(_img_cfg.get("model") or "")
+        _img_size = str(_img_cfg.get("size") or "")
+        generate_image_desc = (
+            "Generate a REAL raster image (photo/illustration, PNG/JPEG) and "
+            "send it to the USER as a chat card. "
+            f"Active generator: {_img_label} (model={_img_model}). Write a rich, "
+            "descriptive prompt TAILORED to THIS image model (subject, "
+            "composition, lighting, style, lens, mood) — it is a diffusion/image "
+            "model, not you drawing SVG by hand. Prefer this over SVG whenever the "
+            "user wants a real picture/photo. Args: prompt (required); size "
+            "(optional" + (f", default {_img_size}" if _img_size else "")
+            + ", e.g. 1024x1024 or 'auto'). Generation may take up to ~1 min.")
+    else:
+        generate_image_desc = (
+            "Image generation is NOT configured on this server — you CANNOT "
+            "produce raster images. Do NOT call this tool. If the user asks for a "
+            "picture/photo, tell them image generation isn't set up on this server "
+            "yet (an admin configures it in image.json); you may offer an SVG/code "
+            "drawing as a fallback.")
+
+    @tool(
+        "generate_image",
+        generate_image_desc,
+        {"type": "object",
+         "properties": {"prompt": {"type": "string"},
+                        "size": {"type": "string"}},
+         "required": ["prompt"]},
+    )
+    async def generate_image(args: dict[str, Any]) -> dict[str, Any]:
+        cfg = session._config.load_image_config()   # call-time: описание могло устареть
+        if not _img_configured(cfg):
+            return _text("image generation is not configured on this server "
+                         "(no image.json) — tell the user it isn't set up yet.")
+        prompt = str(args.get("prompt", "") or "")
+        size = str(args.get("size", "") or "") or None
+        label = str(cfg.get("label") or cfg.get("model") or "image model")
+        model = str(cfg.get("model") or "")
+        try:
+            data, ext, mime = await image_gen.generate(cfg, prompt, size)
+        except image_gen.ImageGenError as e:
+            return _text(f"image generation failed ({label}): {e}")
+        except Exception as e:   # noqa: BLE001 — единый UX ошибки для агента
+            log.warning("image.gen_error", chat=session.meta.chatId, err=repr(e))
+            return _text(f"image generation failed ({label}): unexpected error")
+        # Осмысленное имя: слаг модели + короткий штамп (display-only; в хранилище
+        # уникальность даёт ulid-префикс). model/label возвращаем В РЕЗУЛЬТАТЕ —
+        # на случай устаревшего описания агент увидит, чем реально сгенерено.
+        slug = re.sub(r"[^a-zA-Z0-9]+", "-", model or "image").strip("-")[:32] or "image"
+        name = f"{slug}-{int(time.time())}.{ext}"
+        sent = await session._attach_bytes_to_chat(name, data, mime)
+        return _text(f"{sent} (generator: {label}, model={model}).")
+
     tools = [attach_file, ask_ui, ui_open, ui_update, ui_close,
              ui_current, ui_reopen, ui_drawing,
              handler_register, handler_list, handler_unregister,
              handler_call, kv_set, kv_get, notify,
              schedule_add, remind, schedule_list, schedule_cancel,
              artifact_put, artifact_get, artifact_list,
-             list_chats, send_to_chat]
+             list_chats, send_to_chat, generate_image]
     # §ctl: один источник правды — ровно те же хендлеры, что и нативный MCP,
     # доступны локальной «ручке» (ctl_server → Bash-клиент), чтобы модель за
     # шлюзом-коверкателем имён звала их через Bash. SdkMcpTool.handler — та же
