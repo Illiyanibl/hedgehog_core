@@ -353,6 +353,13 @@ class RegisterPushPayload(_Payload):
                           pattern=r"^[A-Za-z0-9._-]*$")
 
 
+class NekoOpenViewPayload(_Payload):
+    """§17: открыть новую вкладку/окно браузера neko (playwright-mcp
+    browser_tabs:new). url пустой → пустая вкладка. Схему валидирует хендлер
+    (только http/https — не пускаем file:// в общий браузер)."""
+    url: str = Field(default="", max_length=2000)
+
+
 # type → (payload-модель, нужен ли chatId в обёртке)
 CLIENT_FRAME_TYPES: dict[str, tuple[type[_Payload], bool]] = {
     "user_msg": (UserMsgPayload, True),
@@ -418,6 +425,7 @@ CLIENT_FRAME_TYPES: dict[str, tuple[type[_Payload], bool]] = {
     "install_neko": (EmptyPayload, False),
     "get_neko": (EmptyPayload, False),
     "remove_neko": (EmptyPayload, False),
+    "neko_open_view": (NekoOpenViewPayload, False),  # новая вкладка/окно браузера
     # §mcp: перезапуск агента чата + управление MCP-серверами (per-chat)
     "restart_agent": (EmptyPayload, True),
     # §clear: сброс контекста чата — забыть session_id CLI (свежая сессия на

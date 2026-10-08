@@ -146,6 +146,10 @@ class HedgehogServer:
         # §reply: ожидающие reply-армы по чату-инициатору (monotonic-таймстампы);
         # cap+TTL в _reply_arm. См. send_to_chat/_deliver_reply.
         self._reply_pending: dict[str, list[float]] = {}
+        # §17: ленивый серверный NekoProxy (MCP-плейн neko) для neko_open_view —
+        # создаётся при первом использовании, гасится в shutdown. Глобальный (не
+        # per-chat): фрейм без chatId, shared-browser-context терпит неск. сессий.
+        self._neko_proxy = None
         # §sched: планировщик задач + блэкборд. Ставится из main.py после
         # конструктора (нужны колбэки inject/notify, замкнутые на этот сервер).
         self.scheduler = None
@@ -454,6 +458,8 @@ class HedgehogServer:
             for t in list(self._push_tasks):
                 t.cancel()
             await asyncio.gather(*self._push_tasks, return_exceptions=True)
+        if self._neko_proxy is not None:   # §17: догасить серверный MCP-проброс neko
+            await self._neko_proxy.aclose()
         await self.hub.aclose()          # backpressure: догасить close-задачи шины
 
     # ---------- §models: фоновый рефрешер списка моделей ----------
@@ -694,6 +700,7 @@ class HedgehogServer:
         'install_neko': '_h_install_neko',
         'get_neko': '_h_install_neko',
         'remove_neko': '_h_install_neko',
+        'neko_open_view': '_h_neko_open_view',
         'install_skill': '_h_install_skill',
         'set_skill_default': '_h_set_skill_default',
         'list_chats': '_h_list_chats',
@@ -970,6 +977,52 @@ class HedgehogServer:
             "stage": result.stage,
         }))
         log.info("neko." + ftype, ok=result.ok, status=result.status)
+        return
+
+    async def _h_neko_open_view(self, conn_id, frame, p):
+        """§17: новая вкладка/окно браузера neko через серверный NekoProxy
+        (playwright-mcp `browser_tabs:new`). Если браузер открыт → вкладка в том
+        же видимом окне; если был закрыт → held-context мёртв, первый вызов падает,
+        ретрай `browser_navigate` поднимает новое окно. Это и есть вся обработка
+        open-vs-closed (детекцию не строим — гонка, chromium сам выбирает)."""
+        from .. import neko
+        url = (p.url or "").strip()
+        if url and not url.lower().startswith(("http://", "https://")):
+            await self.hub.send_global(conn_id, make_frame(
+                "neko_view_result", {"ok": False, "message": "bad url"}))
+            return
+        # Гейт: контейнер жив И Ёжик подключён к neko-сети (иначе MCP недостижим →
+        # иначе 10с handshake-таймаут вместо быстрого отказа).
+        if not await asyncio.to_thread(neko.ai_control_available):
+            await self.hub.send_global(conn_id, make_frame(
+                "neko_view_result", {"ok": False, "message": "Neko недоступен"}))
+            return
+        if self._neko_proxy is None:
+            from ..core.neko_proxy import NekoProxy
+            self._neko_proxy = NekoProxy(
+                f"http://{neko.CONTAINER}:{self.config.neko_mcp_port}/mcp")
+        def _raise_if_error(res):
+            # MCP-ошибки НЕ бросают — приходят CallToolResult(isError=True)
+            # (playwright-mcp так рапортует «Target closed» при закрытом окне,
+            # ср. ctl_server.py). Трактуем как сбой → уходим в ретрай/отказ.
+            if getattr(res, "isError", False):
+                txt = "".join(getattr(c, "text", "") or ""
+                              for c in (getattr(res, "content", None) or []))
+                raise RuntimeError(txt or "neko tool error")
+        args = {"action": "new", **({"url": url} if url else {})}
+        ok, msg = True, ""
+        try:
+            _raise_if_error(await self._neko_proxy.call("browser_tabs", args, timeout=20))
+        except Exception:   # noqa: BLE001 — окно закрыли (isError) или транспорт
+            try:
+                _raise_if_error(await self._neko_proxy.call(
+                    "browser_navigate", {"url": url or "about:blank"}, timeout=20))
+            except Exception as e2:  # noqa: BLE001
+                ok, msg = False, f"neko: {e2}"
+                log.warning("neko.open_view_failed", err=repr(e2))
+        await self.hub.send_global(conn_id, make_frame(
+            "neko_view_result", {"ok": ok, "message": msg}))
+        log.info("neko.open_view", ok=ok, had_url=bool(url))
         return
 
     async def _h_install_skill(self, conn_id, frame, p):
