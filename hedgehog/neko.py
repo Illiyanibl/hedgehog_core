@@ -210,6 +210,9 @@ def build_run_cmd(config: Config, env_file: str,
         "-e", "NEKO_CAPTURE_SCREENCAST_ENABLED=true",
         "-e", "NEKO_CAPTURE_SCREENCAST_RATE=10/1",
         "-e", "NEKO_CAPTURE_SCREENCAST_QUALITY=60",
+        # §AI-control: порог watchdog — рестарт контейнера после стольких секунд
+        # без главного процесса браузера (быстрее возвращает браузер после закрытия).
+        "-e", f"WATCHDOG_MISS={config.neko_watchdog_miss}",
         "-v", f"{TLS_VOLUME}:/tls:ro",
         "-v", f"{PROFILE_VOLUME}:/home/neko/.config/chromium",
     ]
