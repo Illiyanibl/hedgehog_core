@@ -234,7 +234,11 @@ def _ensure_swap(config: Config) -> None:
     Контейнер host-swap сам не создаст — запускаем one-shot ПРИВИЛЕГИРОВАННЫЙ
     контейнер и через nsenter в namespace хоста (PID 1) создаём /swapfile +
     swapon + запись в fstab. Свойства (снижают риск «сломать»):
-      • идемпотентно: swap уже есть → выходим (не стекуем);
+      • ДОТЯГИВАЕМ до цели: если СУММАРНОГО swap < neko_swap_mb — добавляем
+        /swapfile (раньше выходили при ЛЮБОМ существующем swap → на серверах с
+        маленьким штатным swap-разделом целевой 1 ГБ не создавался и chrome
+        уходил в OOM);
+      • остаточный /swapfile с прошлого раза — просто включаем (swapon);
       • guard по месту: нет (size+400) МБ свободно на / → не создаём;
       • dd (не fallocate) → без sparse-«дыр», mkswap не отвалится;
       • best-effort: любой сбой ЛОГИРУЕТСЯ, провижининг НЕ роняем.
@@ -242,10 +246,16 @@ def _ensure_swap(config: Config) -> None:
     mb = config.neko_swap_mb
     if mb <= 0:
         return
+    # SwapTotal из /proc/meminfo (КБ→МБ) — без зависимости от procps(`free`).
+    swaptotal_mb = "awk '/^SwapTotal:/{print int($2/1024)}' /proc/meminfo 2>/dev/null || echo 0"
     # Исполняется в namespace ХОСТА (nsenter -t 1) → пути/swapon относятся к хосту.
     script = (
         "set -e; "
-        "swapon --show 2>/dev/null | grep -q . && exit 0; "
+        f"cur=$({swaptotal_mb}); "
+        f"[ \"${{cur:-0}}\" -ge {mb} ] && exit 0; "
+        # остаточный файл с прошлой установки → включить и перепроверить
+        "if [ -f /swapfile ]; then swapon /swapfile 2>/dev/null || true; "
+        f"cur=$({swaptotal_mb}); [ \"${{cur:-0}}\" -ge {mb} ] && exit 0; fi; "
         "avail=$(df -Pm / | awk 'NR==2{print $4}'); "
         f"[ \"${{avail:-0}}\" -lt {mb + 400} ] && exit 0; "
         f"dd if=/dev/zero of=/swapfile bs=1M count={mb} status=none; "
