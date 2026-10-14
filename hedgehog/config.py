@@ -90,6 +90,12 @@ class Config:
     # через docker CLI + socket-proxy. Один общий инстанс на сервер, opt-in.
     neko_image: str = field(default_factory=lambda: os.environ.get(
         "HEDGEHOG_NEKO_IMAGE", "ghcr.io/illiyanibl/devolution-neko:latest"))
+    # Таймаут `docker pull` neko-образа. Холодная скачка (~1 ГБ сжато) на слабом
+    # канале идёт 15-25 мин; дефолтные 600с её НЕ покрывали — pull убивался по
+    # таймауту, а provision игнорировал код возврата и шёл в обречённый deploy.
+    # 1800с = 30 мин с запасом (переопределяется HEDGEHOG_NEKO_PULL_TIMEOUT).
+    neko_pull_timeout: int = field(default_factory=lambda: _env_int(
+        "HEDGEHOG_NEKO_PULL_TIMEOUT", 1800))
     # S5-M7: образ для ПРИВИЛЕГИРОВАННОГО one-shot swap (nsenter в PID1 хоста).
     # НЕ neko-образ: компрометация часто-обновляемого CI-тега = root на хосте.
     # Минимальный доверенный alpine (busybox даёт nsenter; сам swap-скрипт идёт

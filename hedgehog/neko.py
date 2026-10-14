@@ -360,9 +360,20 @@ def _provision_locked(config: Config) -> NekoResult:
     _ensure_swap(config)      # §AI-control: host-swap под память браузера (best-effort)
     nat_ip = config.server_ip
 
-    # Стадия «скачка образа»: pull может тянуться минуты при первом разе.
+    # Стадия «скачка образа»: холодный pull тянется 15-25 мин (образ ~1 ГБ).
+    # ВАЖНО: проверяем код возврата. Раньше результат игнорировался + таймаут был
+    # 600с < реального времени pull → на холодной установке pull убивался по
+    # таймауту, а deploy шёл против неполного/отсутствующего образа и падал
+    # невнятной ошибкой. Теперь при провале pull — сразу STAGE_ERROR с логом.
     _set_stage(STAGE_PULLING)
-    _run(["docker", "pull", config.neko_image], timeout=600)
+    code, out = _run(["docker", "pull", config.neko_image],
+                     timeout=config.neko_pull_timeout)
+    if code != 0:
+        _set_stage(STAGE_ERROR)
+        log.error("neko.pull.failed", image=config.neko_image,
+                  timeout=config.neko_pull_timeout, out=out[-300:])
+        return NekoResult(ok=False, status="error", stage=STAGE_ERROR,
+                          message=f"docker pull образа neko не удался: {out[-200:]}")
 
     # Стадия «развёртывание»: пересоздание (rename→singleton→run).
     _set_stage(STAGE_DEPLOYING)
@@ -404,6 +415,9 @@ def _provision_locked(config: Config) -> NekoResult:
         code, out = 1, "new neko container is not running (exited immediately?)"
     if code != 0:
         _set_stage(STAGE_ERROR)
+        # Деталь раньше уходила только клиенту (NekoResult.message), в логах был
+        # лишь stage=error — причину не восстановить. Логируем на сервере.
+        log.error("neko.deploy.failed", recreate=recreate, out=out[-300:])
         if recreate:
             # откат на рабочий старый. S5-M1: упавший `docker run --name CONTAINER`
             # (без --rm) мог оставить труп Created/Exited под этим именем → снимаем
