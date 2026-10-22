@@ -180,9 +180,7 @@ async def _download(request: web.Request) -> web.StreamResponse:
     matches = sorted(files_dir.glob(f"{file_id}__*")) if files_dir.exists() else []
     if not matches:
         raise web.HTTPNotFound(text="file not found")
-    resp = web.FileResponse(matches[0])  # aiohttp сам обрабатывает Range
-    resp.headers["Cache-Control"] = "no-store"
-    return resp
+    return web.FileResponse(matches[0])  # aiohttp сам обрабатывает Range
 
 
 # ---------- файл-браузер (§16, вкладка Files) ----------
@@ -269,12 +267,7 @@ async def _fetch(request: web.Request) -> web.StreamResponse:
     p = _resolve(config, _dec(request, "X-Path"), must_exist=True)
     if not p.is_file():
         raise web.HTTPBadRequest(text="not a file")
-    resp = web.FileResponse(p)  # Range обрабатывает aiohttp
-    # Ресурс адресуется заголовком X-Path при ПОСТОЯННОМ URL (/v1/fetch), а файл
-    # по пути может меняться (write/move/overwrite). Любой кеш по URL вернул бы
-    # чужой/устаревший файл (клиент на URLCache ловил это). Запрещаем кеширование.
-    resp.headers["Cache-Control"] = "no-store"
-    return resp
+    return web.FileResponse(p)  # Range обрабатывает aiohttp
 
 
 async def _put(request: web.Request) -> web.Response:
@@ -596,12 +589,28 @@ async def _zip(request: web.Request) -> web.Response:
             pass
 
 
+async def _no_store(request: web.Request, response: web.StreamResponse) -> None:
+    """Запрет кеширования на ВСЕ ответы файл-сервера.
+
+    Инвариант: все роуты адресуют ресурс ЗАГОЛОВКОМ (X-Path/chatId/fileId) при
+    ПОСТОЯННОМ URL. URLCache клиента ключует по URL → без запрета первый
+    закешированный ответ /v1/fetch возвращался бы на скачивание ЛЮБОГО файла
+    (кросс-файл-отравление; к тому же файл по пути меняется write/move/overwrite,
+    а вложения иммутабельны, но держать байты в незашифрованном Cache.db на
+    телефоне нежелательно). `no-store`, а не `no-cache`: последний разрешает
+    хранение и ревалидацию, а ревалидация по чужому ключу URL даёт 304 с ЧУЖИМ
+    телом — второй путь того же отравления. Держим инвариант в одном месте, а не
+    по хендлерам."""
+    response.headers["Cache-Control"] = "no-store"
+
+
 def make_app(config: Config, token: str) -> web.Application:
     app = web.Application(
         middlewares=[_auth_mw],
         client_max_size=config.max_upload_bytes + (1 << 16))
     app[CONFIG_KEY] = config
     app[TOKEN_KEY] = token
+    app.on_response_prepare.append(_no_store)
     app.add_routes([
         web.get("/v1/health", _health),
         web.post("/v1/upload", _upload),
