@@ -180,7 +180,9 @@ async def _download(request: web.Request) -> web.StreamResponse:
     matches = sorted(files_dir.glob(f"{file_id}__*")) if files_dir.exists() else []
     if not matches:
         raise web.HTTPNotFound(text="file not found")
-    return web.FileResponse(matches[0])  # aiohttp сам обрабатывает Range
+    resp = web.FileResponse(matches[0])  # aiohttp сам обрабатывает Range
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
 # ---------- файл-браузер (§16, вкладка Files) ----------
@@ -267,7 +269,12 @@ async def _fetch(request: web.Request) -> web.StreamResponse:
     p = _resolve(config, _dec(request, "X-Path"), must_exist=True)
     if not p.is_file():
         raise web.HTTPBadRequest(text="not a file")
-    return web.FileResponse(p)  # Range обрабатывает aiohttp
+    resp = web.FileResponse(p)  # Range обрабатывает aiohttp
+    # Ресурс адресуется заголовком X-Path при ПОСТОЯННОМ URL (/v1/fetch), а файл
+    # по пути может меняться (write/move/overwrite). Любой кеш по URL вернул бы
+    # чужой/устаревший файл (клиент на URLCache ловил это). Запрещаем кеширование.
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
 async def _put(request: web.Request) -> web.Response:
