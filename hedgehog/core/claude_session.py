@@ -72,8 +72,8 @@ from . import ctl_server
 # P3: MCP-тулы вынесены в hedgehog_mcp; кросс-чат константы живут там. Ре-экспорт
 # для обратной совместимости (тесты импортируют их из этого модуля).
 from .hedgehog_mcp import (  # noqa: F401 — константы ре-экспортим для тестов
-    build_hedgehog_mcp, _SEND_TO_CHAT_MAX, _CC_MARK, _CC_RATE_MAX,
-    _CC_RATE_WINDOW)
+    build_hedgehog_mcp, BUILTIN_MCP_NAME, _SEND_TO_CHAT_MAX, _CC_MARK,
+    _CC_RATE_MAX, _CC_RATE_WINDOW)
 
 log = structlog.get_logger("claude_session")
 
@@ -971,7 +971,7 @@ class ClaudeSession:
             # MCP: пользовательские серверы (§12) + встроенный hedgehog
             # (инструмент attach_file — агент шлёт файлы в чат).
             mcp = dict(self._mcp_servers)
-            mcp["hedgehog"] = self._make_hedgehog_mcp()
+            mcp[BUILTIN_MCP_NAME] = self._make_hedgehog_mcp()
             opts["mcp_servers"] = mcp
             # Гейт скиллов (§skills): непустой allowlist → включаем эти
             # скиллы и открываем CLI источники user/project, иначе он не

@@ -63,6 +63,11 @@ def _to_json_schema(raw) -> dict:
 
 log = structlog.get_logger("hedgehog_mcp")
 
+# §mcp: имя встроенного in-process MCP-сервера, который инжектится в КАЖДУЮ
+# claude-сессию (notify/ask_ui/send_to_chat/ui_* …). Единая точка правды — чтобы
+# сервер (list_mcp) и инжект (claude_session) не разъезжались по литералу.
+BUILTIN_MCP_NAME = "hedgehog"
+
 # §roster: потолок длины кросс-чат впрыска (send_to_chat). Эхо уходит в
 # pending.jsonl + транскрипт целевого чата; у MCP-аргумента своего лимита нет.
 _SEND_TO_CHAT_MAX = 64 * 1024
@@ -838,4 +843,4 @@ def build_hedgehog_mcp(session):
     session._ctl_meta = {t.name: {"description": t.description,
                                   "input_schema": _to_json_schema(t.input_schema)}
                          for t in tools}
-    return create_sdk_mcp_server(name="hedgehog", tools=tools)
+    return create_sdk_mcp_server(name=BUILTIN_MCP_NAME, tools=tools)

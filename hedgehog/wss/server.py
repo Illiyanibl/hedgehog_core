@@ -32,6 +32,7 @@ from ..bus.hub import Hub
 from ..config import Config
 from ..core.auth import AuthManager
 from ..core.claude_session import ClaudeSession
+from ..core.hedgehog_mcp import BUILTIN_MCP_NAME
 from ..core.pty_session import PtySession
 from ..core import models
 from ..core.gateways import omniroute as omniroute_gw
@@ -1340,6 +1341,13 @@ class HedgehogServer:
         return
 
     async def _h_set_mcp_enabled(self, conn_id, frame, p, meta):
+        # Встроенный hedgehog всегда вкл и не хранится в реестре — отключить
+        # нельзя (иначе у агента пропадут notify/ask_ui/ui_*). Игнорируем, но
+        # отвечаем актуальным деревом, чтобы клиент перерисовал состояние.
+        if p.name == BUILTIN_MCP_NAME:
+            await self.hub.send_global(conn_id, make_frame(
+                "mcp_response", self._mcp_tree(meta), frame.chatId))
+            return
         current = list(meta.mcp or [])
         if p.enabled:
             current = list(dict.fromkeys(current + [p.name]))
@@ -1357,6 +1365,10 @@ class HedgehogServer:
         return
 
     async def _h_remove_mcp(self, conn_id, frame, p, meta):
+        if p.name == BUILTIN_MCP_NAME:   # встроенный нельзя удалить из реестра
+            await self.hub.send_global(conn_id, make_frame(
+                "mcp_response", self._mcp_tree(meta), frame.chatId))
+            return
         self.mcp.remove(p.name)
         current = [n for n in (meta.mcp or []) if n != p.name]
         updated = self.store.update_meta(frame.chatId, mcp=current)
@@ -1794,16 +1806,24 @@ class HedgehogServer:
         return cfg
 
     def _mcp_tree(self, meta: ChatMeta) -> dict[str, Any]:
-        """Список MCP-серверов реестра + флаг «включён в этом чате» (meta.mcp).
-        Секреты (значения заголовков/токены) наружу НЕ отдаём — только имя+тип."""
+        """Список MCP-серверов: встроенный hedgehog (всегда вкл, read-only) +
+        серверы реестра с флагом «включён в этом чате» (meta.mcp). Единый
+        источник истины — показываем ВСЁ, что реально у агента. Секреты
+        (значения заголовков/токены) наружу НЕ отдаём — только имя+тип."""
         enabled = set(meta.mcp or [])
-        servers = [{**m, "enabled": m["name"] in enabled}
-                   for m in self.mcp.list_meta()]
+        # Встроенный hedgehog (notify/ask_ui/send_to_chat/ui_* …) инжектится в
+        # КАЖДУЮ сессию (claude_session) и в реестре не лежит — добавляем
+        # синтетически. builtin=True → клиент рисует строку read-only.
+        servers = [{"name": BUILTIN_MCP_NAME, "type": "builtin",
+                    "enabled": True, "builtin": True}]
+        servers += [{**m, "enabled": m["name"] in enabled, "builtin": False}
+                    for m in self.mcp.list_meta()]
         # Имена, включённые в чате, но отсутствующие в реестре (битые/удалённые
         # руками) — показываем, чтобы их можно было выключить.
-        known = {m["name"] for m in servers}
+        known = {s["name"] for s in servers}
         for name in sorted(enabled - known):
-            servers.append({"name": name, "type": None, "enabled": True})
+            servers.append({"name": name, "type": None,
+                            "enabled": True, "builtin": False})
         return {"servers": servers}
 
     def _skills_tree(self, meta: ChatMeta) -> dict[str, Any]:
