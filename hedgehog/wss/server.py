@@ -1327,6 +1327,13 @@ class HedgehogServer:
         return
 
     async def _h_add_mcp(self, conn_id, frame, p, meta):
+        # Имя встроенного зарезервировано: иначе в реестре появился бы второй
+        # «hedgehog» → дубль в _mcp_tree и неудаляемая строка на клиенте (guard
+        # set/remove съел бы запрос). Игнорируем, отвечаем актуальным деревом.
+        if p.name.strip().lower() == BUILTIN_MCP_NAME:
+            await self.hub.send_global(conn_id, make_frame(
+                "mcp_response", self._mcp_tree(meta), frame.chatId))
+            return
         self.mcp.add(p.name, self._mcp_config(p))
         enabled = list(dict.fromkeys(list(meta.mcp or []) + [p.name]))
         updated = self.store.update_meta(frame.chatId, mcp=enabled)
@@ -1816,8 +1823,10 @@ class HedgehogServer:
         # синтетически. builtin=True → клиент рисует строку read-only.
         servers = [{"name": BUILTIN_MCP_NAME, "type": "builtin",
                     "enabled": True, "builtin": True}]
+        # Реестровый сервер с именем встроенного (старые/битые данные) не
+        # дублируем — встроенный уже добавлен выше.
         servers += [{**m, "enabled": m["name"] in enabled, "builtin": False}
-                    for m in self.mcp.list_meta()]
+                    for m in self.mcp.list_meta() if m["name"] != BUILTIN_MCP_NAME]
         # Имена, включённые в чате, но отсутствующие в реестре (битые/удалённые
         # руками) — показываем, чтобы их можно было выключить.
         known = {s["name"] for s in servers}
