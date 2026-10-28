@@ -656,7 +656,34 @@ class HedgehogServer:
                      reason=(getattr(ws, "close_reason", None) or "")[:120],
                      dur=round(time.time() - t0, 1),
                      peer=(peer[0] if peer else None))
+            # §client-caps: соединение уходит → пересчитать эффективные caps
+            # чатов, где оно было подписано (sticky в сессии удержит, если это
+            # был последний клиент с рендером). Снимаем подписки ДО unregister.
+            caps_chats = self.hub.conn_subs(conn_id)
             self.hub.unregister(conn_id)
+            for cid in caps_chats:
+                await self._push_caps(cid)
+
+    # ---------- §client-caps ----------
+
+    async def _push_caps(self, chat_id: str) -> None:
+        """Протолкнуть эффективный набор возможностей (union подписанных) в живую
+        ClaudeSession чата. Нет сессии — ничего (подхватит при _ensure_session).
+        Смена применится на границе следующего хода (set_client_caps → _caps_dirty)."""
+        session = self.sessions.get(chat_id)
+        if isinstance(session, ClaudeSession):
+            session.set_client_caps(self.hub.caps_for_chat(chat_id))
+
+    async def _h_client_caps(self, conn_id, frame, p):
+        """§client-caps: client_hello / client_caps_update — клиент объявил
+        возможности рендера. Запоминаем на соединении и пересчитываем чаты, где
+        оно подписано (client_hello обычно приходит ДО subscribe → там список
+        пуст, и набор подхватится при subscribe/_ensure_session)."""
+        self.hub.set_conn_caps(conn_id, p.clientCapabilities)
+        log.info("client.caps", conn_id=conn_id,
+                 caps=sorted(p.clientCapabilities)[:8])
+        for cid in self.hub.conn_subs(conn_id):
+            await self._push_caps(cid)
 
     # ---------- диспетчер ----------
 
@@ -697,6 +724,8 @@ class HedgehogServer:
         'logout': '_h_logout',
         'client_log': '_h_client_log',
         'register_push': '_h_register_push',
+        'client_hello': '_h_client_caps',
+        'client_caps_update': '_h_client_caps',
         'update_self': '_h_update_self',
         'install_neko': '_h_install_neko',
         'get_neko': '_h_install_neko',
@@ -1408,6 +1437,8 @@ class HedgehogServer:
     async def _h_subscribe_chat(self, conn_id, frame, p, meta):
         self.hub.subscribe(conn_id, frame.chatId)
         log.info("chat.subscribe", conn_id=conn_id, chat_id=frame.chatId)
+        # §client-caps: это соединение теперь влияет на эффективный набор чата.
+        await self._push_caps(frame.chatId)
         # Для shell-чата поднимаем bash сразу — клиент увидит prompt.
         if meta.addressee == "broker_shell":
             session = await self._ensure_session(meta)
@@ -1436,6 +1467,8 @@ class HedgehogServer:
 
     async def _h_unsubscribe_chat(self, conn_id, frame, p, meta):
         self.hub.unsubscribe(conn_id, frame.chatId)
+        # §client-caps: пересчитать без этого соединения (sticky удержит).
+        await self._push_caps(frame.chatId)
         return
 
     async def _h_get_log(self, conn_id, frame, p, meta):
@@ -1972,6 +2005,11 @@ class HedgehogServer:
         if existing is not None:
             return existing
         self.sessions[meta.chatId] = session
+        # §client-caps: инициализируем ветку рендера формул по подписчикам
+        # (sticky возьмёт первый непустой набор — первый ход не уйдёт в текст,
+        # если iOS уже прислал client_hello и подписался).
+        if isinstance(session, ClaudeSession):
+            session.set_client_caps(self.hub.caps_for_chat(meta.chatId))
         await session.start()
         return session
 

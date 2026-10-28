@@ -353,6 +353,17 @@ class RegisterPushPayload(_Payload):
                           pattern=r"^[A-Za-z0-9._-]*$")
 
 
+class ClientCapsPayload(_Payload):
+    """§client-caps: клиент объявляет свои возможности отображения (что умеет
+    рендерить), чтобы агент подстраивал вывод. Пилот: формулы.
+      `math`    — типографский рендер LaTeX ($…$, $$…$$) в пузыре.
+      `webview` — умеет рисовать окна ui_request (ui_open).
+    Шлётся в `client_hello` (сразу после hello, один раз на соединение) и в
+    `client_caps_update` (при смене пользовательской настройки, на лету).
+    Полный список (не дельта). Неизвестные строки сервер игнорирует."""
+    clientCapabilities: list[str] = Field(default_factory=list, max_length=32)
+
+
 class NekoOpenViewPayload(_Payload):
     """§17: открыть новую вкладку/окно браузера neko (playwright-mcp
     browser_tabs:new). url пустой → пустая вкладка. Схему валидирует хендлер
@@ -419,6 +430,10 @@ CLIENT_FRAME_TYPES: dict[str, tuple[type[_Payload], bool]] = {
     "client_log": (ClientLogPayload, False),
     # §push: клиент сообщает notifyKey для APNs-пушей (глобальный, без chatId)
     "register_push": (RegisterPushPayload, False),
+    # §client-caps: клиент объявляет возможности рендера (connect + на лету;
+    # глобальные, без chatId). Общий payload для обоих.
+    "client_hello": (ClientCapsPayload, False),
+    "client_caps_update": (ClientCapsPayload, False),
     # §15: самообновление Ёжика (git pull + рестарт; глобальный, без chatId)
     "update_self": (EmptyPayload, False),
     # §17: Neko-браузер (провижининг/статус/снос; глобальные, без chatId)

@@ -177,6 +177,34 @@ server executes it and strips it from your reply:
 ```
 """
 
+# §client-caps (§math): ровно ОДНА ветка добавляется в system_prompt по
+# возможностям подключённого клиента (см. _math_append / set_client_caps).
+# Короткие — footprint промпта минимальный.
+HEDGEHOG_MATH_NATIVE_APPEND = """\
+
+## Formulas
+The connected client typesets LaTeX. Show math as `$$ … $$` (block) or `$ … $` \
+(inline) — do NOT use images, ASCII art, or ui_open for formulas. Keep inline \
+`$…$` looking like math and not immediately followed by a digit (avoids currency \
+like `$5`); prefer `$$…$$` for anything non-trivial or multi-line.
+"""
+
+HEDGEHOG_MATH_WEBVIEW_APPEND = """\
+
+## Formulas
+This client does not typeset LaTeX inline, but renders WebView windows. To show \
+a formula, open one with `mcp__hedgehog__ui_open` using a self-contained MathJax \
+HTML page. Don't leave raw LaTeX as the final answer.
+"""
+
+HEDGEHOG_MATH_TEXT_APPEND = """\
+
+## Formulas
+This client shows plain text only (no LaTeX typesetting, no WebView). Write \
+formulas in readable linear/Unicode notation (e.g. ∮_S F·n dS = ∭_V ∇·F dV). \
+No images, no ui_open, no `$$`/`$` LaTeX delimiters.
+"""
+
 # Абсолютный путь к CLI-клиенту «ручки» (hedgehog/ctl_client.py) — кладём в env
 # агента как $HEDGEHOG_CALL. claude_session.py лежит в hedgehog/core/.
 _CTL_CLIENT = str(Path(__file__).resolve().parent.parent / "ctl_client.py")
@@ -366,6 +394,15 @@ class ClaudeSession:
         self._worker: asyncio.Task | None = None
         # True, пока агент обрабатывает user_msg (для get_status, §3.7c).
         self._busy = False
+        # §client-caps: эффективные возможности клиента (union подписанных,
+        # см. hub.caps_for_chat) → ветка рендера формул в system_prompt.
+        # _caps_sticky хранит последний НЕПУСТОЙ набор (чтобы cron-ход в «спящем»
+        # чате без подписчиков не свалился в текстовую ветку). Смена набора
+        # НЕ рвёт клиента немедленно (другой таск, Fable Б1′) — ставит _caps_dirty,
+        # применяется на границе хода в _ensure_client (резолв по session_id цел).
+        self._client_caps: frozenset[str] = frozenset()
+        self._caps_sticky: frozenset[str] | None = None
+        self._caps_dirty = False
         # §reader (постоянный ридер трубы). Раньше _turn читал receive_response()
         # ДО первого ResultMessage и останавливался — но труба НЕ «запрос-ответ»:
         # фоновые Task-субагенты досылают продолжения и ЛИШНИЕ ResultMessage уже
@@ -478,6 +515,38 @@ class ClaudeSession:
             except Exception as e:
                 log.info("sdk.disconnect_failed", chat=self.meta.chatId, err=str(e))
             self._client = None
+
+    # ---------- §client-caps: возможности клиента → ветка рендера формул ----------
+
+    def set_client_caps(self, caps) -> None:
+        """Обновить эффективные возможности клиента для этой сессии. Зовётся из
+        wss-слоя при client_hello/client_caps_update и при подписке/отписке
+        соединения (hub.caps_for_chat → union подписанных).
+
+        Пустой набор (нет подписчиков) НЕ сбрасывает ветку — держим sticky
+        последний непустой (Fable: cron-ход без клиентов не должен уходить в
+        текстовую ветку, если iOS уже объявлял math). При ФАКТИЧЕСКОМ изменении
+        эффективного набора ставим _caps_dirty — применится на границе
+        следующего хода в _ensure_client (НЕ рвём клиента отсюда: это другой
+        таск, голый _disconnect посреди хода повесил бы чат, Fable Б1′)."""
+        caps = frozenset(caps)
+        if caps:
+            self._caps_sticky = caps
+            effective = caps
+        else:
+            effective = self._caps_sticky or frozenset()
+        if effective != self._client_caps:
+            self._client_caps = effective
+            self._caps_dirty = True
+
+    def _math_append(self) -> str:
+        """Одна короткая ветка инструкции по рендеру формул под текущий клиент."""
+        caps = self._client_caps
+        if "math" in caps:
+            return HEDGEHOG_MATH_NATIVE_APPEND
+        if "webview" in caps:
+            return HEDGEHOG_MATH_WEBVIEW_APPEND
+        return HEDGEHOG_MATH_TEXT_APPEND
 
     # ---------- входящие фреймы ----------
 
@@ -927,6 +996,16 @@ class ClaudeSession:
         return f"image '{safe}' sent to the user in the chat"
 
     async def _ensure_client(self) -> ClaudeSDKClient:
+        # §client-caps (Fable Б1′): возможности клиента сменились → пересобрать
+        # клиента со свежей веткой формул. Делаем это ЗДЕСЬ, на границе хода (а не
+        # из set_client_caps в чужом таске), ДО переиспользования живого клиента —
+        # иначе ниже сработал бы `if self._client is None` и остался старый append.
+        # Отмена ридера здесь безопасна (между ходами). Контекст цел — resume по
+        # session_id. Idle-случай покрыт тем же путём: следующий ход пересоберёт.
+        if self._caps_dirty:
+            self._caps_dirty = False
+            if self._client is not None:
+                await self._disconnect()
         # §reader (BUG1): ридер мог умереть при живом клиенте (битый фрейм →
         # MessageParseError, сбой _publish/колбэка). Тогда клиент не None, но
         # трубу никто не читает — следующий query() пройдёт, а _turn_done никто
@@ -1003,9 +1082,14 @@ class ClaudeSession:
             # (прямой Anthropic) нативный MCP работает — протокол не нужен.
             mode = self._config.load_auth_config().get("mode", "oauth")
             self._text_tools_enabled = (mode == "omniroute")
+            # §client-caps: ровно одна ветка рендера формул по возможностям
+            # клиента (native $$…$$ / webview ui_open / текст) — в ОБА пути.
+            append = HEDGEHOG_SYSTEM_APPEND
             if self._text_tools_enabled:
-                opts["system_prompt"]["append"] = (
-                    HEDGEHOG_SYSTEM_APPEND + HEDGEHOG_TEXT_TOOLS_APPEND)
+                append += HEDGEHOG_TEXT_TOOLS_APPEND
+            append += self._math_append()
+            opts["system_prompt"]["append"] = append
+            if self._text_tools_enabled:
                 # §ctl: регистрируем сессию по секретному токену и кладём в env
                 # агента координаты «ручки» — CLI зовёт реальные хендлеры по
                 # unix-сокету (тот же build_hedgehog_mcp уже заполнил _ctl_tools).

@@ -33,6 +33,9 @@ class Hub:
         # conn_id → deviceId (§push: несекретный id устройства, для per-device
         # маршрутизации пуша). Отдельный dict, чтобы не менять кортеж _conns.
         self._conn_device: dict[int, str] = {}
+        # §client-caps: conn_id → объявленные возможности рендера (client_hello /
+        # client_caps_update). Отдельный dict (кортеж _conns не трогаем).
+        self._conn_caps: dict[int, frozenset[str]] = {}
         # conn_id → close (закрыть WS): backpressure-таймаут не только снимает
         # соединение из шины, но и закрывает сокет — иначе ожившее после столла
         # соединение осталось бы «живым, но глухим» (мы на него не шлём).
@@ -62,12 +65,36 @@ class Hub:
         self._conns.pop(conn_id, None)
         self._conn_device.pop(conn_id, None)
         self._conn_close.pop(conn_id, None)
+        self._conn_caps.pop(conn_id, None)
         log.info("conn.unregister", conn_id=conn_id, total=len(self._conns))
 
     def set_device(self, conn_id: int, device_id: str):
         """§push: привязать deviceId к соединению (из фрейма register_push)."""
         if conn_id in self._conns and device_id:
             self._conn_device[conn_id] = device_id
+
+    # ---------- §client-caps: возможности рендера клиента ----------
+
+    def set_conn_caps(self, conn_id: int, caps) -> None:
+        """Запомнить возможности рендера соединения (client_hello/_update)."""
+        if conn_id in self._conns:
+            self._conn_caps[conn_id] = frozenset(caps)
+
+    def conn_subs(self, conn_id: int) -> set[str]:
+        """Чаты, на которые подписано соединение (для пересчёта при caps-апдейте)."""
+        entry = self._conns.get(conn_id)
+        return set(entry[1]) if entry else set()
+
+    def caps_for_chat(self, chat_id: str) -> frozenset[str]:
+        """Эффективный набор = UNION возможностей всех соединений, подписанных на
+        этот чат (Fable: union безопаснее «инициатора» — нет флаппинга; на
+        неумеющем клиенте вывод деградирует, не ломается). Пусто → вызывающий
+        (сессия) держит sticky последний непустой."""
+        out: set[str] = set()
+        for cid, (_, subs) in self._conns.items():
+            if chat_id in subs:
+                out |= self._conn_caps.get(cid, frozenset())
+        return frozenset(out)
 
     def subscribe(self, conn_id: int, chat_id: str):
         if conn_id in self._conns:

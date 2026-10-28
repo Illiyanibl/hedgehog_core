@@ -136,7 +136,11 @@ class Config:
     protocol_versions: tuple[int, ...] = (1,)
     # netwait (§netwait): сервер шлёт op_slow при долгой операции и принимает
     # op_abort; клиент включает индикатор/алерт/abort только при этой capability.
-    capabilities: tuple[str, ...] = ("claude", "broker_shell", "picker", "netwait")
+    # §client-caps: сервер умеет принимать client_hello/client_caps_update
+    # (клиент объявляет свои возможности рендера, напр. формулы). Клиент шлёт
+    # эти кадры ТОЛЬКО при наличии этого флага (иначе старый сервер → BAD_FRAME).
+    capabilities: tuple[str, ...] = (
+        "claude", "broker_shell", "picker", "netwait", "client_caps")
 
     # screen_snapshot aggregation window, seconds (broker overflow pattern)
     snapshot_interval: float = 0.08
