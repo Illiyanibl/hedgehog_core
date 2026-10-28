@@ -186,17 +186,9 @@ server executes it and strips it from your reply:
 HEDGEHOG_FORMULA_APPEND = """\
 
 ## Formulas
-How this client shows formulas can change at runtime (a user setting), so NEVER \
-assume a fixed way. BEFORE rendering ANY formula, call the `formula_mode` tool \
-(`mcp__hedgehog__formula_mode`; under the text-tools protocol — via $HEDGEHOG_CALL). \
-It returns the current mode and what to do:
-  - latex   → write the formula as LaTeX in `$$ … $$` (block) or `$ … $` (inline); \
-the client typesets it. No images, no ui_open.
-  - webview → render it in a WebView window via `mcp__hedgehog__ui_open` with a \
-self-contained MathJax HTML page.
-  - text    → write it in plain Unicode/linear notation (e.g. ∮ F·n dS = ∭ ∇·F dV).
-Follow the mode the tool returns for THIS formula; it may have changed since last \
-time, so don't rely on a previous answer.
+How this client shows formulas can change at runtime. Before rendering ANY \
+formula, call the `formula_mode` tool (`mcp__hedgehog__formula_mode`) and follow \
+its answer; re-check each time, it may have changed.
 """
 
 # Абсолютный путь к CLI-клиенту «ручки» (hedgehog/ctl_client.py) — кладём в env

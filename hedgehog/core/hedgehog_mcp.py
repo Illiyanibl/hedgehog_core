@@ -841,11 +841,9 @@ def build_hedgehog_mcp(session):
 
     @tool(
         "formula_mode",
-        "Returns how to render mathematical formulas for the CURRENT client and "
-        "its live setting: 'latex' ($$…$$ / $…$ inline), 'webview' (draw via "
-        "ui_open+MathJax window), or 'text' (plain Unicode). Call this right "
-        "before rendering ANY formula — the user can change the mode at any time, "
-        "so don't rely on a previous answer.",
+        "Returns the current way to render math formulas for this client (can "
+        "change at runtime). Call right before rendering ANY formula and follow "
+        "the returned instruction; don't rely on a previous answer.",
         {})
     async def formula_mode(args: dict[str, Any]) -> dict[str, Any]:
         return _text(_FORMULA_HINT.get(session.formula_mode(), _FORMULA_HINT["text"]))
