@@ -826,13 +826,37 @@ def build_hedgehog_mcp(session):
         sent = await session._attach_bytes_to_chat(name, data, mime)
         return _text(f"{sent} (generator: {label}, model={model}).")
 
+    # §client-caps: живой режим рендера формул для ТЕКУЩЕГО клиента/настройки.
+    # Зовётся агентом ПЕРЕД отрисовкой формулы (режим меняется в рантайме —
+    # тумблер «Формулы» в приложении; читаем self._client_caps в момент вызова,
+    # без пересборки сессии). Возвращаем режим + что делать (самодостаточно).
+    _FORMULA_HINT = {
+        "latex": "latex — write the formula as LaTeX in $$ … $$ (block) or "
+                 "$ … $ (inline). The client typesets it. No images, no ui_open.",
+        "webview": "webview — render the formula in a WebView window via "
+                   "mcp__hedgehog__ui_open with a self-contained MathJax HTML page.",
+        "text": "text — write the formula in plain Unicode/linear notation "
+                "(e.g. ∮ F·n dS = ∭ ∇·F dV). No LaTeX, no ui_open.",
+    }
+
+    @tool(
+        "formula_mode",
+        "Returns how to render mathematical formulas for the CURRENT client and "
+        "its live setting: 'latex' ($$…$$ / $…$ inline), 'webview' (draw via "
+        "ui_open+MathJax window), or 'text' (plain Unicode). Call this right "
+        "before rendering ANY formula — the user can change the mode at any time, "
+        "so don't rely on a previous answer.",
+        {})
+    async def formula_mode(args: dict[str, Any]) -> dict[str, Any]:
+        return _text(_FORMULA_HINT.get(session.formula_mode(), _FORMULA_HINT["text"]))
+
     tools = [attach_file, ask_ui, ui_open, ui_update, ui_close,
              ui_current, ui_reopen, ui_drawing,
              handler_register, handler_list, handler_unregister,
              handler_call, kv_set, kv_get, notify,
              schedule_add, remind, schedule_list, schedule_cancel,
              artifact_put, artifact_get, artifact_list,
-             list_chats, send_to_chat, generate_image]
+             list_chats, send_to_chat, generate_image, formula_mode]
     # §ctl: один источник правды — ровно те же хендлеры, что и нативный MCP,
     # доступны локальной «ручке» (ctl_server → Bash-клиент), чтобы модель за
     # шлюзом-коверкателем имён звала их через Bash. SdkMcpTool.handler — та же

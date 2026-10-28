@@ -177,32 +177,26 @@ server executes it and strips it from your reply:
 ```
 """
 
-# §client-caps (§math): ровно ОДНА ветка добавляется в system_prompt по
-# возможностям подключённого клиента (см. _math_append / set_client_caps).
-# Короткие — footprint промпта минимальный.
-HEDGEHOG_MATH_NATIVE_APPEND = """\
+# §client-caps (§formula-tool): способ показа формул МЕНЯЕТСЯ в рантайме
+# (настройка клиента), поэтому в промпт зашиваем НЕ конкретный режим, а
+# инструкцию «спроси тул formula_mode перед отрисовкой». Тул отдаёт ЖИВОЙ режим
+# из текущих caps сессии. Прежний приём (зашитая ветка + пересборка клиента с
+# resume) «замораживал» режим на старте сессии — Fable Б1 (resume тянет инерцию
+# транскрипта, одна строка промпта её не перебивает).
+HEDGEHOG_FORMULA_APPEND = """\
 
 ## Formulas
-The connected client typesets LaTeX. Show math as `$$ … $$` (block) or `$ … $` \
-(inline) — do NOT use images, ASCII art, or ui_open for formulas. Keep inline \
-`$…$` looking like math and not immediately followed by a digit (avoids currency \
-like `$5`); prefer `$$…$$` for anything non-trivial or multi-line.
-"""
-
-HEDGEHOG_MATH_WEBVIEW_APPEND = """\
-
-## Formulas
-This client does not typeset LaTeX inline, but renders WebView windows. To show \
-a formula, open one with `mcp__hedgehog__ui_open` using a self-contained MathJax \
-HTML page. Don't leave raw LaTeX as the final answer.
-"""
-
-HEDGEHOG_MATH_TEXT_APPEND = """\
-
-## Formulas
-This client shows plain text only (no LaTeX typesetting, no WebView). Write \
-formulas in readable linear/Unicode notation (e.g. ∮_S F·n dS = ∭_V ∇·F dV). \
-No images, no ui_open, no `$$`/`$` LaTeX delimiters.
+How this client shows formulas can change at runtime (a user setting), so NEVER \
+assume a fixed way. BEFORE rendering ANY formula, call the `formula_mode` tool \
+(`mcp__hedgehog__formula_mode`; under the text-tools protocol — via $HEDGEHOG_CALL). \
+It returns the current mode and what to do:
+  - latex   → write the formula as LaTeX in `$$ … $$` (block) or `$ … $` (inline); \
+the client typesets it. No images, no ui_open.
+  - webview → render it in a WebView window via `mcp__hedgehog__ui_open` with a \
+self-contained MathJax HTML page.
+  - text    → write it in plain Unicode/linear notation (e.g. ∮ F·n dS = ∭ ∇·F dV).
+Follow the mode the tool returns for THIS formula; it may have changed since last \
+time, so don't rely on a previous answer.
 """
 
 # Абсолютный путь к CLI-клиенту «ручки» (hedgehog/ctl_client.py) — кладём в env
@@ -394,15 +388,13 @@ class ClaudeSession:
         self._worker: asyncio.Task | None = None
         # True, пока агент обрабатывает user_msg (для get_status, §3.7c).
         self._busy = False
-        # §client-caps: эффективные возможности клиента (union подписанных,
-        # см. hub.caps_for_chat) → ветка рендера формул в system_prompt.
-        # _caps_sticky хранит последний НЕПУСТОЙ набор (чтобы cron-ход в «спящем»
-        # чате без подписчиков не свалился в текстовую ветку). Смена набора
-        # НЕ рвёт клиента немедленно (другой таск, Fable Б1′) — ставит _caps_dirty,
-        # применяется на границе хода в _ensure_client (резолв по session_id цел).
+        # §client-caps: ЖИВЫЕ эффективные возможности клиента (union подписанных,
+        # см. hub.caps_for_chat). Читает тул formula_mode в момент отрисовки —
+        # поэтому НЕ пересобираем сессию при смене (прежний rebuild+resume
+        # «замораживал» режим, Fable Б1). _caps_sticky — последний НЕПУСТОЙ набор
+        # (cron-ход в «спящем» чате без подписчиков не свалится в text).
         self._client_caps: frozenset[str] = frozenset()
         self._caps_sticky: frozenset[str] | None = None
-        self._caps_dirty = False
         # §reader (постоянный ридер трубы). Раньше _turn читал receive_response()
         # ДО первого ResultMessage и останавливался — но труба НЕ «запрос-ответ»:
         # фоновые Task-субагенты досылают продолжения и ЛИШНИЕ ResultMessage уже
@@ -516,37 +508,33 @@ class ClaudeSession:
                 log.info("sdk.disconnect_failed", chat=self.meta.chatId, err=str(e))
             self._client = None
 
-    # ---------- §client-caps: возможности клиента → ветка рендера формул ----------
+    # ---------- §client-caps: возможности клиента → тул formula_mode ----------
 
     def set_client_caps(self, caps) -> None:
-        """Обновить эффективные возможности клиента для этой сессии. Зовётся из
-        wss-слоя при client_hello/client_caps_update и при подписке/отписке
-        соединения (hub.caps_for_chat → union подписанных).
+        """Обновить ЖИВЫЕ возможности рендера клиента. Зовётся из wss-слоя при
+        client_hello/client_caps_update и при подписке/отписке (hub.caps_for_chat
+        → union подписанных).
 
-        Пустой набор (нет подписчиков) НЕ сбрасывает ветку — держим sticky
-        последний непустой (Fable: cron-ход без клиентов не должен уходить в
-        текстовую ветку, если iOS уже объявлял math). При ФАКТИЧЕСКОМ изменении
-        эффективного набора ставим _caps_dirty — применится на границе
-        следующего хода в _ensure_client (НЕ рвём клиента отсюда: это другой
-        таск, голый _disconnect посреди хода повесил бы чат, Fable Б1′)."""
+        Значение читает тул formula_mode В МОМЕНТ отрисовки формулы — поэтому
+        сессию НЕ пересобираем (прежний rebuild+resume «замораживал» режим на
+        старте, Fable Б1). Просто обновляем поле. Пустой набор (нет подписчиков)
+        НЕ сбрасывает — держим sticky последний непустой (cron-ход без клиентов)."""
         caps = frozenset(caps)
         if caps:
             self._caps_sticky = caps
-            effective = caps
+            self._client_caps = caps
         else:
-            effective = self._caps_sticky or frozenset()
-        if effective != self._client_caps:
-            self._client_caps = effective
-            self._caps_dirty = True
+            self._client_caps = self._caps_sticky or frozenset()
 
-    def _math_append(self) -> str:
-        """Одна короткая ветка инструкции по рендеру формул под текущий клиент."""
+    def formula_mode(self) -> str:
+        """Живой режим рендера формул для тула mcp__hedgehog__formula_mode:
+        latex (клиент типографит $$…$$), webview (ui_open+MathJax), text."""
         caps = self._client_caps
         if "math" in caps:
-            return HEDGEHOG_MATH_NATIVE_APPEND
+            return "latex"
         if "webview" in caps:
-            return HEDGEHOG_MATH_WEBVIEW_APPEND
-        return HEDGEHOG_MATH_TEXT_APPEND
+            return "webview"
+        return "text"
 
     # ---------- входящие фреймы ----------
 
@@ -996,16 +984,9 @@ class ClaudeSession:
         return f"image '{safe}' sent to the user in the chat"
 
     async def _ensure_client(self) -> ClaudeSDKClient:
-        # §client-caps (Fable Б1′): возможности клиента сменились → пересобрать
-        # клиента со свежей веткой формул. Делаем это ЗДЕСЬ, на границе хода (а не
-        # из set_client_caps в чужом таске), ДО переиспользования живого клиента —
-        # иначе ниже сработал бы `if self._client is None` и остался старый append.
-        # Отмена ридера здесь безопасна (между ходами). Контекст цел — resume по
-        # session_id. Idle-случай покрыт тем же путём: следующий ход пересоберёт.
-        if self._caps_dirty:
-            self._caps_dirty = False
-            if self._client is not None:
-                await self._disconnect()
+        # §client-caps: смена режима формул БОЛЬШЕ не требует пересборки клиента —
+        # режим читается тулом formula_mode из живого self._client_caps в момент
+        # отрисовки (прежний rebuild+resume «замораживал» режим, Fable Б1).
         # §reader (BUG1): ридер мог умереть при живом клиенте (битый фрейм →
         # MessageParseError, сбой _publish/колбэка). Тогда клиент не None, но
         # трубу никто не читает — следующий query() пройдёт, а _turn_done никто
@@ -1082,12 +1063,13 @@ class ClaudeSession:
             # (прямой Anthropic) нативный MCP работает — протокол не нужен.
             mode = self._config.load_auth_config().get("mode", "oauth")
             self._text_tools_enabled = (mode == "omniroute")
-            # §client-caps: ровно одна ветка рендера формул по возможностям
-            # клиента (native $$…$$ / webview ui_open / текст) — в ОБА пути.
+            # §client-caps: статичная инструкция «спроси тул formula_mode перед
+            # формулой» — в ОБА пути. Режим НЕ зашит (меняется в рантайме, читается
+            # тулом из живых caps).
             append = HEDGEHOG_SYSTEM_APPEND
             if self._text_tools_enabled:
                 append += HEDGEHOG_TEXT_TOOLS_APPEND
-            append += self._math_append()
+            append += HEDGEHOG_FORMULA_APPEND
             opts["system_prompt"]["append"] = append
             if self._text_tools_enabled:
                 # §ctl: регистрируем сессию по секретному токену и кладём в env

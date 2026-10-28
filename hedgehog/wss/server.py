@@ -669,7 +669,8 @@ class HedgehogServer:
     async def _push_caps(self, chat_id: str) -> None:
         """Протолкнуть эффективный набор возможностей (union подписанных) в живую
         ClaudeSession чата. Нет сессии — ничего (подхватит при _ensure_session).
-        Смена применится на границе следующего хода (set_client_caps → _caps_dirty)."""
+        Значение живое: его читает тул formula_mode в момент отрисовки формулы
+        (сессию НЕ пересобираем — прежний rebuild+resume замораживал режим)."""
         session = self.sessions.get(chat_id)
         if isinstance(session, ClaudeSession):
             session.set_client_caps(self.hub.caps_for_chat(chat_id))
