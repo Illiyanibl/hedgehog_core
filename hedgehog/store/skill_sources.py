@@ -28,6 +28,7 @@ from pathlib import Path
 import structlog
 
 from . import skills_registry
+from ..i18n import Msg
 
 log = structlog.get_logger("skills")
 
@@ -156,15 +157,15 @@ class SkillSources:
                 with zipfile.ZipFile(io.BytesIO(raw)) as z:
                     infos = z.infolist()
                     if len(infos) > _MAX_ZIP_ENTRIES:
-                        raise SkillInstallError("в архиве слишком много файлов")
+                        raise SkillInstallError(Msg("skills.too_many_files"))
                     total = sum(zi.file_size for zi in infos)
                     if total > _MAX_UNCOMPRESSED:
-                        raise SkillInstallError(
-                            f"распакованный размер превышает лимит "
-                            f"{_MAX_UNCOMPRESSED // (1024 * 1024)} МБ (zip-bomb?)")
+                        raise SkillInstallError(Msg(
+                            "skills.unpacked_too_big",
+                            mb=_MAX_UNCOMPRESSED // (1024 * 1024)))
                     z.extractall(tmp)
             except zipfile.BadZipFile:
-                raise SkillInstallError("скачанный архив повреждён/не zip") from None
+                raise SkillInstallError(Msg("skills.bad_archive")) from None
             seen: set[str] = set()
             for skill_md in sorted(Path(tmp).rglob("SKILL.md")):
                 fm = _read_frontmatter(skill_md)
@@ -182,9 +183,7 @@ class SkillSources:
                 shutil.copytree(skill_md.parent, dst)
                 names.append(name)
         if not names:
-            raise SkillInstallError(
-                "в репозитории не найдено валидных скиллов "
-                "(нужен SKILL.md с frontmatter name)")
+            raise SkillInstallError(Msg("skills.none_found"))
         source = repo
         with self._lock:          # только запись реестра под локом (не download)
             data = self._load()
@@ -211,7 +210,7 @@ def _read_frontmatter(skill_md: Path) -> dict | None:
 def _parse_github(url: str) -> tuple[str, str]:
     m = _GH_RE.match(url.strip())
     if not m:
-        raise SkillInstallError("нужна ссылка на github.com/<owner>/<repo>")
+        raise SkillInstallError(Msg("skills.need_github_url"))
     owner, repo = m.group(1), m.group(2)
     return owner, repo.removesuffix(".git")
 
@@ -241,12 +240,12 @@ def _download_zip(owner: str, repo: str) -> bytes:
             with urllib.request.urlopen(req, timeout=90) as r:
                 data = r.read(_MAX_ZIP_DOWNLOAD + 1)   # L: не тянем гигабайты в память
                 if len(data) > _MAX_ZIP_DOWNLOAD:
-                    raise SkillInstallError(
-                        f"архив репозитория больше лимита "
-                        f"{_MAX_ZIP_DOWNLOAD // (1024 * 1024)} МБ")
+                    raise SkillInstallError(Msg(
+                        "skills.archive_too_big",
+                        mb=_MAX_ZIP_DOWNLOAD // (1024 * 1024)))
                 return data
         except SkillInstallError:
             raise                                      # свой лимит не маскируем сетевой ошибкой
         except Exception as e:  # noqa: BLE001 — покажем пользователю причину
             last = e
-    raise SkillInstallError(f"не удалось скачать архив репозитория: {last}")
+    raise SkillInstallError(Msg("skills.download_failed", detail=str(last)))

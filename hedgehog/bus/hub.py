@@ -16,6 +16,7 @@ from typing import Any, Awaitable, Callable
 
 import structlog
 
+from .. import i18n
 from ..protocol import make_frame
 from ..store.chats import ChatStore
 
@@ -36,6 +37,9 @@ class Hub:
         # §client-caps: conn_id → объявленные возможности рендера (client_hello /
         # client_caps_update). Отдельный dict (кортеж _conns не трогаем).
         self._conn_caps: dict[int, frozenset[str]] = {}
+        # §i18n: conn_id → язык клиента (client_hello.lang / set_language).
+        # Нет записи → DEFAULT_LANG (en). Локализация — в _safe_send.
+        self._conn_lang: dict[int, str] = {}
         # conn_id → close (закрыть WS): backpressure-таймаут не только снимает
         # соединение из шины, но и закрывает сокет — иначе ожившее после столла
         # соединение осталось бы «живым, но глухим» (мы на него не шлём).
@@ -66,6 +70,7 @@ class Hub:
         self._conn_device.pop(conn_id, None)
         self._conn_close.pop(conn_id, None)
         self._conn_caps.pop(conn_id, None)
+        self._conn_lang.pop(conn_id, None)
         log.info("conn.unregister", conn_id=conn_id, total=len(self._conns))
 
     def set_device(self, conn_id: int, device_id: str):
@@ -79,6 +84,23 @@ class Hub:
         """Запомнить возможности рендера соединения (client_hello/_update)."""
         if conn_id in self._conns:
             self._conn_caps[conn_id] = frozenset(caps)
+
+    # ---------- §i18n: язык клиента ----------
+
+    def set_conn_lang(self, conn_id: int, lang: str) -> None:
+        """Запомнить (уже нормализованный) язык соединения."""
+        if conn_id in self._conns:
+            self._conn_lang[conn_id] = lang
+
+    def conn_lang(self, conn_id: int) -> str:
+        return self._conn_lang.get(conn_id, i18n.DEFAULT_LANG)
+
+    def conn_lang_explicit(self, conn_id: int) -> str | None:
+        """Язык, который клиент реально прислал (None — не присылал)."""
+        return self._conn_lang.get(conn_id)
+
+    def conn_device(self, conn_id: int) -> str | None:
+        return self._conn_device.get(conn_id)
 
     def conn_subs(self, conn_id: int) -> set[str]:
         """Чаты, на которые подписано соединение (для пересчёта при caps-апдейте)."""
@@ -153,7 +175,9 @@ class Hub:
     async def publish(self, chat_id: str, ftype: str, payload: dict[str, Any],
                       journal: bool = True) -> dict:
         """Событие чата: журнал + постоянный транскрипт + рассылка подписчикам."""
-        frame = make_frame(ftype, payload, chat_id)
+        # §i18n: Msg → английский текст + <f>_key/<f>_args — ключ переживает
+        # запись в журнал (локализуется под язык соединения при отправке/resume).
+        frame = make_frame(ftype, i18n.expand_msgs(payload), chat_id)
         # Фреймы, пропускаемые ОБОИМИ журналами (snapshot, ~12/с в shell-чате),
         # не берут lock и не прыгают в поток — у них нет претензии на порядок
         # файлов, иначе они копились бы за идущим _shed_pending (до ~100МБ).
@@ -213,6 +237,8 @@ class Hub:
         return len(targets)
 
     async def _safe_send(self, conn_id: int, send: SendFn, frame: dict):
+        # §i18n: единая точка исходящих — подставляем язык этого соединения.
+        frame = i18n.localize_frame(frame, self.conn_lang(conn_id))
         try:
             await asyncio.wait_for(send(frame), self._SEND_TIMEOUT)
         except asyncio.CancelledError:

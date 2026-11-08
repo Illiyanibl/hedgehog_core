@@ -140,7 +140,8 @@ class Config:
     # (клиент объявляет свои возможности рендера, напр. формулы). Клиент шлёт
     # эти кадры ТОЛЬКО при наличии этого флага (иначе старый сервер → BAD_FRAME).
     capabilities: tuple[str, ...] = (
-        "claude", "broker_shell", "picker", "netwait", "client_caps")
+        "claude", "broker_shell", "picker", "netwait", "client_caps",
+        "i18n")
 
     # screen_snapshot aggregation window, seconds (broker overflow pattern)
     snapshot_interval: float = 0.08

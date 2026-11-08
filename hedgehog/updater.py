@@ -19,6 +19,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from .i18n import Msg
 
 # git fetch по HTTPS изредка спотыкается (HTTP/2-фрейминг git↔GitHub, разовые
 # сетевые сбои) → git не парсит ответ и просит логин («could not read Username»
@@ -107,7 +108,7 @@ def pull_latest(process_sha: str = "") -> UpdateResult:
     root = repo_root()
     if root is None:
         return UpdateResult(
-            ok=False, message="не git-установка — обновление недоступно")
+            ok=False, message=Msg("update.not_git"))
 
     disk_before = current_sha(root)
     old = process_sha or disk_before      # от чего реально уходим (версия процесса)
@@ -153,7 +154,8 @@ def pull_latest(process_sha: str = "") -> UpdateResult:
             return UpdateResult(ok=False, old=old, new=new, changed=changed,
                                 message=f"pip install: {out[-300:]}")
 
-    msg = f"обновлено {old} → {new}" if changed else f"уже актуально ({new or old})"
+    msg = (Msg("update.updated", old=old, new=new) if changed
+           else Msg("update.up_to_date", version=new or old))
     return UpdateResult(ok=True, changed=changed, old=old, new=new, message=msg)
 
 

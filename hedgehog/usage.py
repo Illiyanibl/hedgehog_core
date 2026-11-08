@@ -18,6 +18,7 @@ import aiohttp
 import structlog
 
 from .config import Config
+from .i18n import Msg
 
 log = structlog.get_logger("limits")
 
@@ -78,7 +79,7 @@ async def fetch_limits(config: Config) -> dict:
     или {'error': ...}. Токен НЕ логируем."""
     token = config.load_oauth_token()
     if not token:
-        return {"error": "auth", "message": "Ёжик не авторизован"}
+        return {"error": "auth", "message": Msg("limits.not_authorized")}
     headers = {
         "Authorization": f"Bearer {token}",
         "anthropic-beta": _BETA,
@@ -91,7 +92,7 @@ async def fetch_limits(config: Config) -> dict:
             async with sess.post(_API, json=_PROBE, headers=headers) as resp:
                 if resp.status in (401, 403):
                     log.warning("limits.auth_rejected", status=resp.status)
-                    return {"error": "auth", "message": "Токен не принят API"}
+                    return {"error": "auth", "message": Msg("limits.token_rejected")}
                 # §ratelimit: 429 (сам probe упёрся в лимит) — заголовки лимитов
                 # ВСЁ РАВНО приходят (в т.ч. -5h-reset). Парсим их, а не отдаём
                 # ошибку: это основной фолбэк для reset, когда агент упёрся.
@@ -110,7 +111,7 @@ async def fetch_limits(config: Config) -> dict:
         # → раньше пролетал мимо и ронял вызывающего. (В 3.11 asyncio.TimeoutError
         # — это builtin TimeoutError.)
         log.warning("limits.timeout")
-        return {"error": "network", "message": "таймаут запроса лимитов"}
+        return {"error": "network", "message": Msg("limits.timeout")}
     except aiohttp.ClientError as e:
         log.warning("limits.fetch_failed", err=str(e))
         return {"error": "network", "message": str(e)}

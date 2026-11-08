@@ -59,6 +59,7 @@ from claude_agent_sdk import (
 
 from ..config import Config
 from ..fileserver import _safe_name
+from ..i18n import Msg
 from ..ids import new_ulid
 from ..protocol import Err, make_error
 from ..store.chats import ChatMeta
@@ -665,8 +666,7 @@ class ClaudeSession:
                                     err=err_text[-300:])
                         await self._send_chat_error(
                             Err.AUTH_REQUIRED,
-                            "Claude на сервере не авторизован — открой ссылку "
-                            "авторизации и пришли код (auth_code)")
+                            Msg("claude.auth_required"))
                         if self._on_auth_required is not None:
                             await self._on_auth_required()
                     else:
@@ -1186,8 +1186,7 @@ class ClaudeSession:
             try:
                 await self._send_chat_error(
                     Err.AUTH_REQUIRED,
-                    "Claude на сервере не авторизован — открой ссылку "
-                    "авторизации и пришли код (auth_code)")
+                    Msg("claude.auth_required"))
                 if self._on_auth_required is not None:
                     await self._on_auth_required()
             finally:
@@ -1211,7 +1210,7 @@ class ClaudeSession:
             try:
                 await self._publish("error", {
                     "code": Err.RATE_LIMITED,
-                    "message": "Достигнут лимит подписки Claude",
+                    "message": Msg("claude.rate_limited"),
                     "reset": reset,
                     "resetType": self._rate_limit_type,
                 })

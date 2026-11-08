@@ -54,7 +54,7 @@ from ..store import views_registry
 from ..store import handlers_registry
 from ..core import handler_runner
 from ..store.skill_sources import SkillSources, SkillInstallError
-from .. import fileserver
+from .. import fileserver, i18n
 from .. import authlog
 from .. import updater
 from .. import push
@@ -304,8 +304,8 @@ class HedgehogServer:
         (scheduled_cancelled, журналируемо → на всех устройствах и на resume,
         иначе висел бы вечно) и сообщаем пользователю (не теряем молча)."""
         await self.hub.publish(chat_id, "scheduled_cancelled", {"jobId": job_id})
-        await self.notify_chat(chat_id, "Отложенное сообщение",
-                               "Не удалось отправить после сброса лимита")
+        await self.notify_chat(chat_id, i18n.Msg("defer.title"),
+                               i18n.Msg("defer.failed"))
 
     async def inject_user_message(self, chat_id: str, text: str,
                                   attachments: list, job_id: str) -> None:
@@ -342,8 +342,8 @@ class HedgehogServer:
             await session.handle_user_msg(prompt, interrupt=False)
             log.info("defer.fired", chat=chat_id, job=job_id, atts=len(atts))
             # Оффлайн-курьер: устройства узнают, что отложенное ушло агенту.
-            await self.notify_chat(chat_id, "Отложенное сообщение",
-                                   "Отправлено агенту после сброса лимита")
+            await self.notify_chat(chat_id, i18n.Msg("defer.title"),
+                                   i18n.Msg("defer.sent"))
         except Exception as e:  # noqa: BLE001 — отказ не должен теряться молча
             log.warning("defer.inject_error", chat=chat_id, job=job_id,
                         err=repr(e))
@@ -351,8 +351,8 @@ class HedgehogServer:
                 await self._defer_failed(chat_id, job_id)   # + снять чип
             else:
                 # чип уже снят эхом, но агенту не доставлено — хотя бы уведомим (M).
-                await self.notify_chat(chat_id, "Отложенное сообщение",
-                                       "Не удалось отправить после сброса лимита")
+                await self.notify_chat(chat_id, i18n.Msg("defer.title"),
+                                       i18n.Msg("defer.failed"))
             raise   # чтобы планировщик записал error в job_runs
 
     async def notify_chat(self, chat_id: str, title: str, body: str) -> bool:
@@ -382,8 +382,13 @@ class HedgehogServer:
         for device_id, key in self.push_keys.devices():
             if device_id in online:
                 continue                                # уже доставлено по WS
+            # §i18n: серверные уведомления (Msg) — на языке устройства; тексты
+            # агента (обычные str) уходят как есть.
+            dev_lang = self.push_keys.lang_of(device_id) or i18n.DEFAULT_LANG
+            t_text = title.render(dev_lang) if isinstance(title, i18n.Msg) else title
+            b_text = body.render(dev_lang) if isinstance(body, i18n.Msg) else body
             task = asyncio.create_task(push.send(
-                list(self.config.push_relay_urls), key, title, body, chat_id))
+                list(self.config.push_relay_urls), key, t_text, b_text, chat_id))
             self._push_tasks.add(task)
             task.add_done_callback(self._push_tasks.discard)
 
@@ -681,10 +686,31 @@ class HedgehogServer:
         оно подписано (client_hello обычно приходит ДО subscribe → там список
         пуст, и набор подхватится при subscribe/_ensure_session)."""
         self.hub.set_conn_caps(conn_id, p.clientCapabilities)
+        if frame.type == "client_hello" and p.lang:
+            self._apply_language(conn_id, p.lang)    # §i18n: язык на коннекте
         log.info("client.caps", conn_id=conn_id,
-                 caps=sorted(p.clientCapabilities)[:8])
+                 caps=sorted(p.clientCapabilities)[:8],
+                 lang=self.hub.conn_lang(conn_id))
         for cid in self.hub.conn_subs(conn_id):
             await self._push_caps(cid)
+
+    def _apply_language(self, conn_id: int, raw: str) -> str:
+        """§i18n: нормализовать и запомнить язык соединения (+ язык устройства
+        для оффлайн-пушей). Возвращает применённый язык."""
+        lang = i18n.normalize_lang(raw)
+        self.hub.set_conn_lang(conn_id, lang)
+        dev = self.hub.conn_device(conn_id)
+        if dev:
+            self.push_keys.set_lang(dev, lang)
+        return lang
+
+    async def _h_set_language(self, conn_id, frame, p):
+        """§19: клиент сменил язык интерфейса на лету."""
+        lang = self._apply_language(conn_id, p.lang)
+        log.info("client.language", conn_id=conn_id, requested=p.lang[:35],
+                 lang=lang)
+        await self.hub.send_global(conn_id, make_frame(
+            "language_set", {"lang": lang}))
 
     # ---------- диспетчер ----------
 
@@ -727,6 +753,7 @@ class HedgehogServer:
         'register_push': '_h_register_push',
         'client_hello': '_h_client_caps',
         'client_caps_update': '_h_client_caps',
+        'set_language': '_h_set_language',
         'update_self': '_h_update_self',
         'install_neko': '_h_install_neko',
         'get_neko': '_h_install_neko',
@@ -869,7 +896,7 @@ class HedgehogServer:
             # §netwait L2: мгновенный отказ — op не регистрируем.
             await self.hub.send_global(conn_id, make_frame(
                 "omniroute_catalog",
-                {"ok": False, "error": "нет base_url/ключа",
+                {"ok": False, "error": i18n.Msg("omni.no_base_or_key"),
                  "providers": [], "cliType": p.cliType,
                  "related": frame.id}))
             return
@@ -935,7 +962,9 @@ class HedgehogServer:
         # попросим релей отправить APNs-пуш, когда устройство будет оффлайн.
         # deviceId привязываем к соединению → знаем, какие устройства онлайн
         # (получат напрямую по WS) и каким нужен пуш (per-device маршрутизация).
-        self.push_keys.remember(p.notifyKey, p.deviceId)
+        lang = (i18n.normalize_lang(p.lang) if p.lang
+                else self.hub.conn_lang_explicit(conn_id))
+        self.push_keys.remember(p.notifyKey, p.deviceId, lang)
         self.hub.set_device(conn_id, p.deviceId)
         return
 
@@ -948,7 +977,7 @@ class HedgehogServer:
         if self._updating:
             await self.hub.send_global(conn_id, make_frame("update_result", {
                 "ok": False, "changed": False, "old": "", "new": "",
-                "message": "обновление уже идёт"}))
+                "message": i18n.Msg("update.in_progress")}))
             return
         self._updating = True
         restarting = False
@@ -1026,7 +1055,7 @@ class HedgehogServer:
         # иначе 10с handshake-таймаут вместо быстрого отказа).
         if not await asyncio.to_thread(neko.ai_control_available):
             await self.hub.send_global(conn_id, make_frame(
-                "neko_view_result", {"ok": False, "message": "Neko недоступен"}))
+                "neko_view_result", {"ok": False, "message": i18n.Msg("neko.unavailable")}))
             return
         if self._neko_proxy is None:
             from ..core.neko_proxy import NekoProxy
@@ -1069,7 +1098,8 @@ class HedgehogServer:
                 "install_skill_result", {"ok": True, **result}))
         except SkillInstallError as e:
             await self.hub.send_global(conn_id, make_frame(
-                "install_skill_result", {"ok": False, "error": str(e)}))
+                "install_skill_result",
+                {"ok": False, "error": i18n.msg_of(e)}))   # §i18n: Msg сохраняем
         except Exception as e:  # noqa: BLE001
             log.warning("skills.install_fail", url=p.url, err=repr(e))
             await self.hub.send_global(conn_id, make_frame(
@@ -1236,7 +1266,7 @@ class HedgehogServer:
         except DeferPendingExists:
             await self.hub.send_global(conn_id, make_error(
                 Err.RATE_LIMITED,
-                "В этом чате уже есть отложенное сообщение (лимит 1)",
+                i18n.Msg("defer.already_scheduled"),
                 chat_id=frame.chatId, related=frame.id))
             return
         except Exception as e:  # noqa: BLE001
@@ -1473,8 +1503,10 @@ class HedgehogServer:
         return
 
     async def _h_get_log(self, conn_id, frame, p, meta):
+        lang = self.hub.conn_lang(conn_id)         # §i18n: как resume (§19.2)
         payload: dict[str, Any] = {
-            "events": self.store.read_transcript_tail(frame.chatId, p.tail)}
+            "events": [i18n.localize_frame(e, lang) for e in
+                       self.store.read_transcript_tail(frame.chatId, p.tail)]}
         if self.store.transcript_limit(frame.chatId) <= 0:
             payload["disabled"] = True  # чат создан с log_kb=0
         await self.hub.send_global(conn_id, make_frame(
@@ -1504,6 +1536,8 @@ class HedgehogServer:
         log.info("chat.resume", conn_id=conn_id, chat_id=frame.chatId,
                  events=len(events), full=full_replay,
                  last_seen=(p.last_seen_id or "")[-6:])
+        lang = self.hub.conn_lang(conn_id)         # §i18n: ключи журнала → язык
+        events = [i18n.localize_frame(e, lang) for e in events]
         payload: dict[str, Any] = {
             "events": events,
             "cursor": events[-1]["id"] if events else p.last_seen_id,
@@ -1676,12 +1710,16 @@ class HedgehogServer:
                  "<meta name='viewport' content='width=device-width,"
                  "initial-scale=1,maximum-scale=1'></head>"
                  "<body style='margin:0;background:#ffffff;'></body></html>")
+        lang = self.hub.conn_lang(conn_id)
+        title = p.title or i18n.t("ui.blank_canvas", lang)
         rec = views_registry.record_open(
             self.config.data_dir, frame.chatId,
-            title=p.title or "Empty canvas", html=blank,
+            title=title, html=blank,
             persistent=True, allow_external=False, kind="blank")
         await self.hub.publish(frame.chatId, "ui_request", {
-            "html": blank, "title": rec.get("title", "Empty canvas"),
+            "html": blank,
+            "title": (rec.get("title", title) if p.title
+                      else i18n.Msg("ui.blank_canvas")),
             "persistent": True, "allow_external": False,
             "view_id": rec.get("id", ""), "kind": "blank",
         })
@@ -2273,9 +2311,9 @@ class HedgehogServer:
             async with aiohttp.ClientSession(timeout=timeout) as sess:
                 async with sess.post(url, json=body, headers=headers) as r:
                     if r.status in (401, 403):
-                        return False, f"ключ отклонён ({r.status})"
+                        return False, i18n.Msg("probe.key_rejected", status=r.status)
                     if r.status >= 500:
-                        return False, f"сервер недоступен ({r.status})"
+                        return False, i18n.Msg("probe.server_unavailable_status", status=r.status)
                     # читаем ограниченный кусок тела (L: не тянем в память
                     # мегабайты с чужого хоста) — первых 64 КБ хватает для класс-ции
                     raw = await r.content.read(65536)
@@ -2283,17 +2321,17 @@ class HedgehogServer:
                     if 200 <= r.status < 300:
                         if self._json_obj(text) is not None:
                             return True, None   # настоящий JSON-ответ message
-                        return False, "endpoint не похож на Anthropic API (200 без JSON)"
+                        return False, i18n.Msg("probe.not_anthropic_200")
                     if self._looks_like_api_error(text):
                         return True, None       # ключ принят, модель/запрос отвергнуты
-                    return False, (f"endpoint не похож на Anthropic API "
-                                   f"({r.status})")
+                    return False, i18n.Msg("probe.not_anthropic_status",
+                                          status=r.status)
         except (asyncio.TimeoutError, TimeoutError):
-            return False, "таймаут проверки (15с)"
+            return False, i18n.Msg("probe.timeout")
         except aiohttp.ClientError as e:
-            return False, f"сервер недоступен: {e}"
+            return False, i18n.Msg("probe.server_unavailable", detail=str(e))
         except Exception as e:  # noqa: BLE001 — валидация не должна ронять хендлер
-            return False, f"ошибка проверки: {e}"
+            return False, i18n.Msg("probe.check_failed", detail=str(e))
 
     async def _activate_apikey(self, api_key: str, base_url: str | None,
                                op_id: str | None = None) -> tuple[bool, str | None]:
@@ -2347,7 +2385,7 @@ class HedgehogServer:
                 "opus": p.opus_model, "sonnet": p.sonnet_model,
             }.get(p.default_tier, p.haiku_model)
             if not tier_model:
-                return False, "не заданы модели шлюза"
+                return False, i18n.Msg("omni.no_gateway_models")
             self._mark_committing(op_id)   # активацию не блокируем probe'ом шлюза
             self.config.save_auth_config({
                 "mode": "omniroute", "api_key": p.api_key, "base_url": p.base_url,
@@ -2400,15 +2438,15 @@ class HedgehogServer:
         (переиспользуя api_key/base_url). Без тир-лимита."""
         auth = self.config.load_auth_config()
         if auth.get("mode") != "omniroute" or not auth.get("api_key"):
-            return False, "OmniRoute не активирован"
+            return False, i18n.Msg("omni.not_active")
         ids = [m.id for m in p.models]
         if not ids:
-            return False, "список моделей пуст"
+            return False, i18n.Msg("omni.models_empty")
         idset = set(ids)
         if p.active_id not in idset:
-            return False, "active_id вне списка"
+            return False, i18n.Msg("omni.active_not_in_list")
         if p.small_fast_id not in idset:
-            return False, "small_fast_id вне списка"
+            return False, i18n.Msg("omni.small_not_in_list")
         new_auth = {
             "mode": "omniroute",
             "api_key": auth["api_key"], "base_url": auth.get("base_url", ""),
@@ -2426,13 +2464,13 @@ class HedgehogServer:
         400/404 = ключ валиден). Модели/active/small_fast/base_url сохраняем."""
         auth = self.config.load_auth_config()
         if auth.get("mode") != "omniroute":
-            return False, "OmniRoute не активирован"
+            return False, i18n.Msg("omni.not_active")
         base = auth.get("base_url", "")
         # активная модель для пробы: новый вид → active_id; легаси → любой слот.
         probe = (auth.get("active_id") or auth.get("haiku_model")
                  or auth.get("sonnet_model") or auth.get("opus_model") or "")
         if not probe:
-            return False, "нет модели для проверки ключа"
+            return False, i18n.Msg("omni.no_probe_model")
         ok, err = await self._probe_auth(base, api_key, probe)
         self._mark_committing(op_id)   # §netwait H2: сетевая фаза прошла
         if not ok:

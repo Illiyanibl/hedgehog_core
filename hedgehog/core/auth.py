@@ -35,6 +35,7 @@ import structlog
 
 from ..adapters.screen_grid import ScreenGrid
 from ..config import Config, write_secret_file
+from ..i18n import Msg
 
 log = structlog.get_logger("auth")
 
@@ -280,7 +281,8 @@ class AuthManager:
                 self._last_err = err
                 log.warning("auth.code_rejected", err=err)
                 await self._broadcast("auth_result", {
-                    "ok": False, "retry": True, "error": f"код не принят: {err}"})
+                    "ok": False, "retry": True,
+                    "error": Msg("auth.code_rejected", detail=err)})
                 self._url, self._parse_from = None, len(self._buf)
                 try:
                     os.write(self._master_fd, b"\r")

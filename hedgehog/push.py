@@ -18,6 +18,8 @@ from pathlib import Path
 import aiohttp
 import structlog
 
+from . import i18n
+
 log = structlog.get_logger("push")
 
 # Забываем устройства, не подключавшиеся дольше этого срока (не пушим на мёртвые).
@@ -56,6 +58,8 @@ class PushKeys:
                         # Новый формат: deviceId → {notifyKey, ts}.
                         out[str(k)] = {"notifyKey": str(v["notifyKey"]),
                                        "ts": float(v.get("ts") or 0)}
+                        if v.get("lang"):
+                            out[str(k)]["lang"] = i18n.normalize_lang(v["lang"])
                     else:
                         # Старый формат {notifyKey: ts}: ключ И есть notifyKey,
                         # используем его же как синтетический deviceId.
@@ -89,7 +93,8 @@ class PushKeys:
             self._devs = dict(tail)
         return len(self._devs) != before
 
-    def remember(self, notify_key: str, device_id: str = "") -> None:
+    def remember(self, notify_key: str, device_id: str = "",
+                 lang: str | None = None) -> None:
         if not notify_key:
             return
         # Без deviceId (старый клиент) — синтетический ключ = notifyKey.
@@ -98,13 +103,30 @@ class PushKeys:
         # (синтетический ключ = notifyKey), теперь пришёл реальный deviceId с тем
         # же notifyKey — убираем старую синтетическую запись, иначе устройство
         # задвоится в реестре и получит пуш дважды (до KEY_TTL).
+        carried_lang = None
         if device_id and device_id != notify_key:
-            self._devs.pop(notify_key, None)
+            old = self._devs.pop(notify_key, None) or {}
+            carried_lang = old.get("lang")        # язык старой записи не теряем
         # Переставляем в хвост (метка «самый свежий»), обновляя last_seen.
-        self._devs.pop(dev, None)
-        self._devs[dev] = {"notifyKey": notify_key, "ts": time.time()}
+        prev = self._devs.pop(dev, None) or {}
+        rec = {"notifyKey": notify_key, "ts": time.time()}
+        keep = lang or prev.get("lang") or carried_lang   # §i18n: язык переживает перерегистрацию
+        if keep:
+            rec["lang"] = keep
+        self._devs[dev] = rec
         self._prune()
         self._save()
+
+    def set_lang(self, device_id: str, lang: str) -> None:
+        """§i18n: язык устройства (для локализации оффлайн-пушей)."""
+        rec = self._devs.get(device_id)
+        if rec is not None and rec.get("lang") != lang:
+            rec["lang"] = lang
+            self._save()
+
+    def lang_of(self, device_id: str) -> str | None:
+        rec = self._devs.get(device_id)
+        return rec.get("lang") if rec else None
 
     def devices(self) -> list[tuple[str, str]]:
         """Список (deviceId, notifyKey) живых (не протухших) устройств."""

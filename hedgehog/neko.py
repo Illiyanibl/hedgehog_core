@@ -28,6 +28,7 @@ from pathlib import Path
 import structlog
 
 from .config import Config, write_secret_file
+from .i18n import Msg
 
 log = structlog.get_logger("neko")
 
@@ -307,7 +308,7 @@ def ai_control_available() -> bool:
 def status(config: Config) -> NekoResult:
     if not _docker_ok():
         return NekoResult(ok=False, status="error", stage=STAGE_ERROR,
-                          message="docker недоступен (нет socket-proxy?)")
+                          message=Msg("neko.docker_unavailable_socket"))
     # Идёт установка — контейнер в промежуточном состоянии (rename→run), поэтому
     # отдаём ЖИВУЮ стадию из provision, а не «absent». Клиент опросом get_neko
     # видит: pulling (скачка образа) → deploying (развёртывание).
@@ -326,7 +327,7 @@ def status(config: Config) -> NekoResult:
                           ai_control=_self_on_network())   # N3: честный статус
     return NekoResult(ok=True, status="absent" if st == "absent" else "error",
                       stage=STAGE_IDLE if st == "absent" else STAGE_ERROR,
-                      message="" if st == "absent" else "контейнер остановлен")
+                      message="" if st == "absent" else Msg("neko.container_stopped"))
 
 
 def provision(config: Config) -> NekoResult:
@@ -341,12 +342,12 @@ def _provision_locked(config: Config) -> NekoResult:
     if not _docker_ok():
         _set_stage(STAGE_ERROR)
         return NekoResult(ok=False, status="error", stage=STAGE_ERROR,
-                          message="docker недоступен (нужен socket-proxy)")
+                          message=Msg("neko.docker_unavailable_need_proxy"))
     user_pw, admin_pw = _passwords(config)
     if not _seed_tls_volume(config):
         _set_stage(STAGE_ERROR)
         return NekoResult(ok=False, status="error", stage=STAGE_ERROR,
-                          message="не удалось подготовить TLS-серт для neko")
+                          message=Msg("neko.tls_failed"))
 
     network, net_connected = _ensure_network()
     if network is None:
@@ -356,7 +357,7 @@ def _provision_locked(config: Config) -> NekoResult:
         # Нет изоляции — не запускаем браузер вовсе.
         _set_stage(STAGE_ERROR)
         return NekoResult(ok=False, status="error", stage=STAGE_ERROR,
-                          message="не удалось создать изолированную сеть neko")
+                          message=Msg("neko.network_failed"))
     _ensure_swap(config)      # §AI-control: host-swap под память браузера (best-effort)
     nat_ip = config.server_ip
 
@@ -373,7 +374,7 @@ def _provision_locked(config: Config) -> NekoResult:
         log.error("neko.pull.failed", image=config.neko_image,
                   timeout=config.neko_pull_timeout, out=out[-300:])
         return NekoResult(ok=False, status="error", stage=STAGE_ERROR,
-                          message=f"docker pull образа neko не удался: {out[-200:]}")
+                          message=Msg("neko.pull_failed", detail=out[-200:]))
 
     # Стадия «развёртывание»: пересоздание (rename→singleton→run).
     _set_stage(STAGE_DEPLOYING)
@@ -426,7 +427,7 @@ def _provision_locked(config: Config) -> NekoResult:
             _run(["docker", "rename", f"{CONTAINER}-old", CONTAINER], timeout=60)
             _run(["docker", "start", CONTAINER], timeout=60)
             return NekoResult(ok=False, status="error", stage=STAGE_ERROR,
-                              message=f"docker run упал, откат на старый: {out[-200:]}")
+                              message=Msg("neko.run_failed_rollback", detail=out[-200:]))
         return NekoResult(ok=False, status="error", stage=STAGE_ERROR,
                           message=f"docker run: {out[-200:]}")
 
@@ -450,4 +451,4 @@ def teardown(config: Config) -> NekoResult:
         _run(["docker", "rm", "-f", CONTAINER], timeout=60)
         _set_stage(STAGE_IDLE)
         return NekoResult(ok=True, status="absent", stage=STAGE_IDLE,
-                          message="neko удалён")
+                          message=Msg("neko.removed"))

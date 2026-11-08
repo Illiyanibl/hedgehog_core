@@ -116,7 +116,8 @@ class UiCallPayload(_Payload):
 
 class UiNewBlankPayload(_Payload):
     """§draw: пользователь нажал ＋ — создать пустое белое §views-окно (холст)."""
-    title: str = "Пустой холст"
+    # §i18n: пусто → сервер подставит «Blank canvas» на языке соединения.
+    title: str = ""
 
 
 class UiDrawApplyPayload(_Payload):
@@ -351,6 +352,9 @@ class RegisterPushPayload(_Payload):
     notifyKey: str = Field(min_length=1, max_length=200)
     deviceId: str = Field(default="", max_length=200,
                           pattern=r"^[A-Za-z0-9._-]*$")
+    # §i18n: язык устройства — на нём серверные уведомления уходят оффлайн-пушем
+    # (на лету обновляется set_language). Без поля — язык текущего соединения.
+    lang: str | None = Field(default=None, max_length=35)
 
 
 class ClientCapsPayload(_Payload):
@@ -362,6 +366,16 @@ class ClientCapsPayload(_Payload):
     `client_caps_update` (при смене пользовательской настройки, на лету).
     Полный список (не дельта). Неизвестные строки сервер игнорирует."""
     clientCapabilities: list[str] = Field(default_factory=list, max_length=32)
+    # §i18n (§19): язык интерфейса клиента (BCP-47-подобный тег) — только в
+    # client_hello; на лету язык меняется фреймом set_language. Сервер
+    # нормализует (i18n.normalize_lang); не пришёл/не поддержан → en.
+    lang: str | None = Field(default=None, max_length=35)
+
+
+class SetLanguagePayload(_Payload):
+    """§i18n (§19): клиент сменил язык интерфейса — сервер локализует под него
+    последующие пользовательские сообщения этого соединения."""
+    lang: str = Field(min_length=1, max_length=35)
 
 
 class NekoOpenViewPayload(_Payload):
@@ -434,6 +448,8 @@ CLIENT_FRAME_TYPES: dict[str, tuple[type[_Payload], bool]] = {
     # глобальные, без chatId). Общий payload для обоих.
     "client_hello": (ClientCapsPayload, False),
     "client_caps_update": (ClientCapsPayload, False),
+    # §i18n: смена языка клиента на лету (глобальный, без chatId)
+    "set_language": (SetLanguagePayload, False),
     # §15: самообновление Ёжика (git pull + рестарт; глобальный, без chatId)
     "update_self": (EmptyPayload, False),
     # §17: Neko-браузер (провижининг/статус/снос; глобальные, без chatId)
