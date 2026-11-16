@@ -13,11 +13,14 @@
 """
 from __future__ import annotations
 
+import importlib.metadata
+import json
 import os
+import re
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from .i18n import Msg
 
@@ -34,15 +37,21 @@ class UpdateResult:
     old: str = ""
     new: str = ""
     message: str = ""
+    # манифест совместимости: {"sdk_before","sdk_after","sdk_pinned","updated","error"}
+    cli: dict = field(default_factory=dict)
 
 
-def _run(args: list[str], cwd: Path) -> tuple[int, str]:
+SDK_DIST = "claude-agent-sdk"
+_PIP_TIMEOUT = 600
+
+
+def _run(args: list[str], cwd: Path, timeout: int = 180) -> tuple[int, str]:
     # GIT_TERMINAL_PROMPT=0 / GIT_ASKPASS=true: git НИКОГДА не зависает в ожидании
     # логина (нет TTY) — падает быстро с понятным кодом, а не «No such device».
     env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": "true"}
     try:
         proc = subprocess.run(
-            args, cwd=str(cwd), capture_output=True, text=True, timeout=180,
+            args, cwd=str(cwd), capture_output=True, text=True, timeout=timeout,
             env=env)
     except (OSError, subprocess.SubprocessError) as e:
         return 1, f"{type(e).__name__}: {e}"
@@ -67,6 +76,65 @@ def _fetch(root: Path, branch: str) -> tuple[int, str]:
         if i < len(_FETCH_BACKOFF):
             time.sleep(_FETCH_BACKOFF[i])
     return code, out
+
+
+def read_compat(pkg_dir: Path | None = None) -> dict | None:
+    """Читает hedgehog/compat.json (манифест совместимой версии SDK) С ДИСКА.
+    None — файла нет / битый JSON / неверные типы. Исключений не бросает."""
+    pkg_dir = pkg_dir or Path(__file__).resolve().parent
+    try:
+        data = json.loads((pkg_dir / "compat.json").read_text(encoding="utf-8"))
+        sdk = data["claude_agent_sdk"]
+        ver = sdk["version"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    if not isinstance(ver, str) or not ver.strip():
+        return None
+    return {"claude_agent_sdk": {**sdk, "version": ver.strip()}}
+
+
+def installed_version(dist: str = SDK_DIST) -> str | None:
+    try:
+        return importlib.metadata.version(dist)
+    except Exception:  # noqa: BLE001  (PackageNotFoundError и порча метаданных)
+        return None
+
+
+def _nums(v: str) -> tuple:
+    n = [int(x) for x in re.findall(r"\d+", v.split("+")[0])[:6]]
+    return tuple(n + [0] * (6 - len(n)))
+
+
+def _version_lt(a: str, b: str) -> bool:
+    """a < b: packaging, если стоит, иначе числовые компоненты."""
+    try:
+        from packaging.version import Version
+        return Version(a) < Version(b)
+    except Exception:  # noqa: BLE001
+        return _nums(a) < _nums(b)
+
+
+def ensure_compat(root: Path, pkg_dir: Path | None = None) -> dict:
+    """Доводит установленный claude-agent-sdk до версии из манифеста.
+    Политика «только вперёд»: installed < pinned → pip install ==pinned.
+    Не бросает: ошибка pip → cli["error"], updated False. {} — манифеста нет."""
+    compat = read_compat(pkg_dir)
+    if compat is None:
+        return {}
+    pinned = compat["claude_agent_sdk"]["version"]
+    before = installed_version()
+    cli: dict = {"sdk_before": before, "sdk_after": before,
+                 "sdk_pinned": pinned, "updated": False, "error": None}
+    if before is None or not _version_lt(before, pinned):
+        return cli      # нет SDK (его ставит requirements) / уже >= pinned
+    code, out = _run([sys.executable, "-m", "pip", "install", "-q",
+                      f"{SDK_DIST}=={pinned}"], root, timeout=_PIP_TIMEOUT)
+    if code != 0:
+        cli["error"] = f"pip install {SDK_DIST}=={pinned}: {out[-300:]}"
+        return cli
+    cli["sdk_after"] = installed_version() or pinned
+    cli["updated"] = True
+    return cli
 
 
 def repo_root() -> Path | None:
@@ -154,9 +222,15 @@ def pull_latest(process_sha: str = "") -> UpdateResult:
             return UpdateResult(ok=False, old=old, new=new, changed=changed,
                                 message=f"pip install: {out[-300:]}")
 
+    # манифест совместимого SDK — после reset (свежий с диска), независимо от
+    # changed; успешный апдейт SDK требует рестарта.
+    cli = ensure_compat(root)
+    if cli.get("updated"):
+        changed = True
+
     msg = (Msg("update.updated", old=old, new=new) if changed
            else Msg("update.up_to_date", version=new or old))
-    return UpdateResult(ok=True, changed=changed, old=old, new=new, message=msg)
+    return UpdateResult(ok=True, changed=changed, old=old, new=new, message=msg, cli=cli)
 
 
 def restart_in_place() -> None:

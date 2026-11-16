@@ -984,13 +984,18 @@ class HedgehogServer:
         try:
             result = await asyncio.to_thread(updater.pull_latest,
                                              _SERVER_COMMIT)
-            await self.hub.send_global(conn_id, make_frame("update_result", {
+            upd_payload = {
                 "ok": result.ok,
                 "changed": result.changed,
                 "old": result.old,
                 "new": result.new,
                 "message": result.message,
-            }))
+            }
+            cli_info = getattr(result, "cli", None)
+            if cli_info:   # манифест совместимого SDK (опционально, §15.2)
+                upd_payload["cli"] = cli_info
+            await self.hub.send_global(conn_id, make_frame(
+                "update_result", upd_payload))
             log.info("update.self", ok=result.ok, changed=result.changed,
                      old=result.old, new=result.new)
             if result.ok and result.changed:
