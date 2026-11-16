@@ -11,6 +11,7 @@
   "update.in_progress": "Μια ενημέρωση βρίσκεται ήδη σε εξέλιξη",
   "update.not_git": "Δεν είναι εγκατάσταση git — η ενημέρωση δεν είναι διαθέσιμη",
   "update.updated": "Ενημερώθηκε {old} → {new}",
+  "update.sdk_updated": "Το Claude CLI ενημερώθηκε {before} → {after}",
   "update.up_to_date": "Είναι ήδη ενημερωμένο ({version})",
   "auth.code_rejected": "Ο κωδικός απορρίφθηκε: {detail}",
   "omni.no_base_or_key": "Λείπει το base_url / το κλειδί API",

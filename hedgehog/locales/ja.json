@@ -11,6 +11,7 @@
   "update.in_progress": "すでに更新中です",
   "update.not_git": "git によるインストールではないため、更新できません",
   "update.updated": "{old} → {new} に更新しました",
+  "update.sdk_updated": "Claude CLI を更新しました {before} → {after}",
   "update.up_to_date": "すでに最新です（{version}）",
   "auth.code_rejected": "コードが受け付けられませんでした: {detail}",
   "omni.no_base_or_key": "base_url / API キーがありません",

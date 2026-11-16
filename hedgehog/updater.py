@@ -37,12 +37,18 @@ class UpdateResult:
     old: str = ""
     new: str = ""
     message: str = ""
-    # манифест совместимости: {"sdk_before","sdk_after","sdk_pinned","updated","error"}
+    # манифест совместимости: {"sdk_before","sdk_after","sdk_pinned","updated",
+    # "error","broken"}; {} — манифеста нет
     cli: dict = field(default_factory=dict)
 
 
 SDK_DIST = "claude-agent-sdk"
 _PIP_TIMEOUT = 600
+_IMPORT_TIMEOUT = 60
+_BUDGET = 900          # общий бюджет pull_latest, сек
+_VER_RE = re.compile(
+    r"^\d+(\.\d+){1,3}((a|b|rc)\d+)?(\.post\d+)?(\.dev\d+)?$")
+_PIP_FLAGS = ["--no-input", "--disable-pip-version-check"]
 
 
 def _run(args: list[str], cwd: Path, timeout: int = 180) -> tuple[int, str]:
@@ -58,7 +64,15 @@ def _run(args: list[str], cwd: Path, timeout: int = 180) -> tuple[int, str]:
     return proc.returncode, (proc.stdout + proc.stderr).strip()
 
 
-def _fetch(root: Path, branch: str) -> tuple[int, str]:
+def _left(deadline: float | None, step: float) -> float:
+    """Таймаут шага: min(step, остаток бюджета). <=0 — бюджет исчерпан."""
+    if deadline is None:
+        return step
+    return min(step, deadline - time.monotonic())
+
+
+def _fetch(root: Path, branch: str,
+           deadline: float | None = None) -> tuple[int, str]:
     """git fetch к origin с ретраями (см. _FETCH_BACKOFF).
 
     credential.helper= (пустой) — НЕ слать никакой stored-токен: репозиторий
@@ -68,9 +82,12 @@ def _fetch(root: Path, branch: str) -> tuple[int, str]:
     Ретрай добивает разовые сетевые сбои."""
     code, out = 1, ""
     for i in range(len(_FETCH_BACKOFF) + 1):
+        t = _left(deadline, 180)
+        if t <= 0:
+            return 1, "budget exhausted"
         code, out = _run(
             ["git", "-c", "credential.helper=", "-c", "http.version=HTTP/1.1",
-             "fetch", "--depth", "1", "origin", branch], root)
+             "fetch", "--depth", "1", "origin", branch], root, timeout=t)
         if code == 0:
             return 0, out
         if i < len(_FETCH_BACKOFF):
@@ -88,8 +105,8 @@ def read_compat(pkg_dir: Path | None = None) -> dict | None:
         ver = sdk["version"]
     except (OSError, ValueError, KeyError, TypeError):
         return None
-    if not isinstance(ver, str) or not ver.strip():
-        return None
+    if not isinstance(ver, str) or not _VER_RE.match(ver.strip()):
+        return None       # только точная версия (никаких «,>0», «.*», «; x»)
     return {"claude_agent_sdk": {**sdk, "version": ver.strip()}}
 
 
@@ -100,40 +117,73 @@ def installed_version(dist: str = SDK_DIST) -> str | None:
         return None
 
 
-def _nums(v: str) -> tuple:
-    n = [int(x) for x in re.findall(r"\d+", v.split("+")[0])[:6]]
-    return tuple(n + [0] * (6 - len(n)))
+def _pip_err(out: str) -> str:
+    """Краткая причина из вывода pip: последняя строка с «ERROR:» (≤300)."""
+    lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
+    errs = [ln for ln in lines if "ERROR:" in ln]
+    return (errs or lines or ["no output"])[-1][:300]
 
 
-def _version_lt(a: str, b: str) -> bool:
-    """a < b: packaging, если стоит, иначе числовые компоненты."""
-    try:
-        from packaging.version import Version
-        return Version(a) < Version(b)
-    except Exception:  # noqa: BLE001
-        return _nums(a) < _nums(b)
+def _sdk_importable(root: Path, deadline: float | None = None) -> bool:
+    t = _left(deadline, _IMPORT_TIMEOUT)
+    if t <= 0:
+        return False
+    code, _ = _run([sys.executable, "-c", "import claude_agent_sdk"], root,
+                   timeout=t)
+    return code == 0
 
 
-def ensure_compat(root: Path, pkg_dir: Path | None = None) -> dict:
-    """Доводит установленный claude-agent-sdk до версии из манифеста.
-    Политика «только вперёд»: installed < pinned → pip install ==pinned.
-    Не бросает: ошибка pip → cli["error"], updated False. {} — манифеста нет."""
+def ensure_compat(root: Path, pkg_dir: Path | None = None,
+                  deadline: float | None = None) -> dict:
+    """НАСТОЯЩИЙ ПИН: приводит установленный claude-agent-sdk ровно к версии
+    из compat.json — и вверх, и вниз; SDK нет → ставит пин. После установки
+    проверяет `import claude_agent_sdk`; при падении pip или импорта
+    переустанавливает прежнюю версию (если была) и проверяет снова. Если SDK
+    так и не импортируется — cli["broken"]=True (pull_latest вернёт ok=False и
+    НЕ даст рестарт в битый SDK). Не бросает; ошибка → cli["error"].
+    {} — манифеста нет.
+
+    pip заменяет файлы SDK на диске: уже запущенные CLI-процессы держат старый
+    inode и доживают на прежней версии; новая подхватывается после рестарта
+    (restart_in_place → execv сбрасывает кэши импорта)."""
     compat = read_compat(pkg_dir)
     if compat is None:
         return {}
     pinned = compat["claude_agent_sdk"]["version"]
     before = installed_version()
     cli: dict = {"sdk_before": before, "sdk_after": before,
-                 "sdk_pinned": pinned, "updated": False, "error": None}
-    if before is None or not _version_lt(before, pinned):
-        return cli      # нет SDK (его ставит requirements) / уже >= pinned
-    code, out = _run([sys.executable, "-m", "pip", "install", "-q",
-                      f"{SDK_DIST}=={pinned}"], root, timeout=_PIP_TIMEOUT)
-    if code != 0:
-        cli["error"] = f"pip install {SDK_DIST}=={pinned}: {out[-300:]}"
+                 "sdk_pinned": pinned, "updated": False, "error": None,
+                 "broken": False}
+    if before == pinned:
         return cli
-    cli["sdk_after"] = installed_version() or pinned
-    cli["updated"] = True
+    if _left(deadline, _PIP_TIMEOUT) <= 5:
+        cli["error"] = "budget exhausted"
+        return cli
+
+    def _pip(ver: str) -> tuple[int, str]:
+        t = _left(deadline, _PIP_TIMEOUT)
+        if t <= 0:
+            return 1, "ERROR: budget exhausted"
+        return _run([sys.executable, "-m", "pip", "install", *_PIP_FLAGS,
+                     f"{SDK_DIST}=={ver}"], root, timeout=t)
+
+    code, out = _pip(pinned)
+    err = None
+    if code != 0:
+        err = f"pip install {SDK_DIST}=={pinned}: {_pip_err(out)}"
+    elif not _sdk_importable(root, deadline):
+        err = f"import claude_agent_sdk failed after install of {pinned}"
+    if err is None:
+        cli["sdk_after"] = installed_version() or pinned
+        cli["updated"] = True
+        return cli
+
+    cli["error"] = err[:300]
+    if before is not None:           # откат на прежнюю версию
+        _pip(before)
+    cli["sdk_after"] = installed_version()
+    if not _sdk_importable(root, deadline):
+        cli["broken"] = True
     return cli
 
 
@@ -173,6 +223,7 @@ def pull_latest(process_sha: str = "") -> UpdateResult:
     упали → процесс остаётся на A, а диск уже B. Тогда повторный апдейт видел бы
     old(B)==new(B) → «уже актуально», рестарта нет → навсегда на старом коде.
     Поэтому «изменилось» = диск ПОСЛЕ reset ≠ SHA процесса (а не ≠ диск ДО)."""
+    deadline = time.monotonic() + _BUDGET      # общий бюджет всего апдейта
     root = repo_root()
     if root is None:
         return UpdateResult(
@@ -194,7 +245,7 @@ def pull_latest(process_sha: str = "") -> UpdateResult:
 
     # fetch + hard reset — работает и на shallow (--depth 1) клоне. _fetch тянет
     # АНОНИМНО (без stored-токена), с HTTP/1.1 и ретраями.
-    code, out = _fetch(root, branch)
+    code, out = _fetch(root, branch, deadline)
     if code != 0:
         return UpdateResult(ok=False, old=old, message=f"git fetch: {out[-300:]}")
     code, out = _run(["git", "reset", "--hard", f"origin/{branch}"], root)
@@ -215,21 +266,41 @@ def pull_latest(process_sha: str = "") -> UpdateResult:
     except OSError:
         req_after = b""
     stale_disk = bool(process_sha) and disk_before != process_sha
+    pip_fail = None
     if changed and req and (req_after != req_before or stale_disk):
-        code, out = _run(
-            [sys.executable, "-m", "pip", "install", "-q", "-r", str(req)], root)
-        if code != 0:
-            return UpdateResult(ok=False, old=old, new=new, changed=changed,
-                                message=f"pip install: {out[-300:]}")
+        # requirements.txt содержит `claude-agent-sdk==<пин>` (зеркало compat.json)
+        t = _left(deadline, _PIP_TIMEOUT)
+        if t <= 0:
+            pip_fail = "budget exhausted"
+        else:
+            code, out = _run(
+                [sys.executable, "-m", "pip", "install", *_PIP_FLAGS,
+                 "-r", str(req)], root, timeout=t)
+            if code != 0:
+                pip_fail = _pip_err(out)
 
-    # манифест совместимого SDK — после reset (свежий с диска), независимо от
-    # changed; успешный апдейт SDK требует рестарта.
-    cli = ensure_compat(root)
-    if cli.get("updated"):
-        changed = True
+    # манифест совместимого SDK — ВСЕГДА после reset/pip (свежий с диска),
+    # независимо от changed: закрывает любое расхождение с requirements.
+    cli = ensure_compat(root, deadline=deadline)
 
-    msg = (Msg("update.updated", old=old, new=new) if changed
-           else Msg("update.up_to_date", version=new or old))
+    if pip_fail is not None:
+        return UpdateResult(ok=False, old=old, new=new, changed=changed,
+                            message=f"pip install: {pip_fail}", cli=cli)
+    if cli.get("broken"):
+        # SDK не импортируется даже после отката — рестарт в него запрещён
+        return UpdateResult(ok=False, old=old, new=new, changed=False,
+                            message=f"claude-agent-sdk: {cli.get('error')}", cli=cli)
+    sdk_only = False
+    if cli.get("updated") and not changed:
+        changed = sdk_only = True
+
+    if sdk_only:
+        msg = Msg("update.sdk_updated", before=cli.get("sdk_before") or "—",
+                  after=cli.get("sdk_after") or "—")
+    elif changed:
+        msg = Msg("update.updated", old=old, new=new)
+    else:
+        msg = Msg("update.up_to_date", version=new or old)
     return UpdateResult(ok=True, changed=changed, old=old, new=new, message=msg, cli=cli)
 
 
@@ -237,7 +308,8 @@ def restart_in_place() -> None:
     """Перезапуск процесса с обновлённым кодом. execv переиспользует тот же
     интерпретатор и заново импортирует модули с диска; окружение (порты,
     токен) наследуется. Слушающие сокеты закрываются (CLOEXEC) → новый
-    процесс переприбиндивается. Доп. аргументы запуска (sys.argv[1:]) сохраняем,
+    процесс переприбиндивается. execv также сбрасывает кэши импорта: pip мог
+    заменить файлы SDK, запущенные CLI держат старый inode. Доп. аргументы запуска (sys.argv[1:]) сохраняем,
     иначе рестарт после апдейта терял бы переданные флаги."""
     os.execv(sys.executable,
              [sys.executable, "-m", "hedgehog.main", *sys.argv[1:]])

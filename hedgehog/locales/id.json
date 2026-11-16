@@ -11,6 +11,7 @@
   "update.in_progress": "Pembaruan sudah berjalan",
   "update.not_git": "Bukan instalasi git — pembaruan tidak tersedia",
   "update.updated": "Diperbarui {old} → {new}",
+  "update.sdk_updated": "Claude CLI diperbarui {before} → {after}",
   "update.up_to_date": "Sudah yang terbaru ({version})",
   "auth.code_rejected": "Kode ditolak: {detail}",
   "omni.no_base_or_key": "base_url / kunci API tidak ada",

@@ -991,7 +991,7 @@ class HedgehogServer:
                 "new": result.new,
                 "message": result.message,
             }
-            cli_info = getattr(result, "cli", None)
+            cli_info = result.cli
             if cli_info:   # манифест совместимого SDK (опционально, §15.2)
                 upd_payload["cli"] = cli_info
             await self.hub.send_global(conn_id, make_frame(

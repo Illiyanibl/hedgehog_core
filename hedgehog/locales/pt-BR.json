@@ -11,6 +11,7 @@
   "update.in_progress": "Já há uma atualização em andamento",
   "update.not_git": "Instalação sem git — atualização indisponível",
   "update.updated": "Atualizado {old} → {new}",
+  "update.sdk_updated": "Claude CLI atualizado {before} → {after}",
   "update.up_to_date": "Já está atualizado ({version})",
   "auth.code_rejected": "Código rejeitado: {detail}",
   "omni.no_base_or_key": "Sem base_url / chave de API",

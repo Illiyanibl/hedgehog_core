@@ -7,7 +7,7 @@ dependencies = [
     "websockets>=13.0",
     "pydantic>=2.7",
     "structlog>=24.1",
-    "claude-agent-sdk>=0.2.179",
+    "claude-agent-sdk==0.2.179",
     "aiohttp>=3.10",
     "cryptography>=42.0",
 ]

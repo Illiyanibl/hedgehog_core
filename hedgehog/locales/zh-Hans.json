@@ -11,6 +11,7 @@
   "update.in_progress": "更新已在进行中",
   "update.not_git": "非 git 安装——无法更新",
   "update.updated": "已更新 {old} → {new}",
+  "update.sdk_updated": "Claude CLI 已更新 {before} → {after}",
   "update.up_to_date": "已是最新版本（{version}）",
   "auth.code_rejected": "授权码被拒绝：{detail}",
   "omni.no_base_or_key": "缺少 base_url / API 密钥",
