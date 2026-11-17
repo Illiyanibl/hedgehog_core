@@ -25,6 +25,7 @@ from typing import Any
 import structlog
 import websockets
 from websockets.asyncio.server import Request, Response, ServerConnection, serve
+from websockets.protocol import State
 
 from .. import tls
 
@@ -660,6 +661,12 @@ class HedgehogServer:
                 "cliTypes": list(models.KNOWN_CLI_TYPES),
             }))
             async for raw in ws:
+                # Кадр, дочитанный из буфера уже ПОСЛЕ закрытия клиентом (цикл
+                # стоял на долгой операции): клиент считает его недоставленным
+                # и пошлёт заново после переподключения — не выполнять (дубль).
+                if ws.state is not State.OPEN:
+                    log.info("conn.drop_after_close", conn_id=conn_id)
+                    break
                 await self._dispatch(conn_id, raw)
         except websockets.ConnectionClosed:
             pass
