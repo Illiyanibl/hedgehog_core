@@ -212,6 +212,10 @@ class Hub:
     # тормозящий сокет не сериализовал доставку всем прочим.
     _SEND_TIMEOUT = 15.0
 
+    def has_conn(self, conn_id: int) -> bool:
+        """Соединение ещё зарегистрировано (не закрыто)."""
+        return conn_id in self._conns
+
     async def send_global(self, conn_id: int, frame: dict):
         """Системный фрейм (hello, chat_list, pong, error) одному соединению."""
         entry = self._conns.get(conn_id)

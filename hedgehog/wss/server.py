@@ -191,6 +191,8 @@ class HedgehogServer:
         # бы ping/subscribe/user_msg этого соединения. Ссылки держим (GC).
         self._neko_install_task: asyncio.Task | None = None
         self._neko_remove_task: asyncio.Task | None = None
+        # §15: фоновый update_self (тоже вне цикла кадров соединения).
+        self._update_task: asyncio.Task | None = None
         # §defer-clock: смещение часов Anthropic относительно локальных
         # (serverDate из заголовка Date ответа /v1/messages − time.time()).
         # Обновляется при get_limits. Нужно, чтобы планировать defer к реальному
@@ -470,9 +472,14 @@ class HedgehogServer:
             for t in list(self._push_tasks):
                 t.cancel()
             await asyncio.gather(*self._push_tasks, return_exceptions=True)
-        # §17: фоновые install/remove neko — снимаем задачи (поток docker сам
-        # доработает: to_thread не отменить, но и не ждём его здесь).
-        for t in (self._neko_install_task, self._neko_remove_task):
+        # §17/§15: фоновые install/remove neko и update_self — снимаем задачи.
+        # Поток to_thread не отменить, а asyncio.run ждёт его на выходе →
+        # идущий docker pull прерываем флагом, чтобы shutdown не висел.
+        if self._neko_install_task is not None and not self._neko_install_task.done():
+            from .. import neko
+            neko.cancel_provision()
+        for t in (self._neko_install_task, self._neko_remove_task,
+                  self._update_task):
             if t is not None and not t.done():
                 t.cancel()
         if self._neko_proxy is not None:   # §17: догасить серверный MCP-проброс neko
@@ -997,6 +1004,25 @@ class HedgehogServer:
                 "message": i18n.Msg("update.in_progress")}))
             return
         self._updating = True
+        # git pull/pip/рестарт идут до ~15 мин (бюджет pull_latest) → ФОНОВАЯ
+        # задача, как install_neko: цикл кадров соединения сразу свободен
+        # (ping/user_msg не ждут апдейта). Проверка+взвод без await между ними
+        # — single-flight сохраняется.
+        self._update_task = asyncio.create_task(
+            self._update_job(conn_id, frame.id), name="update-self")
+        return
+
+    async def _reply_or_broadcast(self, conn_id, frame):
+        """Итог долгой фоновой операции (update_self, ошибка neko) —
+        инициатору, если он ещё на связи; иначе всем (клиент мог
+        переподключиться за время pull/pip)."""
+        if self.hub.has_conn(conn_id):
+            await self.hub.send_global(conn_id, frame)
+        else:
+            await self.hub.broadcast_global(frame)
+
+    async def _update_job(self, conn_id, frame_id):
+        """Фон update_self: pull_latest в потоке → update_result → рестарт."""
         restarting = False
         try:
             result = await asyncio.to_thread(updater.pull_latest,
@@ -1011,7 +1037,7 @@ class HedgehogServer:
             cli_info = result.cli
             if cli_info:   # манифест совместимого SDK (опционально, §15.2)
                 upd_payload["cli"] = cli_info
-            await self.hub.send_global(conn_id, make_frame(
+            await self._reply_or_broadcast(conn_id, make_frame(
                 "update_result", upd_payload))
             log.info("update.self", ok=result.ok, changed=result.changed,
                      old=result.old, new=result.new)
@@ -1020,6 +1046,11 @@ class HedgehogServer:
                 async def _restart():
                     await asyncio.sleep(1.0)  # дать update_result долететь
                     log.info("update.restart", to=result.new)
+                    from .. import neko
+                    if neko.is_provisioning():
+                        # execv не ждёт поток docker: прерываем pull, иначе
+                        # он доживёт сиротой, а стадия после рестарта = absent.
+                        neko.cancel_provision()
                     try:
                         updater.restart_in_place()   # execv — не возвращается
                     except Exception as e:  # noqa: BLE001
@@ -1031,10 +1062,15 @@ class HedgehogServer:
                         self._updating = False   # разлатчиваем — рестарт не идёт
                 # L: держим ссылку (иначе GC может собрать задачу до execv).
                 self._restart_task = asyncio.create_task(_restart())
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 — сбой фоновой задачи не теряем
+            log.error("update.job_failed", err=repr(e))
+            await self._reply_or_broadcast(conn_id, make_error(
+                Err.INTERNAL, f"{type(e).__name__}: {e}", related=frame_id))
         finally:
             if not restarting:
                 self._updating = False
-        return
 
     @staticmethod
     def _neko_frame(result) -> dict:
@@ -1092,7 +1128,7 @@ class HedgehogServer:
             raise
         except Exception as e:  # noqa: BLE001 — сбой фоновой задачи не теряем
             log.error("neko.job_failed", type=ftype, err=repr(e))
-            await self.hub.send_global(conn_id, make_error(
+            await self._reply_or_broadcast(conn_id, make_error(
                 Err.INTERNAL, f"{type(e).__name__}: {e}", related=frame_id))
             return
         await self.hub.broadcast_global(self._neko_frame(result))

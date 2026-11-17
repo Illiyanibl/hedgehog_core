@@ -429,6 +429,14 @@ def _cancelled_result() -> NekoResult:
                       message=Msg("neko.install_cancelled"))
 
 
+def _cancel_cleanup() -> NekoResult:
+    """§cancel посреди deploy: НЕ откатываться на старый контейнер (remove_neko
+    уже мог снести текущий без лока) — сносим и новый, и `-old`."""
+    _run(["docker", "rm", "-f", CONTAINER], timeout=60)
+    _run(["docker", "rm", "-f", f"{CONTAINER}-old"], timeout=60)
+    return _cancelled_result()
+
+
 def _provision_locked(config: Config) -> NekoResult:
     # §cancel: точки отмены — только между шагами, где состояние чистое (до
     # deploy: rename/run/rollback не рвём на полпути). Deploy короткий, а
@@ -491,6 +499,8 @@ def _provision_locked(config: Config) -> NekoResult:
         _run(["docker", "rm", "-f", f"{CONTAINER}-old"], timeout=60)
         code, out = _run(["docker", "rename", CONTAINER, f"{CONTAINER}-old"], timeout=60)
         if code != 0:
+            if _cancel.is_set():
+                return _cancel_cleanup()
             _set_stage(STAGE_ERROR)
             return NekoResult(ok=False, status="error", stage=STAGE_ERROR,
                               message=f"docker rename: {out[-200:]}")
@@ -526,6 +536,9 @@ def _provision_locked(config: Config) -> NekoResult:
         # Деталь раньше уходила только клиенту (NekoResult.message), в логах был
         # лишь stage=error — причину не восстановить. Логируем на сервере.
         log.error("neko.deploy.failed", recreate=recreate, out=out[-300:])
+        if _cancel.is_set():
+            # §cancel: откат вернул бы живой браузер ПОСЛЕ remove_neko.
+            return _cancel_cleanup()
         if recreate:
             # откат на рабочий старый. S5-M1: упавший `docker run --name CONTAINER`
             # (без --rm) мог оставить труп Created/Exited под этим именем → снимаем
@@ -565,7 +578,10 @@ def teardown(config: Config, wait_s: float | None = None) -> NekoResult:
     ждём его выхода не дольше wait_s (S5-M2: не пересекаться с rename/run).
     Не дождались (provision застрял в коротком deploy) — сносим без лока;
     provision сам увидит флаг в конце deploy и снесёт свежий контейнер."""
-    cancel_provision()
+    if _provisioning:
+        # Только идущий provision: иначе флаг «съел» бы install, пришедший
+        # сразу после remove (он мог захватить лок раньше teardown).
+        cancel_provision()
     wait = TEARDOWN_WAIT_S if wait_s is None else wait_s
     locked = _provision_lock.acquire(timeout=wait)
     if not locked:
@@ -574,6 +590,8 @@ def teardown(config: Config, wait_s: float | None = None) -> NekoResult:
         if locked:
             _cancel.clear()          # provision не идёт — флаг больше не нужен
         _run(["docker", "rm", "-f", CONTAINER], timeout=60)
+        if not locked:   # deploy мог держать старый под `-old`
+            _run(["docker", "rm", "-f", f"{CONTAINER}-old"], timeout=60)
         if locked:
             _set_stage(STAGE_IDLE)
         return NekoResult(ok=True, status="absent", stage=STAGE_IDLE,
