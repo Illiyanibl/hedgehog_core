@@ -7,6 +7,7 @@
   "neko.pull_failed": "Neko のイメージを取得できませんでした: {detail}",
   "neko.run_failed_rollback": "docker run に失敗したため、以前のコンテナに戻しました: {detail}",
   "neko.removed": "Neko を削除しました",
+  "neko.install_cancelled": "Neko のインストールをキャンセルしました",
   "neko.unavailable": "Neko を利用できません",
   "update.in_progress": "すでに更新中です",
   "update.not_git": "git によるインストールではないため、更新できません",

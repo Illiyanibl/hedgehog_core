@@ -7,6 +7,7 @@
   "neko.pull_failed": "Gagal mengunduh image Neko: {detail}",
   "neko.run_failed_rollback": "docker run gagal, dikembalikan ke kontainer sebelumnya: {detail}",
   "neko.removed": "Neko dihapus",
+  "neko.install_cancelled": "Instalasi Neko dibatalkan",
   "neko.unavailable": "Neko tidak tersedia",
   "update.in_progress": "Pembaruan sudah berjalan",
   "update.not_git": "Bukan instalasi git — pembaruan tidak tersedia",

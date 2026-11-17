@@ -46,6 +46,19 @@ NETWORK = "hedgehog-neko-net"
 # интерливят rename/rm/run и рвут контейнер. Lock (не asyncio) — операции в потоках.
 _provision_lock = threading.Lock()
 
+# §cancel: отмена идущего provision (remove_neko во время установки). Флаг
+# проверяется между шагами provision; долгий `docker pull` запускается через
+# Popen (_active_proc) и прибивается cancel_provision() — docker CLI при выходе
+# рвёт API-соединение, и демон останавливает pull. teardown НЕ ждёт лок вечно:
+# взводит отмену, ждёт выхода provision не дольше TEARDOWN_WAIT_S и сносит.
+_cancel = threading.Event()
+_proc_lock = threading.Lock()
+_active_proc: subprocess.Popen | None = None
+# Идёт ли provision прямо сейчас (держит _provision_lock) — для status():
+# первые шаги (TLS/сеть/swap) идут ДО стадии pulling, но это уже установка.
+_provisioning = False
+TEARDOWN_WAIT_S = 180.0
+
 
 @dataclass
 class NekoResult:
@@ -86,7 +99,10 @@ def install_stage() -> str:
 # ---------- docker helpers ----------
 
 def _run(args: list[str], timeout: int = 600,
-         input_bytes: bytes | None = None) -> tuple[int, str]:
+         input_bytes: bytes | None = None,
+         cancellable: bool = False) -> tuple[int, str]:
+    if cancellable:      # §cancel: долгий шаг, прерываемый remove_neko
+        return _run_cancellable(args, timeout)
     try:
         proc = subprocess.run(
             args, capture_output=True, timeout=timeout, input=input_bytes)
@@ -94,6 +110,61 @@ def _run(args: list[str], timeout: int = 600,
         return 1, f"{type(e).__name__}: {e}"
     out = (proc.stdout or b"") + (proc.stderr or b"")
     return proc.returncode, out.decode("utf-8", "replace").strip()
+
+
+def _kill_proc(proc: subprocess.Popen) -> None:
+    """SIGTERM → (5с) → SIGKILL. docker CLI на выходе закрывает API-стрим."""
+    try:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+    except OSError:
+        pass
+
+
+def _run_cancellable(args: list[str], timeout: int) -> tuple[int, str]:
+    """Как _run, но процесс прерываем cancel_provision() (для `docker pull`)."""
+    global _active_proc
+    try:
+        proc = subprocess.Popen(args, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT)
+    except (OSError, subprocess.SubprocessError) as e:
+        return 1, f"{type(e).__name__}: {e}"
+    with _proc_lock:
+        _active_proc = proc
+        cancelled = _cancel.is_set()      # отмена пришла до регистрации процесса
+    if cancelled:
+        _kill_proc(proc)
+    try:
+        try:
+            out, _ = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _kill_proc(proc)
+            out, _ = proc.communicate()
+            return 1, (f"TimeoutExpired: {args[:3]} > {timeout}s\n"
+                       + (out or b"").decode("utf-8", "replace").strip())
+    finally:
+        with _proc_lock:
+            _active_proc = None
+    if _cancel.is_set():
+        return 1, "cancelled"
+    return proc.returncode, (out or b"").decode("utf-8", "replace").strip()
+
+
+def cancel_provision() -> None:
+    """Взвести отмену идущего provision и прибить текущий прерываемый процесс."""
+    _cancel.set()
+    with _proc_lock:
+        proc = _active_proc
+    if proc is not None and proc.poll() is None:
+        log.info("neko.cancel.kill_proc", pid=proc.pid)
+        _kill_proc(proc)
+
+
+def is_provisioning() -> bool:
+    return _provisioning
 
 
 def _docker_ok() -> bool:
@@ -312,8 +383,11 @@ def status(config: Config) -> NekoResult:
     # Идёт установка — контейнер в промежуточном состоянии (rename→run), поэтому
     # отдаём ЖИВУЮ стадию из provision, а не «absent». Клиент опросом get_neko
     # видит: pulling (скачка образа) → deploying (развёртывание).
-    if _stage in (STAGE_PULLING, STAGE_DEPLOYING):
-        return NekoResult(ok=True, status="installing", stage=_stage,
+    # §cancel: _provisioning — установка уже идёт, но ещё на подготовительных
+    # шагах (TLS/сеть/swap, до pulling) → тоже «installing», не «absent».
+    if _stage in (STAGE_PULLING, STAGE_DEPLOYING) or _provisioning:
+        stage = _stage if _stage in (STAGE_PULLING, STAGE_DEPLOYING) else STAGE_PULLING
+        return NekoResult(ok=True, status="installing", stage=stage,
                           mcp_port=config.neko_mcp_port)
     st = _container_status(CONTAINER)
     if st == "running":
@@ -334,21 +408,47 @@ def provision(config: Config) -> NekoResult:
     """Идемпотентно поднять neko. Блокирующая — звать через asyncio.to_thread.
     S5-M2: сериализовано _provision_lock — параллельные install_neko/get_neko не
     интерливят rename/rm/run."""
+    global _provisioning
     with _provision_lock:
-        return _provision_locked(config)
+        _provisioning = True
+        try:
+            return _provision_locked(config)
+        finally:
+            _provisioning = False
+            # §cancel: отмена обслужена (или не приходила) — следующий provision
+            # стартует с чистым флагом. Под локом: teardown ждёт его же.
+            _cancel.clear()
+
+
+def _cancelled_result() -> NekoResult:
+    """§cancel: provision прерван remove_neko. Контейнер снесёт teardown →
+    итоговое состояние «absent» (существующий статус, новых не вводим)."""
+    _set_stage(STAGE_IDLE)
+    log.info("neko.provision.cancelled")
+    return NekoResult(ok=False, status="absent", stage=STAGE_IDLE,
+                      message=Msg("neko.install_cancelled"))
 
 
 def _provision_locked(config: Config) -> NekoResult:
+    # §cancel: точки отмены — только между шагами, где состояние чистое (до
+    # deploy: rename/run/rollback не рвём на полпути). Deploy короткий, а
+    # teardown после него всё равно снесёт контейнер.
+    if _cancel.is_set():
+        return _cancelled_result()
     if not _docker_ok():
         _set_stage(STAGE_ERROR)
         return NekoResult(ok=False, status="error", stage=STAGE_ERROR,
                           message=Msg("neko.docker_unavailable_need_proxy"))
     user_pw, admin_pw = _passwords(config)
+    if _cancel.is_set():
+        return _cancelled_result()
     if not _seed_tls_volume(config):
         _set_stage(STAGE_ERROR)
         return NekoResult(ok=False, status="error", stage=STAGE_ERROR,
                           message=Msg("neko.tls_failed"))
 
+    if _cancel.is_set():
+        return _cancelled_result()
     network, net_connected = _ensure_network()
     if network is None:
         # fail-closed. Раньше при провале создания выделенной сети neko
@@ -358,8 +458,12 @@ def _provision_locked(config: Config) -> NekoResult:
         _set_stage(STAGE_ERROR)
         return NekoResult(ok=False, status="error", stage=STAGE_ERROR,
                           message=Msg("neko.network_failed"))
+    if _cancel.is_set():
+        return _cancelled_result()
     _ensure_swap(config)      # §AI-control: host-swap под память браузера (best-effort)
     nat_ip = config.server_ip
+    if _cancel.is_set():
+        return _cancelled_result()
 
     # Стадия «скачка образа»: холодный pull тянется 15-25 мин (образ ~1 ГБ).
     # ВАЖНО: проверяем код возврата. Раньше результат игнорировался + таймаут был
@@ -367,8 +471,11 @@ def _provision_locked(config: Config) -> NekoResult:
     # таймауту, а deploy шёл против неполного/отсутствующего образа и падал
     # невнятной ошибкой. Теперь при провале pull — сразу STAGE_ERROR с логом.
     _set_stage(STAGE_PULLING)
+    # §cancel: pull — самый долгий шаг → прерываемый (remove_neko прибивает CLI).
     code, out = _run(["docker", "pull", config.neko_image],
-                     timeout=config.neko_pull_timeout)
+                     timeout=config.neko_pull_timeout, cancellable=True)
+    if _cancel.is_set():
+        return _cancelled_result()
     if code != 0:
         _set_stage(STAGE_ERROR)
         log.error("neko.pull.failed", image=config.neko_image,
@@ -434,6 +541,13 @@ def _provision_locked(config: Config) -> NekoResult:
     if recreate:
         _run(["docker", "rm", "-f", f"{CONTAINER}-old"], timeout=60)
 
+    if _cancel.is_set():
+        # §cancel: отмена пришла во время deploy, а teardown не дождался лока
+        # (TEARDOWN_WAIT_S) и уже снёс то, что было, — сносим свежеподнятый сами,
+        # иначе после remove_neko остался бы живой браузер.
+        _run(["docker", "rm", "-f", CONTAINER], timeout=60)
+        return _cancelled_result()
+
     _set_stage(STAGE_READY)
     log.info("neko.provisioned", port=config.neko_https_port, network=network,
              nat=nat_ip or "ipfetch")
@@ -446,9 +560,24 @@ def _provision_locked(config: Config) -> NekoResult:
                       mcp_port=config.neko_mcp_port, ai_control=net_connected)
 
 
-def teardown(config: Config) -> NekoResult:
-    with _provision_lock:            # S5-M2: не пересекаться с идущим provision
+def teardown(config: Config, wait_s: float | None = None) -> NekoResult:
+    """Снести neko. §cancel: идущий provision прерываем (флаг + kill pull) и
+    ждём его выхода не дольше wait_s (S5-M2: не пересекаться с rename/run).
+    Не дождались (provision застрял в коротком deploy) — сносим без лока;
+    provision сам увидит флаг в конце deploy и снесёт свежий контейнер."""
+    cancel_provision()
+    wait = TEARDOWN_WAIT_S if wait_s is None else wait_s
+    locked = _provision_lock.acquire(timeout=wait)
+    if not locked:
+        log.warning("neko.teardown.lock_timeout", wait_s=wait)
+    try:
+        if locked:
+            _cancel.clear()          # provision не идёт — флаг больше не нужен
         _run(["docker", "rm", "-f", CONTAINER], timeout=60)
-        _set_stage(STAGE_IDLE)
+        if locked:
+            _set_stage(STAGE_IDLE)
         return NekoResult(ok=True, status="absent", stage=STAGE_IDLE,
                           message=Msg("neko.removed"))
+    finally:
+        if locked:
+            _provision_lock.release()

@@ -7,6 +7,7 @@
   "neko.pull_failed": "无法拉取 Neko 镜像：{detail}",
   "neko.run_failed_rollback": "docker run 失败，已回滚到之前的容器：{detail}",
   "neko.removed": "Neko 已移除",
+  "neko.install_cancelled": "Neko 安装已取消",
   "neko.unavailable": "Neko 不可用",
   "update.in_progress": "更新已在进行中",
   "update.not_git": "非 git 安装——无法更新",

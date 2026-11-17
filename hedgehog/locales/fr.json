@@ -7,6 +7,7 @@
   "neko.pull_failed": "Impossible de télécharger l'image de Neko : {detail}",
   "neko.run_failed_rollback": "docker run a échoué, retour au conteneur précédent : {detail}",
   "neko.removed": "Neko supprimé",
+  "neko.install_cancelled": "Installation de Neko annulée",
   "neko.unavailable": "Neko est indisponible",
   "update.in_progress": "Une mise à jour est déjà en cours",
   "update.not_git": "Installation sans git : mise à jour indisponible",

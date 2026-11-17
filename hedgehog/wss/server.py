@@ -185,6 +185,11 @@ class HedgehogServer:
         # не должен запустить 2× git reset/pip/execv. Латчится при запланированном
         # рестарте (процесс вот-вот сменится — новых обновлений не начинаем).
         self._updating = False
+        # §17/§cancel: install_neko/remove_neko — фоновые задачи (single-flight),
+        # НЕ в цикле кадров соединения: иначе provision (pull 15-25 мин) держал
+        # бы ping/subscribe/user_msg этого соединения. Ссылки держим (GC).
+        self._neko_install_task: asyncio.Task | None = None
+        self._neko_remove_task: asyncio.Task | None = None
         # §defer-clock: смещение часов Anthropic относительно локальных
         # (serverDate из заголовка Date ответа /v1/messages − time.time()).
         # Обновляется при get_limits. Нужно, чтобы планировать defer к реальному
@@ -464,6 +469,11 @@ class HedgehogServer:
             for t in list(self._push_tasks):
                 t.cancel()
             await asyncio.gather(*self._push_tasks, return_exceptions=True)
+        # §17: фоновые install/remove neko — снимаем задачи (поток docker сам
+        # доработает: to_thread не отменить, но и не ждём его здесь).
+        for t in (self._neko_install_task, self._neko_remove_task):
+            if t is not None and not t.done():
+                t.cancel()
         if self._neko_proxy is not None:   # §17: догасить серверный MCP-проброс neko
             await self._neko_proxy.aclose()
         await self.hub.aclose()          # backpressure: догасить close-задачи шины
@@ -1019,18 +1029,9 @@ class HedgehogServer:
                 self._updating = False
         return
 
-    async def _h_install_neko(self, conn_id, frame, p):
-        ftype = frame.type
-        # §17: Neko-браузер. Провижининг/снос — блокирующий docker I/O в
-        # отдельном потоке. Авторизация — тем же токеном, что WS (без SSH).
-        from .. import neko
-        if ftype == "install_neko":
-            result = await asyncio.to_thread(neko.provision, self.config)
-        elif ftype == "remove_neko":
-            result = await asyncio.to_thread(neko.teardown, self.config)
-        else:
-            result = await asyncio.to_thread(neko.status, self.config)
-        await self.hub.send_global(conn_id, make_frame("neko_result", {
+    @staticmethod
+    def _neko_frame(result) -> dict:
+        return make_frame("neko_result", {
             "ok": result.ok,
             "status": result.status,
             "message": result.message,
@@ -1040,9 +1041,55 @@ class HedgehogServer:
             "mcp_port": result.mcp_port,
             "ai_control": result.ai_control,
             "stage": result.stage,
-        }))
-        log.info("neko." + ftype, ok=result.ok, status=result.status)
+        })
+
+    async def _h_install_neko(self, conn_id, frame, p):
+        ftype = frame.type
+        # §17: Neko-браузер. Авторизация — тем же токеном, что WS (без SSH).
+        # install/remove — долгий блокирующий docker I/O → ФОНОВАЯ задача
+        # (to_thread внутри), цикл кадров соединения сразу свободен (ping/
+        # subscribe/user_msg не ждут pull). Итог install/remove рассылается
+        # ВСЕМ соединениям (клиент мог переподключиться за время установки).
+        # get_neko — быстрый status() без лока, отвечаем запросившему.
+        from .. import neko
+        if ftype == "get_neko":
+            result = await asyncio.to_thread(neko.status, self.config)
+            await self.hub.send_global(conn_id, self._neko_frame(result))
+            log.info("neko." + ftype, ok=result.ok, status=result.status)
+            return
+        install = ftype == "install_neko"
+        busy = self._neko_install_task if install else self._neko_remove_task
+        if busy is not None and not busy.done():
+            # single-flight: повтор (двойной тап/второе устройство) не запускает
+            # второй provision/teardown — отвечаем текущим статусом (installing).
+            result = await asyncio.to_thread(neko.status, self.config)
+            await self.hub.send_global(conn_id, self._neko_frame(result))
+            log.info("neko." + ftype + ".already_running", status=result.status)
+            return
+        # Проверка+взвод атомарны (между ними нет await) — как M4 у update_self.
+        task = asyncio.create_task(
+            self._neko_job(conn_id, frame.id, ftype,
+                           neko.provision if install else neko.teardown),
+            name=f"neko-{ftype}")
+        if install:
+            self._neko_install_task = task
+        else:
+            self._neko_remove_task = task
         return
+
+    async def _neko_job(self, conn_id, frame_id, ftype, fn):
+        """Фон install/remove: поток docker → итог ВСЕМ соединениям."""
+        try:
+            result = await asyncio.to_thread(fn, self.config)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 — сбой фоновой задачи не теряем
+            log.error("neko.job_failed", type=ftype, err=repr(e))
+            await self.hub.send_global(conn_id, make_error(
+                Err.INTERNAL, f"{type(e).__name__}: {e}", related=frame_id))
+            return
+        await self.hub.broadcast_global(self._neko_frame(result))
+        log.info("neko." + ftype, ok=result.ok, status=result.status)
 
     async def _h_neko_open_view(self, conn_id, frame, p):
         """§17: новая вкладка/окно браузера neko через серверный NekoProxy
