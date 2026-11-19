@@ -13,11 +13,15 @@ hello. Дальше — диспетчеризация client→server фрей�
 from __future__ import annotations
 
 import asyncio
+import re
 import copy
+import functools
 import hashlib
 import hmac
 import http
 import json
+import os
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -30,15 +34,17 @@ from websockets.protocol import State
 from .. import tls
 
 from ..bus.hub import Hub
-from ..config import Config
+from ..config import Config, write_secret_file
 from ..core.auth import AuthManager
 from ..core.claude_session import ClaudeSession
+from ..core.session_base import AgentSession, SessionClosed
 from ..core.hedgehog_mcp import BUILTIN_MCP_NAME
 from ..core.pty_session import PtySession
 from ..core import models
 from ..core.gateways import omniroute as omniroute_gw
 from ..protocol import (
     Attachment,
+    AuthOmniRoutePayload,
     BadFrame,
     ClientFrame,
     Err,
@@ -48,7 +54,15 @@ from ..protocol import (
     parse_client_frame,
 )
 from ..scheduler import DeferPendingExists
-from ..store.chats import ChatMeta, ChatStore
+from ..core import (agy_auth, auth_store, cli_install, cli_registry, codex_auth,
+                    codex_rpc, grok_auth, key_probe, secrets_redact)
+from ..core.agy_auth import AgyAuthManager
+from ..core.codex_auth import CodexAuthManager
+from ..core.codex_session import CodexSession
+from ..core.grok_auth import GrokAuthManager
+from ..core.grok_session import GrokSession
+from ..core.antigravity_session import AntigravitySession
+from ..store.chats import ChatMeta, ChatStore, public_meta
 from ..store.mcp_registry import McpRegistry
 from ..store import skills_registry
 from ..store import views_registry
@@ -61,6 +75,17 @@ from .. import updater
 from .. import push
 
 log = structlog.get_logger("wss")
+
+# §multi-cli: сессии агентов (общие операции: caps, ui_event, ответы на запросы).
+_MCP_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")  # имя MCP: без «_» в начале/спецсимволов
+_AGENT_SESSIONS = AgentSession    # runtime-Protocol: Claude/agy/Codex (не PTY)
+# CLI, у которых вход — отдельный менеджер (device/OAuth), и модуль-«хранилище»
+# (is_logged_in/logout/apply_alt — побочные эффекты режима API-ключа/шлюза).
+_LOGIN_MODULES = {"antigravity": agy_auth, "codex": codex_auth,
+                  "grok": grok_auth}
+# LOW-1: CLI, у которых вход поверх живого токена безвреден (`agy --login`
+# токен не стирает) — на 401 стартуем вход как раньше, без проверки токена.
+_AUTOLOGIN_OVER_TOKEN = frozenset({"antigravity"})
 
 WS_PATH = "/v1/connect"
 
@@ -138,8 +163,25 @@ class HedgehogServer:
         self.mcp = McpRegistry(config.data_dir / "mcp.json")
         self.skill_sources = SkillSources(config.data_dir / "skill_sources.json")
         self.hub = Hub(self.store)
-        self.sessions: dict[str, ClaudeSession | PtySession] = {}
+        self.sessions: dict[str, AgentSession | PtySession] = {}
         self.auth = AuthManager(config, self._auth_broadcast)
+        # §multi-cli: вход Antigravity (Google OAuth через `agy acp --login`).
+        self.agy_auth = AgyAuthManager(
+            config, functools.partial(self._cli_auth_broadcast, "antigravity"))
+        # §20: вход OpenAI Codex (device code через `codex login --device-auth`).
+        self.codex_auth = CodexAuthManager(
+            config, functools.partial(self._cli_auth_broadcast, "codex"))
+        self._configure_grok_home()
+        codex_auth.configure(config)
+        agy_auth.configure(config)
+        # §cli-pins: управляемый каталог CLI (чистая установка Ёжиком) — его
+        # find_binary смотрит первым после HEDGEHOG_<CLI>_BIN.
+        cli_registry.configure_cli_dir(config.data_dir / "cli-bin")
+        secrets_redact.clear_sources()
+        secrets_redact.add_source(lambda: auth_store.all_api_secrets(config))
+        # §21: вход Grok Build (device code через `grok login --device-auth`).
+        self.grok_auth = GrokAuthManager(
+            config, functools.partial(self._cli_auth_broadcast, "grok"))
         # §push: notifyKey'и устройств (для APNs-пуша при оффлайн-клиенте).
         self.push_keys = push.PushKeys(config.push_keys_file)
         # Сильные ссылки на fire-and-forget задачи пуша: asyncio держит задачи
@@ -158,6 +200,7 @@ class HedgehogServer:
         # §models: фоновый рефрешер списка моделей. Событие взводится при смене
         # авторизации (и при пустом кэше) → немедленное обновление вне суток.
         self._models_refresh_now = asyncio.Event()
+        self._omni_models_sig: str | None = None   # последняя разосланная omni-выборка
         self._models_task: asyncio.Task | None = None
         # L: держим ссылку на задачу рестарта — иначе GC мог бы её собрать до
         # execv (update вернул ok, а рестарта нет).
@@ -182,6 +225,16 @@ class HedgehogServer:
         # user_msg/inject (meta прочитана до удаления) не воскресил его сессию
         # (висячий CLI-процесс + падение журнала на удалённый чат).
         self._deleting: set[str] = set()
+        # §multi-cli: per-chat замок на смену CLI; id запросов, отменённых
+        # сменой (поздний permission/picker/ui-ответ молча игнорируем).
+        self._chat_locks: dict[str, asyncio.Lock] = {}
+        # §auth: замок на CLI — сериализует активацию/выход/старт входа и создание сессий
+        self._auth_locks: dict[str, asyncio.Lock] = {}
+        # MED-1: CLI ответил 401 при живом токене подписки — cli_status/hello
+        # отдают AUTH_REQUIRED (кэш моделей хранит OK последней удачной пробы),
+        # пока не будет удачной пробы, реального входа или смены способа.
+        self._cli_token_rejected: set[str] = set()
+        self._stale_requests: dict[str, set[str]] = {}
         # M4: update_self в полёте — второй вызов (двойной тап/второе устройство)
         # не должен запустить 2× git reset/pip/execv. Латчится при запланированном
         # рестарте (процесс вот-вот сменится — новых обновлений не начинаем).
@@ -193,6 +246,12 @@ class HedgehogServer:
         self._neko_remove_task: asyncio.Task | None = None
         # §15: фоновый update_self (тоже вне цикла кадров соединения).
         self._update_task: asyncio.Task | None = None
+        # §cli-pins: фоновая установка CLI при set_cli/create_chat на
+        # неустановленный (single-flight на CLI); чаты, ждущие установку (им —
+        # error CLI_INSTALL_FAILED); флаги отмены потоков установки.
+        self._cli_install_tasks: dict[str, asyncio.Task] = {}
+        self._cli_install_chats: dict[str, set[str]] = {}
+        self._cli_install_cancel: dict[str, Any] = {}
         # §defer-clock: смещение часов Anthropic относительно локальных
         # (serverDate из заголовка Date ответа /v1/messages − time.time()).
         # Обновляется при get_limits. Нужно, чтобы планировать defer к реальному
@@ -238,8 +297,8 @@ class HedgehogServer:
             "content": text, "sender": sender, "related": None,
             "attachments": [], "btw": False,
         })
-        await session.handle_user_msg(text, interrupt=interrupt,
-                                      on_result=on_result)
+        await self._deliver(chat_id, session, text, interrupt=interrupt,
+                            on_result=on_result)
         return True, {"cold_started": not was_running, "was_busy": was_busy}
 
     # ---------- §reply: доставка ответа адресату (send_to_chat reply-роутинг) ----
@@ -347,7 +406,7 @@ class HedgehogServer:
             resolved = fileserver.resolve_attachment_paths(
                 self.config.chats_dir, chat_id, atts)
             prompt = fileserver.compose_prompt(text, resolved)
-            await session.handle_user_msg(prompt, interrupt=False)
+            await self._deliver(chat_id, session, prompt, interrupt=False)
             log.info("defer.fired", chat=chat_id, job=job_id, atts=len(atts))
             # Оффлайн-курьер: устройства узнают, что отложенное ушло агенту.
             await self.notify_chat(chat_id, i18n.Msg("defer.title"),
@@ -431,6 +490,9 @@ class HedgehogServer:
         self._cancel_login_timers()
         self._login_op = None
         await self.auth.stop()
+        await self.agy_auth.stop()
+        await self.codex_auth.stop()
+        await self.grok_auth.stop()
         ops = list(self._ops.values())
         for op in ops:
             op["slow_task"].cancel()
@@ -482,6 +544,16 @@ class HedgehogServer:
                   self._update_task):
             if t is not None and not t.done():
                 t.cancel()
+        # §cli-pins: установки CLI — флаг отмены (поток urllib/subprocess
+        # прерывается на следующем блоке) + отмена задач.
+        for ev in self._cli_install_cancel.values():
+            ev.set()
+        cli_tasks = [t for t in self._cli_install_tasks.values() if not t.done()]
+        for t in cli_tasks:
+            t.cancel()
+        if cli_tasks:
+            await asyncio.gather(*cli_tasks, return_exceptions=True)
+        self._cli_install_tasks.clear()
         if self._neko_proxy is not None:   # §17: догасить серверный MCP-проброс neko
             await self._neko_proxy.aclose()
         await self.hub.aclose()          # backpressure: догасить close-задачи шины
@@ -522,11 +594,23 @@ class HedgehogServer:
         # set_models) затёр бы omniroute-пикер CLI-алиасами.
         omni = self._omniroute_models_list(models.DEFAULT_CLI_TYPE)
         if omni is not None:
-            await self.hub.broadcast_global(make_frame("models_list", omni))
-            return self._MODELS_TTL
-        # Не поднимаем второй CLI-процесс во время активного хода (§models M1).
-        if any(isinstance(s, ClaudeSession) and s.status == "busy"
-               for s in self.sessions.values()):
+            # Рассылаем при первом проходе и при изменении выбора, а не на
+            # каждом витке (иначе старые клиенты получали бы models_list каждые
+            # 1–2 мин. во время длинных ходов — ревью §multi-cli).
+            sig = json.dumps(omni, sort_keys=True, default=str)
+            if sig != self._omni_models_sig:
+                self._omni_models_sig = sig
+                await self.hub.broadcast_global(make_frame("models_list", omni))
+            # §multi-cli: другие CLI омни не касается — их модели обновляем.
+            if all(t == models.DEFAULT_CLI_TYPE for t in models.KNOWN_CLI_TYPES):
+                return self._MODELS_TTL
+        else:
+            self._omni_models_sig = None
+        # Не поднимаем второй CLI-процесс Claude во время активного хода
+        # (§models M1); пробы других CLI (`agy models`) ходу не мешают.
+        if omni is None and any(
+                isinstance(s, ClaudeSession) and s.status == "busy"
+                for s in self.sessions.values()):
             log.info("models.refresh_deferred_busy")
             return self._MODELS_RETRY
         # Троттлинг: между реальными пробами не меньше _MODELS_MIN_INTERVAL —
@@ -539,6 +623,10 @@ class HedgehogServer:
         # §cli-types: обновляем кэш КАЖДОГО известного типа CLI (сейчас один —
         # claude). Каждый тип — своя проба/кэш/бродкаст.
         for cli_type in models.KNOWN_CLI_TYPES:
+            if omni is not None and cli_type == models.DEFAULT_CLI_TYPE:
+                continue          # claude под omniroute — список уже разослан
+            if self._gateway_models_list(cli_type) is not None:
+                continue          # §auth: у шлюза список из выбора, CLI не пробуем
             # Проба — отдельной таской, чтобы входящий user_msg мог её отменить
             # (M1: не держим второй процесс во время хода).
             self._models_probe_task = asyncio.create_task(
@@ -566,8 +654,15 @@ class HedgehogServer:
                 log.info("models.refreshed", cli=cli_type,
                          n=len(data["models"]), current=data.get("current"))
                 # §models L1: клиенты на PENDING узнают о готовности.
+                # Типы, скрытые от старых клиентов (§18.3), — только multi_cli.
+                spec = cli_registry.spec_for(cli_type)
                 await self.hub.broadcast_global(
-                    make_frame("models_list", data))
+                    make_frame("models_list", data),
+                    require_cap=(None if spec is None or spec.legacy_visible
+                                 else cli_registry.MULTI_CLI_CAP))
+                if cli_type in self._cli_token_rejected:   # MED-1: токен снова работает
+                    self._cli_token_rejected.discard(cli_type)
+                    await self._broadcast_cli_status(cli_type)
             else:
                 # Не затираем последний хороший кэш (auth/нет CLI/ошибка).
                 log.info("models.refresh_skip", cli=cli_type,
@@ -611,11 +706,16 @@ class HedgehogServer:
         изменённый — клиент сразу видит сброс, а не ждёт рефетча (раньше
         молча расходилось: в CLI-view висела протухшая модель)."""
         for m in self.store.list():
+            if m.addressee == "claude" and m.cliType != models.DEFAULT_CLI_TYPE:
+                # §multi-cli: чат сейчас на другом CLI — сбрасываем только
+                # сохранённую модель Claude, активную (чужого CLI) не трогаем.
+                if (m.cliSessions.get("claude") or {}).get("model"):
+                    self.store.set_cli_state(m.chatId, "claude", model=None)
+                continue
             if getattr(m, "model", None):
                 updated = self.store.update_meta(m.chatId, model=None)
                 if updated is not None:
-                    await self.hub.broadcast_global(
-                        make_frame("chat_updated", vars(updated)))
+                    await self._broadcast_meta("chat_updated", updated)
 
     # ---------- HTTP-этап (§1.1) ----------
 
@@ -665,7 +765,10 @@ class HedgehogServer:
                 "capabilities": list(self.config.capabilities),
                 # §cli-types: какие типы CLI-агентов умеет этот Ёžik (клиент
                 # покажет выбор только из них; старый клиент поле игнорит).
-                "cliTypes": list(models.KNOWN_CLI_TYPES),
+                "cliTypes": list(cli_registry.legacy_visible_cli_types()),
+                # §multi-cli (§18.3): присутствие/авторизация/возможности каждого
+                # CLI. Поле добавочное — старый клиент его игнорирует (§9.4).
+                "cliStatus": self._cli_status_snapshot(),
             }))
             async for raw in ws:
                 # Кадр, дочитанный из буфера уже ПОСЛЕ закрытия клиентом (цикл
@@ -701,7 +804,7 @@ class HedgehogServer:
         Значение живое: его читает тул formula_mode в момент отрисовки формулы
         (сессию НЕ пересобираем — прежний rebuild+resume замораживал режим)."""
         session = self.sessions.get(chat_id)
-        if isinstance(session, ClaudeSession):
+        if isinstance(session, _AGENT_SESSIONS):
             session.set_client_caps(self.hub.caps_for_chat(chat_id))
 
     async def _h_client_caps(self, conn_id, frame, p):
@@ -769,6 +872,8 @@ class HedgehogServer:
         'auth_code': '_h_auth_code',
         'auth_apikey': '_h_auth_apikey',
         'auth_omniroute': '_h_auth_omniroute',
+        'auth_gateway': '_h_auth_gateway',
+        'auth_token': '_h_auth_token',
         'omniroute_probe_models': '_h_omniroute_probe_models',
         'omniroute_set_key': '_h_omniroute_set_key',
         'omniroute_set_models': '_h_omniroute_set_models',
@@ -794,6 +899,7 @@ class HedgehogServer:
         'rename_chat': '_h_rename_chat',
         'set_mode': '_h_set_mode',
         'set_model': '_h_set_model',
+        'set_cli': '_h_set_cli',
         'schedule_message': '_h_schedule_message',
         'cancel_scheduled': '_h_cancel_scheduled',
         'list_scheduled': '_h_list_scheduled',
@@ -865,6 +971,9 @@ class HedgehogServer:
         return
 
     async def _h_auth_start(self, conn_id, frame, p):
+        cli = p.cliType or models.DEFAULT_CLI_TYPE
+        if cli != models.DEFAULT_CLI_TYPE:       # §multi-cli (§18.7)
+            return await self._cli_auth_start(conn_id, frame, cli)
         # §netwait: single-flight — если флоу уже идёт, auth.start() лишь
         # пере-шлёт ссылку; новые таймеры ставим ТОЛЬКО на реально новый флоу.
         was_running = self.auth.running
@@ -874,6 +983,8 @@ class HedgehogServer:
         return
 
     async def _h_auth_code(self, conn_id, frame, p):
+        if p.cliType != models.DEFAULT_CLI_TYPE:  # §multi-cli (§18.7)
+            return await self._cli_auth_code(conn_id, p)
         if not await self.auth.submit_code(p.code):
             # Единый путь у клиента: неуспех — тоже auth_result.
             await self.hub.send_global(conn_id, make_frame(
@@ -884,8 +995,44 @@ class HedgehogServer:
         self._start_login_timers(frame.id, conn_id, "code")
         return
 
+    async def _auth_alt_precheck(self, conn_id, frame, cli: str, method: str,
+                                 base_url: str | None) -> str | None:
+        """Общая проверка auth_apikey/auth_gateway: CLI известен и умеет способ,
+        base_url допустим. Нормализованный base_url (или "") либо None, если
+        клиенту уже отправлена ошибка."""
+        spec = cli_registry.spec_for(cli)
+        if spec is None:
+            await self._cli_auth_err(conn_id, frame, Err.CLI_UNKNOWN,
+                                     f"unknown cliType {cli!r}")
+            return None
+        if method not in {m.id for m in spec.auth_methods}:
+            await self._cli_auth_err(conn_id, frame, Err.AUTH_METHOD_UNSUPPORTED,
+                                     i18n.Msg("auth.method_unsupported"))
+            return None
+        if not base_url:
+            return ""
+        try:
+            return auth_store.validate_base_url(base_url)
+        except ValueError as e:
+            await self._cli_auth_err(conn_id, frame, Err.BAD_BASE_URL,
+                                     i18n.Msg(str(e)))
+            return None
+
     async def _h_auth_apikey(self, conn_id, frame, p):
         # §altauth: активировать прямой API-ключ (заголовок x-api-key).
+        cli = p.cliType or models.DEFAULT_CLI_TYPE
+        base = await self._auth_alt_precheck(
+            conn_id, frame, cli, cli_registry.AUTH_API_KEY, p.base_url)
+        if base is None:
+            return
+        if cli != models.DEFAULT_CLI_TYPE:
+            async def _op_cli_key():
+                return "auth_result", await self._activate_cli_alt(
+                    cli, auth_store.API_KEY, p.api_key, base or None, frame.id)
+            self._spawn_tracked(conn_id, frame.id, "auth_apikey", _op_cli_key())
+            return
+        p = p.model_copy(update={"base_url": base or None})
+
         async def _op_apikey():
             ok, err = await self._activate_apikey(
                 p.api_key, p.base_url, frame.id)
@@ -894,8 +1041,69 @@ class HedgehogServer:
             conn_id, frame.id, "auth_apikey", _op_apikey())
         return
 
+    async def _h_auth_token(self, conn_id, frame, p):
+        # §auth: вставленный долгоживущий токен подписки (Claude, способ 4)
+        cli = p.cliType or models.DEFAULT_CLI_TYPE
+        if await self._auth_alt_precheck(conn_id, frame, cli, cli_registry.AUTH_TOKEN,
+                                         None) is None:
+            return
+        token = p.token.strip()
+        if not token.isprintable() or any(c.isspace() for c in token):
+            return await self._cli_auth_err(conn_id, frame, Err.BAD_FRAME,
+                                            i18n.Msg("auth.token_invalid"))
+
+        async def _op_token():
+            from .. import usage
+            res = await usage.fetch_limits(self.config, token=token)
+            self._mark_committing(frame.id)
+            if res.get("error") == "auth" or res.get("error") == "http":
+                return "auth_result", {"ok": False, "cliType": cli, "method": "token",
+                                       "error": i18n.Msg("probe.key_rejected",
+                                                         status=401)}
+            if res.get("error"):
+                return "auth_result", {"ok": False, "cliType": cli, "method": "token",
+                                       "error": i18n.Msg("probe.check_failed",
+                                                         detail=str(res.get("message")))}
+            write_secret_file(self.config.oauth_token_file, token)
+            await self._quiet_stop_login()
+            log.info("auth.token_activated")
+            # как успех OAuth: стирает альт-режим, сбрасывает модели, пересоздаёт сессии
+            await self._claude_login_succeeded()
+            return "auth_result", {"ok": True, "cliType": cli, "method": "token",
+                                   "error": None}
+        self._spawn_tracked(conn_id, frame.id, "auth_token", _op_token())
+        return
+
+    async def _h_auth_gateway(self, conn_id, frame, p):
+        # §auth: шлюз для любого CLI; у Claude это тот же omniroute-флоу.
+        base = await self._auth_alt_precheck(
+            conn_id, frame, p.cliType or models.DEFAULT_CLI_TYPE,
+            cli_registry.AUTH_GATEWAY, p.base_url)
+        if base is None:
+            return
+        cli = p.cliType or models.DEFAULT_CLI_TYPE
+        if cli != models.DEFAULT_CLI_TYPE:
+            async def _op_cli_gw():
+                return "auth_result", await self._activate_cli_alt(
+                    cli, auth_store.GATEWAY, p.api_key, base, frame.id,
+                    models_sel=[{"id": m.id, "name": m.name} for m in p.models],
+                    active_id=p.active_id, api_backend=p.api_backend)
+            self._spawn_tracked(conn_id, frame.id, "auth_gateway", _op_cli_gw())
+            return
+        omni = AuthOmniRoutePayload(
+            api_key=p.api_key, base_url=base, models=p.models,
+            active_id=p.active_id, small_fast_id=p.small_fast_id)
+        return await self._h_auth_omniroute(conn_id, frame, omni)
+
     async def _h_auth_omniroute(self, conn_id, frame, p):
         # §altauth: активировать шлюз (ключ + base_url + выбранные модели).
+        base = await self._auth_alt_precheck(
+            conn_id, frame, models.DEFAULT_CLI_TYPE, cli_registry.AUTH_GATEWAY,
+            p.base_url)
+        if base is None:
+            return
+        p = p.model_copy(update={"base_url": base})
+
         async def _op_omni():
             ok, err = await self._activate_omniroute(p, frame.id)
             return "auth_result", {"ok": ok, "error": err}
@@ -907,11 +1115,29 @@ class HedgehogServer:
         # §omni шаг 1: каталог моделей шлюза. Ключ пуст → берём сохранённый
         # (редактирование без ввода ключа), но ТОЛЬКО на сохранённый base_url:
         # не отправляем секрет на произвольный клиентский URL (Fable SF1).
+        if cli_registry.spec_for(p.cliType) is None:
+            # до любого чтения auth_store: cliType идёт в имя файла
+            await self.hub.send_global(conn_id, make_frame(
+                "omniroute_catalog",
+                {"ok": False, "error": f"unknown cliType {p.cliType!r}"[:80],
+                 "code": Err.CLI_UNKNOWN, "providers": [],
+                 "cliType": p.cliType, "related": frame.id}))
+            return
         base = (p.base_url or "").strip()
         key = (p.api_key or "").strip()
+        if base:
+            try:                       # тот же контроль URL, что при активации
+                base = auth_store.validate_base_url(base)
+            except ValueError as e:
+                await self.hub.send_global(conn_id, make_frame(
+                    "omniroute_catalog",
+                    {"ok": False, "error": i18n.Msg(str(e)), "providers": [],
+                     "cliType": p.cliType, "related": frame.id}))
+                return
         if not key:
-            auth = self.config.load_auth_config()
-            if auth.get("mode") == "omniroute":
+            auth = self.config.load_auth_config() if p.cliType == "claude" \
+                else auth_store.load(self.config, p.cliType)
+            if auth.get("mode") == "omniroute" or auth.get("method") == "gateway":
                 stored_base = auth.get("base_url", "")
                 if not base or base == stored_base:
                     base = base or stored_base
@@ -948,13 +1174,17 @@ class HedgehogServer:
         ok, err = self._save_omniroute_models(p)
         if ok:
             await self._reset_all_chat_models()   # выбор мог протухнуть (§models L2)
-            await self._restart_claude_sessions()
+            await self._restart_cli_sessions(models.DEFAULT_CLI_TYPE)
             self._invalidate_models_cache()
+            await self._broadcast_cli_status(models.DEFAULT_CLI_TYPE)
         await self.hub.send_global(conn_id, make_frame(
             "omniroute_set_result", {"ok": ok, "error": err}))
         return
 
     async def _h_logout(self, conn_id, frame, p):
+        cli = p.cliType or models.DEFAULT_CLI_TYPE
+        if cli != models.DEFAULT_CLI_TYPE:       # §multi-cli (§18.7)
+            return await self._cli_logout(conn_id, cli)
         # §13: разлогин. /logout в SDK не работает (интерактивная
         # команда), поэтому удаляем сохранённый OAuth-токен и пересоздаём
         # claude-сессии. Следующий user_msg → AUTH_REQUIRED → auth-флоу.
@@ -963,17 +1193,23 @@ class HedgehogServer:
         # отменяет задачу флоу до удаления файла → сохранения после нет.
         if self.auth.running or self._login_op is not None:
             await self._abort_login("logged out")
-        try:
-            self.config.oauth_token_file.unlink(missing_ok=True)
-        except OSError as e:
-            log.warning("auth.logout_unlink_failed", err=str(e))
+        # Слоистый выход (только multi_cli-клиенты): при активном ключе/шлюзе снимаем
+        # ТОЛЬКО его — OAuth-токен подписки не трогаем (как у остальных CLI, §22.2).
+        # Старые клиенты — прежний полный разлогин.
+        layered = (self.hub.conn_has_cap(conn_id, cli_registry.MULTI_CLI_CAP)
+                   and auth_store.active_method(self.config, cli)
+                   != auth_store.SUBSCRIPTION)
+        if not layered:
+            try:
+                self.config.oauth_token_file.unlink(missing_ok=True)
+            except OSError as e:
+                log.warning("auth.logout_unlink_failed", err=str(e))
         # §altauth: разлогин сбрасывает и альт-способ (API-ключ/OmniRoute).
         self.config.clear_auth_config()
         await self._reset_all_chat_models()    # §models L2: выбор мог протухнуть
-        for chat_id, session in list(self.sessions.items()):
-            if isinstance(session, ClaudeSession):
-                await self._stop_session(chat_id)
+        await self._restart_cli_sessions(models.DEFAULT_CLI_TYPE)
         self._invalidate_models_cache()   # §models: сбросить/переобновить
+        await self._broadcast_cli_status(models.DEFAULT_CLI_TYPE)
         log.info("auth.logout")
         return
 
@@ -1214,8 +1450,10 @@ class HedgehogServer:
 
     async def _h_list_chats(self, conn_id, frame, p):
         chats = []
+        multi = self.hub.conn_has_cap(conn_id, cli_registry.MULTI_CLI_CAP)
         for m in self.store.list():
-            entry = vars(m) | self._chat_status(m.chatId)
+            entry = (public_meta(m, include_cli_sessions=multi)
+                     | self._chat_status(m.chatId))
             chats.append(entry)
         await self.hub.send_global(conn_id, make_frame("chat_list", {"chats": chats}))
         return
@@ -1233,6 +1471,8 @@ class HedgehogServer:
             # §omni: при omniroute-авторизации источник — ВЫБРАННЫЕ модели
             # (шаг 1), а не CLI-проба. Тир-лимит (первые N) применяет клиент.
             data = omni
+        elif (gw := self._gateway_models_list(cli_type)) is not None:
+            data = gw       # §auth: шлюз другого CLI — выбранные модели
         else:
             data = models.load_cache(self.config, cli_type)
             if data is None:
@@ -1256,11 +1496,27 @@ class HedgehogServer:
             seed_skills = self.skill_sources.new_chat_skill_names() or None
         # §cli-types: неизвестный тип клампим к дефолту — meta не должна
         # врать о типе (сессию по нему поднимаем; сейчас всегда claude).
-        cli_type = (p.cliType if p.cliType in models.KNOWN_CLI_TYPES
-                    else models.DEFAULT_CLI_TYPE)
-        if cli_type != p.cliType:
-            log.warning("chat.clitype_unknown", requested=p.cliType,
-                        fallback=cli_type)
+        cli_type = models.DEFAULT_CLI_TYPE
+        install_cli = None
+        if p.addressee == "claude":
+            multi = self.hub.conn_has_cap(conn_id, cli_registry.MULTI_CLI_CAP)
+            # §cli-pins: клиенту §18 — неустановленный CLI с пином ставим фоном
+            err = self._cli_error(p.cliType, allow_install=multi)
+            if err is None and not self._cli_present(p.cliType):
+                install_cli = p.cliType
+            if err is not None and multi:
+                # §multi-cli (§18.4): клиент §18 выбирает из hello.cliStatus —
+                # неизвестный/недоступный CLI для него ошибка.
+                await self.hub.send_global(conn_id, make_error(
+                    err[0], err[1], related=frame.id))
+                return
+            if err is not None:
+                # Клиент без multi_cli: прежний кламп к дефолту (поведение до
+                # фичи не меняем).
+                log.warning("chat.clitype_unknown", requested=p.cliType,
+                            fallback=cli_type)
+            else:
+                cli_type = p.cliType
         meta = self.store.create(
             p.name, p.addressee, p.cwd,
             mcp=p.mcp, permission_mode=p.permission_mode,
@@ -1271,7 +1527,9 @@ class HedgehogServer:
                  addressee=meta.addressee, cwd=meta.cwd, mcp=meta.mcp,
                  permission_mode=meta.permission_mode, log_kb=meta.log_kb,
                  skills=seed_skills or [])
-        await self.hub.broadcast_global(make_frame("chat_created", vars(meta)))
+        await self._broadcast_meta("chat_created", meta)
+        if install_cli is not None:
+            self._start_cli_install(install_cli, meta.chatId)
         return
 
     async def _h_delete_chat(self, conn_id, frame, p, meta):
@@ -1281,6 +1539,8 @@ class HedgehogServer:
         try:
             # Сессия закрывается всегда; рабочая папка (cwd) — по флагу.
             await self._stop_session(frame.chatId)
+            self._chat_locks.pop(frame.chatId, None)
+            self._stale_requests.pop(frame.chatId, None)
             self.store.delete(frame.chatId, delete_cwd=p.delete_cwd,
                               projects_base=self.config.default_cwd)
             views_registry.clear_chat(self.config.data_dir, frame.chatId)  # §views
@@ -1298,8 +1558,7 @@ class HedgehogServer:
         updated = self.store.update_meta(frame.chatId, name=p.name)
         log.info("chat.renamed", chat=frame.chatId, name=p.name)
         if updated is not None:
-            await self.hub.broadcast_global(
-                make_frame("chat_updated", vars(updated)))
+            await self._broadcast_meta("chat_updated", updated)
         return
 
     async def _h_set_mode(self, conn_id, frame, p, meta):
@@ -1308,12 +1567,210 @@ class HedgehogServer:
         if updated is None:   # L: чат исчез (конкурентный delete) → vars(None)
             return
         # Стопаем сессию — новый режим применится при следующем user_msg.
-        await self._stop_session(frame.chatId)
+        await self._restart_session(frame.chatId)
         log.info("chat.mode_changed", chat=frame.chatId,
                  permission_mode=p.permission_mode)
-        await self.hub.broadcast_global(
-            make_frame("chat_updated", vars(updated)))
+        await self._broadcast_meta("chat_updated", updated)
         return
+
+    # ---------- §multi-cli ----------
+
+    def _cli_present(self, cli_type: str) -> bool:
+        spec = cli_registry.spec_for(cli_type)
+        if spec is None:
+            return False
+        if spec.bundled or not spec.binary:
+            return True
+        return cli_registry.find_binary(cli_type) is not None
+
+    def _cli_error(self, cli_type: str, *, allow_install: bool = False
+                   ) -> tuple[str, str] | None:
+        """Валидация типа CLI для create_chat/set_cli: (код, текст) или None.
+        allow_install: CLI не установлен, но в compat.json есть валидная запись
+        для этой платформы (или установка уже идёт) — не ошибка, вызывающий
+        запустит фоновую установку (_start_cli_install)."""
+        if cli_registry.spec_for(cli_type) is None:
+            return Err.CLI_UNKNOWN, f"unknown cliType {cli_type!r}"
+        if not self._cli_present(cli_type):
+            if allow_install and (self._cli_installing(cli_type)
+                                  or cli_install.installable(cli_type)):
+                return None
+            return Err.CLI_UNAVAILABLE, f"CLI {cli_type!r} is not installed"
+        return None
+
+    # ---------- §cli-pins: фоновая установка CLI ----------
+
+    def _cli_installing(self, cli: str) -> bool:
+        t = self._cli_install_tasks.get(cli)
+        return t is not None and not t.done()
+
+    def _start_cli_install(self, cli: str, chat_id: str | None = None) -> None:
+        """Запустить фоновую установку CLI (single-flight): CLI не установлен,
+        в compat.json есть запись. Ждущие сессии этого CLI (воркер,
+        cli_install.wait_pending) стартуют после неё."""
+        if self._cli_present(cli):
+            return
+        if chat_id:
+            self._cli_install_chats.setdefault(cli, set()).add(chat_id)
+        if self._cli_installing(cli):
+            return
+        cancel = self._cli_install_cancel[cli] = threading.Event()
+        task = asyncio.create_task(self._cli_install_job(cli, cancel),
+                                   name=f"cli-install:{cli}")
+        self._cli_install_tasks[cli] = task
+        cli_install.track(cli, task)
+
+    async def _cli_install_job(self, cli: str, cancel) -> None:
+        res: dict = {"ok": False, "error": "cancelled"}
+        try:
+            log.info("cli.install_start", cli=cli)
+            await self._broadcast_cli_status(cli, install=True)   # installing: true
+            res = await asyncio.to_thread(cli_install.ensure_installed, cli,
+                                          cancel=cancel)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 — сбой установки не роняет сервер
+            res = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+        finally:
+            if self._cli_install_tasks.get(cli) is asyncio.current_task():
+                self._cli_install_tasks.pop(cli, None)
+            self._cli_install_cancel.pop(cli, None)
+        chats = self._cli_install_chats.pop(cli, set())
+        log.info("cli.install_done", cli=cli, ok=res.get("ok"),
+                 version=res.get("version"), err=res.get("error"))
+        if res.get("ok"):
+            self._invalidate_models_cache()
+        else:
+            for chat_id in sorted(chats):
+                if self.store.get(chat_id) is None:
+                    continue
+                # Старый клиент кода не знает — ему хватит CLI_UNAVAILABLE
+                # от воркера сессии на ждавший ход.
+                await self.hub.publish(chat_id, "error", {
+                    "code": Err.CLI_INSTALL_FAILED, "cliType": cli,
+                    "message": i18n.Msg("cli.install_failed", cli=cli,
+                                        error=str(res.get("error") or "")[:300])},
+                    require_cap=cli_registry.MULTI_CLI_CAP)
+        await self._broadcast_cli_status(cli, install=True)   # present, installing: false
+
+    def _cli_status_snapshot(self) -> dict[str, dict]:
+        """hello.cliStatus (§18.3): present/auth_state/cliCapabilities по CLI."""
+        out: dict[str, dict] = {}
+        for cli_type, spec in cli_registry.CLI_SPECS.items():
+            present = self._cli_present(cli_type)
+            cache = models.load_cache(self.config, cli_type) if present else None
+            if not present:
+                state = "NO_CLI"
+            elif (cli_type in _LOGIN_MODULES
+                  and auth_store.active_method(self.config, cli_type)
+                  == auth_store.SUBSCRIPTION
+                  and not _LOGIN_MODULES[cli_type].is_logged_in()):
+                state = "AUTH_REQUIRED"      # токена нет — проба не нужна
+            elif cli_type in self._cli_token_rejected:
+                state = "AUTH_REQUIRED"      # MED-1: токен есть, но CLI ответил 401
+            else:
+                state = (cache or {}).get("auth_state") or "PENDING"
+            out[cli_type] = {"present": present, "auth_state": state,
+                             **self._install_flags(cli_type, present),
+                             "cliCapabilities": list(spec.capabilities),
+                             "experimental": spec.experimental,
+                             # §auth: какие способы входа реализованы и какой активен
+                             "authMethods": [
+                                 m.public() for m in spec.auth_methods
+                                 if not (cli_type == "grok"
+                                         and grok_auth.managed_home() is None
+                                         and m.id != cli_registry.AUTH_DEVICE_CODE)],
+                             "activeMethod": auth_store.active_method(
+                                 self.config, cli_type),
+                             "authDetail": auth_store.detail(self.config, cli_type)}
+        return out
+
+    def _install_flags(self, cli: str, present: bool) -> dict:
+        """§cli-pins (hello.cliStatus): installing — идёт фоновая установка;
+        installable — CLI нет, но Ёжик поставит его при set_cli/create_chat.
+        Поля добавочные и только когда true (иначе — как до фичи)."""
+        if present:
+            return {}
+        if self._cli_installing(cli):
+            return {"installing": True}
+        if cli_registry.spec_for(cli) is not None and cli_install.installable(cli):
+            return {"installable": True}
+        return {}
+
+    async def _broadcast_meta(self, ftype: str, meta: ChatMeta) -> None:
+        """chat_created/chat_updated: клиентам multi_cli — с cliSessions (без
+        session_id), остальным — wire как до фичи."""
+        await self.hub.broadcast_variants(
+            make_frame(ftype, public_meta(meta)),
+            make_frame(ftype, public_meta(meta, include_cli_sessions=True)),
+            cli_registry.MULTI_CLI_CAP)
+
+    def _auth_lock(self, cli: str) -> asyncio.Lock:
+        lock = self._auth_locks.get(cli)
+        if lock is None:
+            lock = self._auth_locks[cli] = asyncio.Lock()
+        return lock
+
+    def _chat_lock(self, chat_id: str) -> asyncio.Lock:
+        lock = self._chat_locks.get(chat_id)
+        if lock is None:
+            lock = self._chat_locks[chat_id] = asyncio.Lock()
+        return lock
+
+    async def _h_set_cli(self, conn_id, frame, p, meta):
+        """§18.5: сменить активный CLI чата. Контекст не переносится."""
+        if meta.addressee != "claude":
+            await self.hub.send_global(conn_id, make_error(
+                Err.BAD_FRAME, "set_cli: only for agent chats",
+                chat_id=frame.chatId, related=frame.id))
+            return
+        err = self._cli_error(p.cliType, allow_install=True)
+        if err is not None:
+            await self.hub.send_global(conn_id, make_error(
+                err[0], err[1], chat_id=frame.chatId, related=frame.id))
+            return
+        if not self._cli_present(p.cliType):
+            # §cli-pins: CLI нет, но есть пин — переключаем как обычно, ставим фоном
+            self._start_cli_install(p.cliType, frame.chatId)
+        # M3: идёт смена способа входа нового CLI — ждём её, иначе сессия под
+        # чатовым замком стартовала бы со старыми кредами (между quiesce и save).
+        # Коснуться-и-отпустить ДО _chat_lock: порядок auth→chat (как в
+        # _ensure_session), иначе дедлок с активацией. MED-2: между отпусканием
+        # _auth_lock и захватом _chat_lock активация могла снова взять замок —
+        # тогда отпускаем _chat_lock, снова ждём _auth_lock и повторяем.
+        auth_lock = self._auth_lock(p.cliType)
+        while True:
+            async with auth_lock:
+                pass
+            async with self._chat_lock(frame.chatId):
+                if auth_lock.locked():
+                    continue
+                cur = self.store.get(frame.chatId)      # мета могла устареть
+                if cur is None:
+                    return
+                if cur.cliType == p.cliType:             # идемпотентно
+                    await self._broadcast_meta("chat_updated", cur)
+                    return
+                old_cli = cur.cliType
+                queued = self._detach_queue(frame.chatId)
+                await self._stop_session(frame.chatId)
+                res = self.store.set_active_cli(frame.chatId, p.cliType)
+                if res is None:      # чат удалили, пока ждали
+                    return
+                new_meta, first_init = res
+                log.info("chat.cli_switched", chat=frame.chatId, frm=old_cli,
+                         to=p.cliType, first_init=first_init, queued=len(queued))
+                await self.hub.publish(
+                    frame.chatId, "cli_switched",
+                    {"from": old_cli, "to": p.cliType, "first_init": first_init},
+                    require_cap=cli_registry.MULTI_CLI_CAP)
+                await self._broadcast_meta("chat_updated", new_meta)
+                if queued:   # сообщения, ждавшие в очереди, едут в новый CLI
+                    new_session = await self._ensure_session_locked(new_meta)
+                    for content, on_result in queued:
+                        await new_session.handle_user_msg(
+                            content, interrupt=False, on_result=on_result)
+                return
 
     async def _h_set_model(self, conn_id, frame, p, meta):
         # §models: пустая строка → сброс к дефолту CLI (None). Как set_mode:
@@ -1326,10 +1783,15 @@ class HedgehogServer:
         updated = self.store.update_meta(frame.chatId, model=new_model)
         if updated is None:   # L: чат исчез (конкурентный delete) → vars(None)
             return
-        await self._stop_session(frame.chatId)
-        log.info("chat.model_changed", chat=frame.chatId, model=new_model)
-        await self.hub.broadcast_global(
-            make_frame("chat_updated", vars(updated)))
+        if p.effort is not None:       # §20: уровень рассуждения активного CLI
+            effort = "".join(ch for ch in p.effort.strip()
+                             if ch.isalnum()) or None
+            updated = self.store.set_cli_state(
+                frame.chatId, updated.cliType, effort=effort) or updated
+        await self._restart_session(frame.chatId)
+        log.info("chat.model_changed", chat=frame.chatId, model=new_model,
+                 effort=p.effort)
+        await self._broadcast_meta("chat_updated", updated)
         return
 
     async def _h_schedule_message(self, conn_id, frame, p, meta):
@@ -1445,18 +1907,17 @@ class HedgehogServer:
             frame.chatId, skills=(current or None))
         if updated is None:   # L: чат исчез (конкурентный delete) → vars(None)
             return
-        await self._stop_session(frame.chatId)
+        await self._restart_session(frame.chatId)
         log.info("chat.skill_group_changed", chat=frame.chatId,
                  source=p.source, enabled=p.enabled,
                  skills=updated.skills or [])
-        await self.hub.broadcast_global(
-            make_frame("chat_updated", vars(updated)))
+        await self._broadcast_meta("chat_updated", updated)
         return
 
     async def _h_restart_agent(self, conn_id, frame, p, meta):
         # Контекст жив (resume по claude_session_id) — стоп-сессия лишь
         # роняет коннект; новый MCP-набор подхватится на первом user_msg.
-        await self._stop_session(frame.chatId)
+        await self._restart_session(frame.chatId)
         log.info("chat.agent_restarted", chat=frame.chatId)
         await self.hub.send_global(conn_id, make_frame(
             "mcp_response", self._mcp_tree(meta), frame.chatId))
@@ -1468,7 +1929,12 @@ class HedgehogServer:
         # Спасает «отравленный» чат (напр. залипший на 400 content-filter),
         # минуя модель. Видимая переписка чата не трогается.
         await self._stop_session(frame.chatId)
-        self.store.update_meta(frame.chatId, claude_session_id=None)
+        cur = self.store.get(frame.chatId) or meta     # cliType мог смениться
+        if cur.cliType == "claude":
+            self.store.update_meta(frame.chatId, claude_session_id=None)
+        else:   # §multi-cli: забываем сессию АКТИВНОГО CLI
+            self.store.set_cli_state(frame.chatId, cur.cliType,
+                                     session_id=None, initialized=False)
         log.info("chat.context_cleared", chat=frame.chatId)
         # Подтверждаем клиенту — он покажет заметку ТОЛЬКО по этому фрейму
         # (иначе на старом Ёжике без хендлера был бы ложный «очищено»).
@@ -1485,7 +1951,8 @@ class HedgehogServer:
         # Имя встроенного зарезервировано: иначе в реестре появился бы второй
         # «hedgehog» → дубль в _mcp_tree и неудаляемая строка на клиенте (guard
         # set/remove съел бы запрос). Игнорируем, отвечаем актуальным деревом.
-        if p.name.strip().lower() == BUILTIN_MCP_NAME:
+        if (p.name.strip().lower() == BUILTIN_MCP_NAME
+                or not _MCP_NAME_RE.fullmatch(p.name)):
             await self.hub.send_global(conn_id, make_frame(
                 "mcp_response", self._mcp_tree(meta), frame.chatId))
             return
@@ -1494,10 +1961,10 @@ class HedgehogServer:
         updated = self.store.update_meta(frame.chatId, mcp=enabled)
         if updated is None:   # L: чат исчез (конкурентный delete) → vars(None)
             return
-        await self._stop_session(frame.chatId)  # применить новый MCP
+        await self._restart_session(frame.chatId)  # применить новый MCP
         log.info("chat.mcp_added", chat=frame.chatId, name=p.name,
                  transport=p.transport)
-        await self.hub.broadcast_global(make_frame("chat_updated", vars(updated)))
+        await self._broadcast_meta("chat_updated", updated)
         await self.hub.send_global(conn_id, make_frame(
             "mcp_response", self._mcp_tree(updated), frame.chatId))
         return
@@ -1518,10 +1985,10 @@ class HedgehogServer:
         updated = self.store.update_meta(frame.chatId, mcp=current)
         if updated is None:   # L: чат исчез (конкурентный delete) → vars(None)
             return
-        await self._stop_session(frame.chatId)  # рестарт агента
+        await self._restart_session(frame.chatId)  # рестарт агента
         log.info("chat.mcp_enabled", chat=frame.chatId, name=p.name,
                  enabled=p.enabled)
-        await self.hub.broadcast_global(make_frame("chat_updated", vars(updated)))
+        await self._broadcast_meta("chat_updated", updated)
         await self.hub.send_global(conn_id, make_frame(
             "mcp_response", self._mcp_tree(updated), frame.chatId))
         return
@@ -1536,14 +2003,38 @@ class HedgehogServer:
         updated = self.store.update_meta(frame.chatId, mcp=current)
         if updated is None:   # L: чат исчез (конкурентный delete) → vars(None)
             return
-        await self._stop_session(frame.chatId)
+        await self._restart_session(frame.chatId)
         log.info("chat.mcp_removed", chat=frame.chatId, name=p.name)
-        await self.hub.broadcast_global(make_frame("chat_updated", vars(updated)))
+        await self._broadcast_meta("chat_updated", updated)
         await self.hub.send_global(conn_id, make_frame(
             "mcp_response", self._mcp_tree(updated), frame.chatId))
         return
 
     async def _h_get_limits(self, conn_id, frame, p, meta):
+        # §multi-cli (§18.6): лимиты есть не у каждого CLI. Клиентам multi_cli —
+        # честный ответ supported:false; клиент без multi_cli всегда получает
+        # лимиты Claude (поведение до фичи).
+        cli = p.cliType or meta.cliType
+        multi = self.hub.conn_has_cap(conn_id, cli_registry.MULTI_CLI_CAP)
+        if multi and auth_store.active_method(self.config, cli) \
+                != auth_store.SUBSCRIPTION:
+            # лимиты подписки к ключу/шлюзу не относятся
+            await self.hub.send_global(conn_id, make_frame(
+                "limits_result", {"cliType": cli, "supported": False,
+                                  "reason": auth_store.active_method(self.config, cli)},
+                frame.chatId))
+            return
+        if multi and not cli_registry.supports(cli, cli_registry.CAP_LIMITS):
+            await self.hub.send_global(conn_id, make_frame(
+                "limits_result", {"cliType": cli, "supported": False},
+                frame.chatId))
+            return
+        if multi and cli == "codex":
+            # §20: лимиты аккаунта ChatGPT/Codex — `account/rateLimits/read`
+            # в той же форме, что у Claude (fiveHour/sevenDay).
+            await self.hub.send_global(conn_id, make_frame(
+                "limits_result", await codex_rpc.fetch_limits(), frame.chatId))
+            return
         # §limits: лимиты подписки из заголовков /v1/messages (usage.py).
         from .. import usage
         data = await usage.fetch_limits(self.config)
@@ -1604,8 +2095,10 @@ class HedgehogServer:
                        self.store.read_transcript_tail(frame.chatId, p.tail)]}
         if self.store.transcript_limit(frame.chatId) <= 0:
             payload["disabled"] = True  # чат создан с log_kb=0
+        # MED-3: события журнала уже редактированы при publish — без повторной
+        # редакции (тяжёлый regex по всему хвосту на event loop).
         await self.hub.send_global(conn_id, make_frame(
-            "log_response", payload, frame.chatId))
+            "log_response", payload, frame.chatId), redact=False)
         return
 
     async def _h_get_status(self, conn_id, frame, p, meta):
@@ -1631,19 +2124,27 @@ class HedgehogServer:
         log.info("chat.resume", conn_id=conn_id, chat_id=frame.chatId,
                  events=len(events), full=full_replay,
                  last_seen=(p.last_seen_id or "")[-6:])
+        # §multi-cli гейт: фреймы §18 (cli_switched) — только клиентам multi_cli.
+        # cursor считаем по ПОЛНОМУ списку, чтобы не переполучать отфильтрованное.
+        cursor = events[-1]["id"] if events else p.last_seen_id
+        if not self.hub.conn_has_cap(conn_id, cli_registry.MULTI_CLI_CAP):
+            events = [e for e in events
+                      if e.get("type") not in cli_registry.MULTI_CLI_ONLY_TYPES]
         lang = self.hub.conn_lang(conn_id)         # §i18n: ключи журнала → язык
         events = [i18n.localize_frame(e, lang) for e in events]
         payload: dict[str, Any] = {
             "events": events,
-            "cursor": events[-1]["id"] if events else p.last_seen_id,
+            "cursor": cursor,
             "full_replay": full_replay,
         }
         if self.store.had_partial_loss(frame.chatId):
             payload["partial_loss"] = True
             self.store.clear_partial_loss(frame.chatId)
         # Прямой ответ, не через журнал — иначе resume зациклится.
+        # MED-3: журнал редактирован при publish — повторно не гоняем regex.
         await self.hub.send_global(
-            conn_id, make_frame("resume_response", payload, frame.chatId))
+            conn_id, make_frame("resume_response", payload, frame.chatId),
+            redact=False)
         return
 
     async def _h_user_msg(self, conn_id, frame, p, meta):
@@ -1661,7 +2162,7 @@ class HedgehogServer:
         # ход (handle_user_msg → client.interrupt()) и поедет следующим
         # ходом с контекстом. Помечаем эхо флагом btw — клиенты показывают
         # реплику как «дослано» (уточнение/«стой»).
-        is_btw = (isinstance(session, ClaudeSession)
+        is_btw = (isinstance(session, _AGENT_SESSIONS)
                   and session.status == "busy")
         await self.hub.publish(frame.chatId, "user_msg_echo", {
             "content": p.content,
@@ -1679,7 +2180,7 @@ class HedgehogServer:
             note = self._draw_note(frame.chatId, p.draw_view_id)
             if note:
                 prompt = f"{prompt}\n\n{note}" if prompt.strip() else note
-        await session.handle_user_msg(prompt)
+        await self._deliver(frame.chatId, session, prompt)
         return
 
     async def _h_pty_write(self, conn_id, frame, p, meta):
@@ -1710,8 +2211,8 @@ class HedgehogServer:
         # из views_registry, а sessions пуст — с sessions.get нажатие молча
         # терялось бы).
         session = await self._ensure_session(meta)
-        if isinstance(session, ClaudeSession):
-            await session.handle_ui_event(p.data)
+        if isinstance(session, _AGENT_SESSIONS):
+            await self._deliver(frame.chatId, session, p.data, ui=True)
         return
 
     async def _h_ui_list(self, conn_id, frame, p, meta):
@@ -1846,12 +2347,17 @@ class HedgehogServer:
         ftype = frame.type
         session = self.sessions.get(frame.chatId)
         resolved = False
-        if isinstance(session, ClaudeSession):
+        if isinstance(session, _AGENT_SESSIONS):
             # значение ответа зависит от типа фрейма; резолв — единый (§req).
             value = (p.decision if ftype == "permission_response"
                      else p.option_id if ftype == "picker_response"
                      else p.data)
             resolved = session.resolve(p.related, value)
+        if not resolved and p.related in self._stale_requests.get(
+                frame.chatId, ()):
+            # §multi-cli: запрос отменён сменой CLI — поздний ответ не ошибка.
+            self._stale_requests[frame.chatId].discard(p.related)
+            return
         if not resolved:
             await self.hub.send_global(conn_id, make_error(
                 Err.BAD_FRAME, f"no pending request {p.related}",
@@ -1945,19 +2451,22 @@ class HedgehogServer:
         self._login_broadcast_hook(ftype)   # §netwait: гасим login-таймеры по шагам
         await self.hub.broadcast_global(make_frame(ftype, payload))
         if ftype == "auth_result" and payload.get("ok"):
-            # §omni: OAuth-успех = вход по подписке → СТИРАЕМ альт-авторизацию
-            # (auth.json), иначе остался бы mode=omniroute и build_auth_env/
-            # list_models продолжили бы отдавать модели шлюза (баг: после входа
-            # по подписке в CLI-view висели omniroute-модели). Только OAuth идёт
-            # через этот колбэк — apikey/omniroute шлют auth_result напрямую.
-            self.config.clear_auth_config()
-            await self._reset_all_chat_models()      # per-chat выбор мог быть omniroute-id
-            # Новый OAuth-токен: пересоздаём claude-сессии, чтобы SDK
-            # подхватил env CLAUDE_CODE_OAUTH_TOKEN на следующем user_msg.
-            for chat_id, session in list(self.sessions.items()):
-                if isinstance(session, ClaudeSession):
-                    await self._stop_session(chat_id)
-            self._invalidate_models_cache()   # §models: список мог смениться
+            await self._claude_login_succeeded()
+
+    async def _claude_login_succeeded(self) -> None:
+        """Вход Claude по подписке состоялся (OAuth-флоу или вставленный токен)."""
+        # §omni: OAuth-успех = вход по подписке → СТИРАЕМ альт-авторизацию
+        # (auth.json), иначе остался бы mode=omniroute и build_auth_env/
+        # list_models продолжили бы отдавать модели шлюза (баг: после входа
+        # по подписке в CLI-view висели omniroute-модели). apikey/omniroute шлют
+        # auth_result напрямую.
+        self.config.clear_auth_config()
+        await self._reset_all_chat_models()      # per-chat выбор мог быть omniroute-id
+        # Новый OAuth-токен: пересоздаём claude-сессии, чтобы SDK
+        # подхватил env CLAUDE_CODE_OAUTH_TOKEN на следующем user_msg.
+        await self._restart_cli_sessions(models.DEFAULT_CLI_TYPE)
+        self._invalidate_models_cache()   # §models: список мог смениться
+        await self._broadcast_cli_status(models.DEFAULT_CLI_TYPE)
 
     # ---------- статус чата (§3.7c) ----------
 
@@ -2078,8 +2587,61 @@ class HedgehogServer:
 
     # ---------- сессии ----------
 
+    async def _deliver(self, chat_id: str, session, content: str, *,
+                       ui: bool = False, **kw) -> None:
+        """handle_user_msg с повтором: сессию могли закрыть (set_cli) между
+        _ensure_session и постановкой в очередь — берём актуальную сессию чата."""
+        for _ in range(3):
+            try:
+                if ui:
+                    await session.handle_ui_event(content)
+                else:
+                    await session.handle_user_msg(content, **kw)
+                return
+            except SessionClosed:
+                meta = self.store.get(chat_id)
+                if meta is None:
+                    return
+                session = await self._ensure_session(meta)
+        if ui:
+            await session.handle_ui_event(content)
+        else:
+            await session.handle_user_msg(content, **kw)
+
     async def _ensure_session(self, meta: ChatMeta) -> ClaudeSession | PtySession:
         # S1-M: чат удаляется прямо сейчас — не поднимаем сессию (иначе воскресим).
+        if meta.chatId in self._deleting:
+            raise RuntimeError(f"chat {meta.chatId} is being deleted")
+        session = self.sessions.get(meta.chatId)
+        if session is not None:
+            return session
+        # §multi-cli (§18.5): создание сессии идёт под тем же per-chat замком, что
+        # и set_cli — иначе user_msg посреди смены CLI поднял бы сессию СТАРОГО
+        # CLI между stop и записью нового cliType. Мету перечитываем под замком.
+        # §auth: пока идёт смена способа входа этого CLI, новую сессию не создаём
+        # (иначе она взяла бы старые креды между quiesce и save). Ждём замок ДО
+        # _chat_lock и тут же отпускаем: порядок замков auth→chat у активации
+        # (quiesce берёт chat_lock под auth_lock), обратный порядок дал бы дедлок.
+        while True:
+            fresh = self.store.get(meta.chatId) or meta
+            auth_lock = (self._auth_lock(fresh.cliType)
+                         if fresh.addressee == "claude" else None)
+            if auth_lock is not None:
+                async with auth_lock:
+                    pass
+            async with self._chat_lock(meta.chatId):
+                fresh = self.store.get(meta.chatId) or meta
+                # Как в set_cli: активация могла захватить auth-замок ПОСЛЕ
+                # «коснуться и отпустить» — тогда quiesce уже мог пройти этот
+                # чат, и сессия поднялась бы со старыми кредами. Перепроверяем
+                # под чатовым замком; занят → выходим из него и ждём снова.
+                lk = (self._auth_lock(fresh.cliType)
+                      if fresh.addressee == "claude" else None)
+                if lk is None or not lk.locked():
+                    return await self._ensure_session_locked(fresh)
+
+    async def _ensure_session_locked(self, meta: ChatMeta):
+        """Тело _ensure_session; вызывающий держит _chat_lock чата."""
         if meta.chatId in self._deleting:
             raise RuntimeError(f"chat {meta.chatId} is being deleted")
         session = self.sessions.get(meta.chatId)
@@ -2095,37 +2657,120 @@ class HedgehogServer:
             return result
 
         if meta.addressee == "claude":
-            async def chat_error(code: str, message: str):
-                await self.hub.publish(meta.chatId, "error",
-                                       {"code": code, "message": message})
-            mcp_servers = self.mcp.resolve(meta.mcp)
-            # §AI-control: если общий браузер neko поднят — АВТО-выдаём агенту
-            # браузерные инструменты (@playwright/mcp по ВЫДЕЛЕННОЙ docker-сети
-            # hedgehog↔neko). Реестр и meta.mcp не трогаем: доступно всем чатам,
-            # пока neko жив; применяется при (пере)старте сессии. Порт наружу не
-            # публикуется — достижим только отсюда.
-            from .. import neko
-            # N3: выдаём браузерный MCP только если AI-control РЕАЛЬНО доступен
-            # (контейнер жив И Ёжик в neko-сети) — иначе агент получил бы
-            # недостижимый MCP (клиент не публикует порт наружу).
-            if await asyncio.to_thread(neko.ai_control_available):
-                mcp_servers = {**mcp_servers, "neko_browser": {
-                    "type": "http",
-                    "url": f"http://{neko.CONTAINER}:{self.config.neko_mcp_port}/mcp",
-                }}
-
-            def save_session_id(sid: str | None, chat_id=meta.chatId):
-                self.store.update_meta(chat_id, claude_session_id=sid)
-
-            session = ClaudeSession(meta, publish, chat_error, self.config,
-                                    mcp_servers=mcp_servers,
-                                    on_auth_required=self._on_chat_auth_required,
-                                    on_session_id=save_session_id,
-                                    on_status=self._chat_status_notifier(meta.chatId),
-                                    scheduler=self.scheduler,
-                                    roster=self._roster)
+            # §multi-cli: фабрика по активному CLI чата (сейчас только claude).
+            session = await self._make_agent_session(meta, publish)
         else:
             session = PtySession(meta, publish, self.config)
+        return await self._register_session(meta, session)
+
+    async def _make_agent_session(self, meta: ChatMeta, publish):
+        """§multi-cli: создать сессию агента по meta.cliType. Неизвестный тип
+        (рассинхрон meta/сервера) — откат к claude с предупреждением."""
+        cli_type = meta.cliType
+        if cli_type not in self._AGENT_FACTORIES:
+            log.warning("chat.clitype_no_factory", chat=meta.chatId,
+                        cli=cli_type)
+            cli_type = models.DEFAULT_CLI_TYPE
+        # §cli-pins: CLI чата пропал/не доустановился (рестарт посреди
+        # установки, сбой) — запускаем установку снова; воркер сессии её дождётся.
+        if not self._cli_present(cli_type) and cli_install.installable(cli_type):
+            self._start_cli_install(cli_type, meta.chatId)
+        return await getattr(self, self._AGENT_FACTORIES[cli_type])(meta, publish)
+
+    # cliType → имя метода-фабрики (расширяется по мере появления CLI).
+    _AGENT_FACTORIES = {"claude": "_make_claude_session",
+                        "antigravity": "_make_antigravity_session",
+                        "codex": "_make_codex_session",
+                        "grok": "_make_grok_session"}
+
+    async def _make_acp_session(self, cls, cli: str, meta: ChatMeta, publish):
+        """Общая фабрика не-Claude CLI-сессий: MCP = встроенный hedgehog
+        (stdio-мост) + пользовательские из реестра."""
+        async def chat_error(code: str, message: str):
+            await self.hub.publish(meta.chatId, "error",
+                                   {"code": code, "message": message,
+                                    "cliType": cli})
+
+        def save_session_id(sid: str | None, chat_id=meta.chatId):
+            self.store.set_cli_state(chat_id, cli, session_id=sid,
+                                     initialized=bool(sid))
+
+        return cls(
+            meta, publish, chat_error, self.config,
+            mcp_servers=await self._agent_mcp_servers(meta),
+            on_session_id=save_session_id,
+            on_auth_required=functools.partial(self._on_cli_auth_required, cli),
+            on_status=self._chat_status_notifier(meta.chatId),
+            scheduler=self.scheduler, roster=self._roster)
+
+    async def _make_codex_session(self, meta: ChatMeta, publish):
+        """§20: сессия OpenAI Codex (`codex app-server`)."""
+        return await self._make_acp_session(
+            CodexSession, "codex", meta, publish)
+
+    def _configure_grok_home(self) -> None:
+        """§21.3: управляемый GROK_HOME (data_dir/grok-home) с правилами прав.
+        HEDGEHOG_GROK_HOME=system — работать с личным ~/.grok без правил."""
+        c = self.config
+        if os.environ.get("HEDGEHOG_GROK_HOME") == "system":
+            grok_auth.configure_managed_home(None, config=c)
+            return
+        grok_auth.configure_managed_home(c.data_dir / "grok-home", [
+            str(c.token_file), str(c.oauth_token_file), str(c.auth_config_file),
+            str(c.image_config_file), str(c.push_keys_file), str(c.tls_dir),
+            str(c.data_dir / "grok-home"), str(c.data_dir / "grok-home-alt"), str(c.data_dir / "codex-home-alt"), str(c.data_dir / "agy-home-alt"),
+            str(c.data_dir / "cli-bin"),
+            str(c.data_dir / "auth.*.json")], config=c)
+
+    async def _make_grok_session(self, meta: ChatMeta, publish):
+        """§21: сессия Grok Build (`grok agent stdio`)."""
+        return await self._make_acp_session(
+            GrokSession, "grok", meta, publish)
+
+    async def _make_antigravity_session(self, meta: ChatMeta, publish):
+        """§multi-cli: сессия Antigravity (`agy acp`)."""
+        return await self._make_acp_session(
+            AntigravitySession, "antigravity", meta, publish)
+
+    async def _agent_mcp_servers(self, meta: ChatMeta) -> dict[str, dict]:
+        """Пользовательские MCP чата + авто-выдача браузера neko (общая для всех
+        CLI)."""
+        mcp_servers = self.mcp.resolve(meta.mcp)
+        # §AI-control: если общий браузер neko поднят — АВТО-выдаём агенту
+        # браузерные инструменты (@playwright/mcp по ВЫДЕЛЕННОЙ docker-сети
+        # hedgehog↔neko). Реестр и meta.mcp не трогаем: доступно всем чатам,
+        # пока neko жив; применяется при (пере)старте сессии. Порт наружу не
+        # публикуется — достижим только отсюда.
+        from .. import neko
+        # N3: выдаём браузерный MCP только если AI-control РЕАЛЬНО доступен
+        # (контейнер жив И Ёжик в neko-сети) — иначе агент получил бы
+        # недостижимый MCP (клиент не публикует порт наружу).
+        if await asyncio.to_thread(neko.ai_control_available):
+            mcp_servers = {**mcp_servers, "neko_browser": {
+                "type": "http",
+                "url": f"http://{neko.CONTAINER}:{self.config.neko_mcp_port}/mcp",
+            }}
+        return mcp_servers
+
+    async def _make_claude_session(self, meta: ChatMeta, publish):
+        async def chat_error(code: str, message: str):
+            await self.hub.publish(meta.chatId, "error",
+                                   {"code": code, "message": message})
+        mcp_servers = await self._agent_mcp_servers(meta)
+
+        def save_session_id(sid: str | None, chat_id=meta.chatId):
+            self.store.update_meta(chat_id, claude_session_id=sid)
+
+        session = ClaudeSession(meta, publish, chat_error, self.config,
+                                mcp_servers=mcp_servers,
+                                on_auth_required=self._on_chat_auth_required,
+                                on_session_id=save_session_id,
+                                on_status=self._chat_status_notifier(meta.chatId),
+                                scheduler=self.scheduler,
+                                roster=self._roster)
+        return session
+
+    async def _register_session(self, meta: ChatMeta, session):
         # M6: пока строили сессию (await neko.ai_control_available / build_auth_env), в неё
         # мог параллельно впрыснуть cron/roster и уже поднять её — не плодим
         # второй CLI-процесс. re-check→assign без await между ними → атомарно.
@@ -2138,28 +2783,107 @@ class HedgehogServer:
         existing = self.sessions.get(meta.chatId)
         if existing is not None:
             return existing
+        # §multi-cli (§18.5): пока строили сессию, мог прийти set_cli — тогда
+        # сессия собрана под устаревший CLI. Выбрасываем её (не стартована) и
+        # собираем заново по актуальной мете.
+        fresh = self.store.get(meta.chatId)
+        if (meta.addressee == "claude" and fresh is not None
+                and fresh.cliType != meta.cliType):
+            return await self._ensure_session_locked(fresh)
         self.sessions[meta.chatId] = session
         # §client-caps: инициализируем ветку рендера формул по подписчикам
         # (sticky возьмёт первый непустой набор — первый ход не уйдёт в текст,
         # если iOS уже прислал client_hello и подписался).
-        if isinstance(session, ClaudeSession):
+        if isinstance(session, AgentSession):
             session.set_client_caps(self.hub.caps_for_chat(meta.chatId))
         await session.start()
         return session
 
+    def _detach_queue(self, chat_id: str) -> list:
+        """Закрыть приём сессии чата и забрать ждущие в очереди сообщения;
+        id её висящих запросов помечаются устаревшими (поздний ответ клиента
+        молча игнорируется). Закрытие ДО take_queued: гонящийся
+        handle_user_msg получит SessionClosed и повторит доставку."""
+        session = self.sessions.get(chat_id)
+        if not isinstance(session, AgentSession):     # нет сессии / PTY
+            return []
+        session.close_intake()
+        queued = session.take_queued()
+        self._stale_requests.setdefault(chat_id, set()).update(
+            session.pending_request_ids())
+        return queued
+
+    async def _restart_session(self, chat_id: str) -> None:
+        """Перезапуск сессии (смена режима/модели/MCP/скиллов): сообщения из
+        очереди, уже показанные эхом, не теряются — едут в новую сессию."""
+        # M2: detach+stop под чатовым замком — иначе _ensure_session, начатый
+        # user_msg по СТАРОЙ мете (до set_mode/set_model), зарегистрировал бы
+        # сессию уже после нашего stop. Подъём/доставка — ВНЕ замка:
+        # _ensure_session берёт его сам (asyncio.Lock нереентерабелен).
+        async with self._chat_lock(chat_id):
+            queued = self._detach_queue(chat_id)
+            await self._stop_session(chat_id)
+        meta = self.store.get(chat_id)
+        if queued and meta is not None:
+            session = await self._ensure_session(meta)
+            for content, on_result in queued:
+                await self._deliver(chat_id, session, content,
+                                    interrupt=False, on_result=on_result)
+
     async def _stop_session(self, chat_id: str):
         session = self.sessions.pop(chat_id, None)
         if session is not None:
+            # сессия ушла из реестра: гонящийся handle_user_msg не должен её
+            # оживить (получит SessionClosed и повторит через новую)
+            if isinstance(session, AgentSession):
+                session.close_intake()
             await session.stop()
 
     # ------------------------- §altauth: активация ----------------------------
 
-    async def _restart_claude_sessions(self):
-        """Уронить активные claude-сессии → следующий ход поднимет их с новым
-        env (тем же путём, что logout). PTY-сессии не трогаем."""
-        for chat_id, session in list(self.sessions.items()):
-            if isinstance(session, ClaudeSession):
-                await self._stop_session(chat_id)
+    async def _quiesce_cli(self, cli: str, *, notify_busy: bool) -> list:
+        """Остановить сессии чатов указанного CLI, сохранив ждущие в очереди
+        сообщения. Под _chat_lock каждого чата (не гонимся с ensure/set_cli).
+        notify_busy: идущему ходу — error AUTH_CHANGED. Возвращает
+        [(chat_id, queued)] для _resume_queued (вызывать ВНЕ _auth_lock)."""
+        pending = []
+        for m in list(self.store.list()):
+            if m.addressee != "claude" or m.cliType != cli:
+                continue
+            async with self._chat_lock(m.chatId):
+                session = self.sessions.get(m.chatId)
+                if session is None:
+                    continue
+                if notify_busy and getattr(session, "status", "idle") == "busy":
+                    await self.hub.publish(m.chatId, "error", {
+                        "code": Err.AUTH_CHANGED, "cliType": cli,
+                        "message": i18n.Msg("auth.changed")})
+                queued = self._detach_queue(m.chatId)
+                await self._stop_session(m.chatId)
+            if queued:
+                pending.append((m.chatId, queued))
+        return pending
+
+    async def _resume_queued(self, pending: list) -> None:
+        """Доставить сохранённую очередь в новые сессии. НЕ вызывать под
+        _auth_lock: _ensure_session ждёт этот же замок."""
+        for chat_id, queued in pending:
+            meta = self.store.get(chat_id)
+            if meta is None:
+                continue
+            try:
+                session = await self._ensure_session(meta)
+                for content, on_result in queued:
+                    await self._deliver(chat_id, session, content,
+                                        interrupt=False, on_result=on_result)
+            except Exception as e:  # noqa: BLE001 — не терять остальные чаты
+                log.warning("auth.resume_queued_failed", chat=chat_id,
+                            err=secrets_redact.redact(repr(e)))
+
+    async def _restart_cli_sessions(self, cli: str) -> None:
+        """Уронить сессии CLI → следующий ход поднимет их с новыми кредами;
+        очередь переезжает в новую сессию. Вне _auth_lock."""
+        await self._resume_queued(await self._quiesce_cli(cli, notify_busy=False))
 
     # ------------------------- §netwait: долгие операции ----------------------
 
@@ -2249,9 +2973,11 @@ class HedgehogServer:
             else:
                 raise                         # отмена самого _run_tracked (shutdown)
         except Exception as e:                # noqa: BLE001 — H3: сетка исключений
-            log.warning("netwait.op_failed", op=op_id, kind=kind, err=repr(e))
+            log.warning("netwait.op_failed", op=op_id, kind=kind,
+                        err=secrets_redact.redact(repr(e)))
             await self.hub.send_global(conn_id, make_error(
-                Err.INTERNAL, f"operation failed: {e}", related=op_id))
+                Err.INTERNAL, secrets_redact.redact(f"operation failed: {e}"),
+                related=op_id))
         finally:
             slow.cancel()
             # снимаем ТОЛЬКО свою запись (defense-in-depth к дубль-отказу выше):
@@ -2326,6 +3052,246 @@ class HedgehogServer:
             self._login_op = None
             await self.auth.stop()
             log.info("auth.quiet_stop_login")
+
+    # ------------------- §multi-cli: вход не-Claude CLI -------------------
+
+    def _auth_manager(self, cli: str):
+        return {"antigravity": self.agy_auth,
+                "codex": self.codex_auth,
+                "grok": self.grok_auth}.get(cli)
+
+    async def _cli_auth_err(self, conn_id, frame, code: str, text: str):
+        await self.hub.send_global(conn_id, make_error(
+            code, text, related=getattr(frame, "id", None)))
+
+    async def _cli_auth_start(self, conn_id, frame, cli: str):
+        if cli_registry.spec_for(cli) is None:
+            return await self._cli_auth_err(conn_id, frame, Err.CLI_UNKNOWN,
+                                            f"unknown cliType {cli!r}")
+        mgr = self._auth_manager(cli)
+        if mgr is None:
+            return await self._cli_auth_err(conn_id, frame, Err.CLI_UNAVAILABLE,
+                                            f"{cli!r} has no auth flow")
+        async with self._auth_lock(cli):    # не стартуем вход посреди смены способа
+            if auth_store.active_method(self.config, cli) != auth_store.SUBSCRIPTION:
+                # активен API-ключ/шлюз: вход по подписке — только после выхода из него
+                await self.hub.send_global(conn_id, make_frame("auth_result", {
+                    "ok": False, "cliType": cli,
+                    "error": i18n.Msg("auth.alt_mode_active")}))
+                return
+            await mgr.start()
+
+    async def _cli_auth_code(self, conn_id, p):
+        mgr = self._auth_manager(p.cliType)
+        if mgr is not None and not getattr(mgr, "needs_code", True):
+            # device-code вход (Codex): код вводят на сайте, Ёжику его слать не надо
+            await self.hub.send_global(conn_id, make_frame("auth_result", {
+                "ok": False, "cliType": p.cliType,
+                "error": i18n.Msg("auth.code_not_needed")}))
+            return
+        if mgr is None or not await mgr.submit_code(p.code):
+            await self.hub.send_global(conn_id, make_frame("auth_result", {
+                "ok": False, "cliType": p.cliType,
+                "error": "no auth flow in progress"}))
+
+    async def _cli_logout(self, conn_id, cli: str):
+        # весь выход (от quiesce до cli_status) — под замком CLI; очередь
+        # возобновляем строго после выхода из него
+        async with self._auth_lock(cli):
+            pending = await self._cli_logout_locked(cli)
+        await self._resume_queued(pending)
+
+    async def _cli_logout_locked(self, cli: str) -> list:
+        if auth_store.active_method(self.config, cli) != auth_store.SUBSCRIPTION:
+            # снимаем активный API-ключ/шлюз; вход по подписке (токен) не трогаем
+            pending = await self._quiesce_cli(cli, notify_busy=True)
+            auth_store.clear(self.config, cli)
+            try:
+                await self._apply_alt_mode(cli, {})
+            except Exception as e:  # noqa: BLE001 — режим уже снят, чистка best-effort
+                log.warning("auth.alt_clear_failed", cli=cli,
+                            err=secrets_redact.redact(repr(e)))
+            await self._after_auth_change(cli)
+            log.info("auth.alt_logout", cli=cli)
+            return pending
+        mod = _LOGIN_MODULES.get(cli)
+        if mod is None:
+            return []
+        await self._auth_manager(cli).stop()
+        pending = await self._quiesce_cli(cli, notify_busy=False)
+        mod.logout()
+        self._invalidate_models_cache()
+        log.info("auth.logout", cli=cli)
+        await self._broadcast_cli_status(cli)
+        return pending
+
+    async def _activate_cli_alt(self, cli: str, method: str, api_key: str,
+                                base_url: str | None, op_id: str | None = None, *,
+                                models_sel: list[dict] | None = None,
+                                active_id: str = "",
+                                api_backend: str = "") -> dict:
+        """§auth: активировать API-ключ или шлюз не-Claude CLI. Проверяет ключ
+        запросом каталога моделей, пишет auth.<cli>.json (0600), гасит вход по
+        подписке, прерывает сессии CLI с ошибкой. Возвращает payload auth_result.
+        Весь процесс — под _auth_lock(cli): две активации подряд исполняются
+        строго по очереди (итог = последняя), очередь чатов возобновляется
+        после выхода из замка."""
+        async with self._auth_lock(cli):
+            res, pending = await self._activate_cli_alt_locked(
+                cli, method, api_key, base_url, op_id, models_sel=models_sel,
+                active_id=active_id, api_backend=api_backend)
+        await self._resume_queued(pending)
+        return res
+
+    async def _activate_cli_alt_locked(self, cli, method, api_key, base_url,
+                                       op_id, *, models_sel, active_id,
+                                       api_backend) -> tuple[dict, list]:
+        spec = cli_registry.spec_for(cli)
+        res = {"cliType": cli, "method": method}
+        if cli == "grok" and grok_auth.managed_home() is None:
+            # HEDGEHOG_GROK_HOME=system: изолированного альт-каталога нет, а ключ в
+            # личном ~/.grok не отключил бы токен подписки — режим недоступен
+            return {**res, "ok": False,
+                    "error": i18n.Msg("auth.method_unsupported")}, []
+        if method == auth_store.GATEWAY and not base_url:
+            return {**res, "ok": False, "error": i18n.Msg("omni.no_base_or_key")}, []
+        ok, err, ids = await key_probe.probe(spec.key_probe, base_url, api_key)
+        self._mark_committing(op_id)
+        if not ok:
+            return {**res, "ok": False, "error": err}, []
+        rec = {"method": method, "api_key": api_key, "base_url": base_url or None,
+               "updated_at": time.time()}
+        if not spec.gateway_models:
+            # модели фиксирует сам CLI, но с ключом доступен лишь каталог API
+            # (agy: static-список содержит claude/gpt, которых у Gemini API нет)
+            rec["catalog"] = [i for i in ids if i.startswith("gemini")][:100]
+        if method == auth_store.GATEWAY:
+            if spec.gateway_models:
+                sel = [m for m in (models_sel or []) if m.get("id")] \
+                    or [{"id": i, "name": i} for i in ids[:50]]
+                if not sel:
+                    return {**res, "ok": False,
+                            "error": i18n.Msg("omni.models_empty")}, []
+                known = {m["id"] for m in sel}
+                if active_id and active_id not in known:
+                    return {**res, "ok": False,
+                            "error": i18n.Msg("omni.active_not_in_list")}, []
+                rec.update(models=[{"id": m["id"],
+                                    "name": (str(m.get("name") or m["id"]))[:40]}
+                                   for m in sel],
+                           active_id=active_id or sel[0]["id"],
+                           api_backend=api_backend or None)
+        prev = auth_store.load(self.config, cli)     # для отката к прежнему режиму
+        pending = await self._quiesce_cli(cli, notify_busy=True)
+        auth_store.save(self.config, cli, rec)
+        try:
+            await self._apply_alt_mode(cli, rec)
+        except Exception as e:  # noqa: BLE001 — не оставляем полуприменённый режим
+            detail = secrets_redact.redact(str(e))
+            log.warning("auth.alt_apply_failed", cli=cli,
+                        err=secrets_redact.redact(repr(e)))
+            # откат к ПРЕЖНЕМУ режиму (а не к «подписке»): запись и побочные эффекты
+            if prev:
+                auth_store.save(self.config, cli, prev)
+            else:
+                auth_store.clear(self.config, cli)
+            try:
+                await self._apply_alt_mode(cli, prev)
+            except Exception as e2:  # noqa: BLE001 — только в лог
+                log.warning("auth.alt_rollback_failed", cli=cli,
+                            err=secrets_redact.redact(repr(e2)))
+            await self._broadcast_cli_status(cli)
+            return {**res, "ok": False, "error": i18n.Msg(
+                "probe.check_failed", detail=detail[:200])}, pending
+        mgr = self._auth_manager(cli)
+        if mgr is not None:
+            await mgr.stop()             # осиротевший вход по подписке не должен
+                                         # прислать ложный auth_result позже
+        await self._after_auth_change(cli)
+        log.info("auth.alt_activated", cli=cli, method=method,
+                 base_url=base_url or "default")
+        return {**res, "ok": True, "error": None}, pending
+
+    async def _apply_alt_mode(self, cli: str, rec: dict) -> None:
+        """Побочные эффекты режима для конкретного CLI (rec={} — режим снят)."""
+        mod = _LOGIN_MODULES.get(cli)       # apply_alt: sync или async
+        if mod is None:
+            return
+        res = mod.apply_alt(rec)
+        if asyncio.iscoroutine(res):
+            await res
+
+    async def _after_auth_change(self, cli: str) -> None:
+        """Способ входа CLI изменился (сессии уже остановлены quiesce): сбросить
+        выбор модели/кэш, оповестить клиентов (cli_status). Под _auth_lock.
+        M4: каждому чату со сброшенной моделью — chat_updated (как у Claude в
+        _reset_all_chat_models), клиент не держит протухший выбор."""
+        for m in self.store.list():                      # модели прежнего способа
+            if (m.cliSessions.get(cli) or {}).get("model"):
+                updated = self.store.set_cli_state(m.chatId, cli, model=None,
+                                                   effort=None)
+                if updated is not None:
+                    await self._broadcast_meta("chat_updated", updated)
+        self._cli_token_rejected.discard(cli)   # MED-1: другой способ — другой статус
+        self._invalidate_models_cache()
+        await self._broadcast_cli_status(cli)
+
+    async def _broadcast_cli_status(self, cli: str, *, install: bool = False) -> None:
+        """cli_status (§18.7) — глобально, только клиентам multi_cli.
+        §cli-pins: поле installing — в кадрах фоновой установки (install=True:
+        старт → true, итог → false) и пока она идёт; иначе поля нет (= false)."""
+        if not self.hub.any_conn_has_cap(cli_registry.MULTI_CLI_CAP):
+            return
+        snap = self._cli_status_snapshot().get(cli)
+        if snap is None:
+            return
+        payload = {
+            "cliType": cli, "present": snap["present"],
+            "auth_state": snap["auth_state"],
+            "activeMethod": snap["activeMethod"],
+            "authDetail": snap["authDetail"]}
+        if install or self._cli_installing(cli):
+            payload["installing"] = self._cli_installing(cli)
+        await self.hub.broadcast_global(make_frame("cli_status", payload),
+                                        require_cap=cli_registry.MULTI_CLI_CAP)
+
+    async def _cli_auth_broadcast(self, cli: str, ftype: str, payload: dict):
+        """auth_link / auth_result не-Claude CLI — глобально, только клиентам
+        multi_cli (старый клиент показал бы чужую ссылку как ссылку Claude).
+        H1: сессии CLI перезапускаем только после РЕАЛЬНОГО входа — не на
+        already_logged_in (входа не было; иначе 401 при живом токене каскадно
+        ронял бы все чаты этого CLI)."""
+        await self.hub.broadcast_global(
+            make_frame(ftype, {**payload, "cliType": cli}),
+            require_cap=cli_registry.MULTI_CLI_CAP)
+        if (ftype == "auth_result" and payload.get("ok")
+                and not payload.get("already_logged_in")):
+            self._cli_token_rejected.discard(cli)   # MED-1: реальный вход
+            await self._restart_cli_sessions(cli)
+            self._invalidate_models_cache()
+            await self._broadcast_cli_status(cli)
+
+    async def _on_cli_auth_required(self, cli: str):
+        """Хук сессии не-Claude CLI при AUTH_REQUIRED (ошибка в чат уже ушла).
+        Ключ/шлюз отвергнуты — вход по подписке не поможет, ничего не делаем.
+        Токен подписки на месте (CLI всё равно ответил 401) — для codex/grok вход
+        НЕ стартуем (`codex login` стёр бы живой токен; повторный «успех»
+        перезапустил бы все чаты CLI), а помечаем CLI как AUTH_REQUIRED (MED-1:
+        кэш моделей хранит OK) и рассылаем cli_status. Antigravity (LOW-1) —
+        прежнее поведение: `agy --login` токен не стирает, авто-старт безвреден.
+        Без токена — авто-старт входа."""
+        if auth_store.active_method(self.config, cli) != auth_store.SUBSCRIPTION:
+            return
+        mod = _LOGIN_MODULES.get(cli)
+        if (cli not in _AUTOLOGIN_OVER_TOKEN
+                and mod is not None and mod.is_logged_in()):
+            log.info("auth.required_with_token", cli=cli)
+            self._cli_token_rejected.add(cli)
+            await self._broadcast_cli_status(cli)
+            return
+        mgr = self._auth_manager(cli)
+        if mgr is not None:
+            await mgr.start()
 
     async def _on_chat_auth_required(self):
         """Хук claude-сессии при AUTH_REQUIRED. Для omniroute/apikey НЕ поднимаем
@@ -2404,7 +3370,12 @@ class HedgehogServer:
         try:
             timeout = aiohttp.ClientTimeout(total=15)
             async with aiohttp.ClientSession(timeout=timeout) as sess:
-                async with sess.post(url, json=body, headers=headers) as r:
+                async with sess.post(url, json=body, headers=headers,
+                                     allow_redirects=False) as r:
+                    if 300 <= r.status < 400:   # ключ не должен уйти на чужой хост по Location
+                        return False, i18n.Msg(
+                            "probe.redirect", status=r.status,
+                            host=key_probe.redirect_host(r.headers.get("Location")))
                     if r.status in (401, 403):
                         return False, i18n.Msg("probe.key_rejected", status=r.status)
                     if r.status >= 500:
@@ -2424,9 +3395,9 @@ class HedgehogServer:
         except (asyncio.TimeoutError, TimeoutError):
             return False, i18n.Msg("probe.timeout")
         except aiohttp.ClientError as e:
-            return False, i18n.Msg("probe.server_unavailable", detail=str(e))
+            return False, i18n.Msg("probe.server_unavailable", detail=secrets_redact.redact(str(e)))
         except Exception as e:  # noqa: BLE001 — валидация не должна ронять хендлер
-            return False, i18n.Msg("probe.check_failed", detail=str(e))
+            return False, i18n.Msg("probe.check_failed", detail=secrets_redact.redact(str(e)))
 
     async def _activate_apikey(self, api_key: str, base_url: str | None,
                                op_id: str | None = None) -> tuple[bool, str | None]:
@@ -2437,9 +3408,11 @@ class HedgehogServer:
             return False, err
         self.config.save_auth_config({
             "mode": "apikey", "api_key": api_key, "base_url": base_url or None})
+        await self._quiet_stop_login()   # осиротевший setup-token → ложный «600s»
         await self._reset_all_chat_models()    # §models L2: выбор мог протухнуть
-        await self._restart_claude_sessions()
+        await self._restart_cli_sessions(models.DEFAULT_CLI_TYPE)
         self._invalidate_models_cache()   # §models: список зависит от ключа
+        await self._broadcast_cli_status(models.DEFAULT_CLI_TYPE)
         log.info("auth.apikey_activated", base_url=base_url or "anthropic")
         return True, None
 
@@ -2491,8 +3464,9 @@ class HedgehogServer:
                      new=False, default_tier=p.default_tier)
         await self._quiet_stop_login()   # убить осиротевший setup-token (ложный «600s»)
         await self._reset_all_chat_models()    # §models L2: выбор мог протухнуть
-        await self._restart_claude_sessions()
+        await self._restart_cli_sessions(models.DEFAULT_CLI_TYPE)
         self._invalidate_models_cache()   # §models: список зависит от шлюза
+        await self._broadcast_cli_status(models.DEFAULT_CLI_TYPE)
         return True, None
 
     async def _omniroute_catalog(self, base_url: str, api_key: str) -> dict:
@@ -2572,10 +3546,31 @@ class HedgehogServer:
             return False, err
         self.config.save_auth_config({**auth, "api_key": api_key})
         await self._quiet_stop_login()   # убить осиротевший setup-token (ложный «600s»)
-        await self._restart_claude_sessions()   # новый ключ в env новой сессии
+        await self._restart_cli_sessions(models.DEFAULT_CLI_TYPE)   # новый ключ в env новой сессии
         self._invalidate_models_cache()
+        await self._broadcast_cli_status(models.DEFAULT_CLI_TYPE)
         log.info("omni.key_updated", base_url=base)
         return True, None
+
+    def _gateway_models_list(self, cli_type: str) -> dict | None:
+        """§auth: models_list из выбранных моделей шлюза не-Claude CLI."""
+        if cli_type == models.DEFAULT_CLI_TYPE:
+            return None
+        rec = auth_store.load(self.config, cli_type)
+        if rec.get("catalog") and rec.get("method") in (auth_store.API_KEY,
+                                                        auth_store.GATEWAY):
+            # CLI с фиксированными моделями (Antigravity) под ключом: каталог API
+            return {"cliType": cli_type, "models": list(rec["catalog"]),
+                    "names": {i: i for i in rec["catalog"]}, "current": None,
+                    "source": "api", "raw": "", "auth_state": "OK",
+                    "cli_present": True, "updated_at": 0}
+        if rec.get("method") != auth_store.GATEWAY or not rec.get("models"):
+            return None
+        sel = rec["models"]
+        return {"cliType": cli_type, "models": [m["id"] for m in sel],
+                "names": {m["id"]: m.get("name") or m["id"] for m in sel},
+                "current": rec.get("active_id"), "source": "gateway", "raw": "",
+                "auth_state": "OK", "cli_present": True, "updated_at": 0}
 
     def _omniroute_models_list(self, cli_type: str) -> dict | None:
         """§omni: models_list из ВЫБРАННЫХ моделей (если активна omniroute-авториз.

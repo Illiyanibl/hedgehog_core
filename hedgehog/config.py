@@ -141,7 +141,7 @@ class Config:
     # эти кадры ТОЛЬКО при наличии этого флага (иначе старый сервер → BAD_FRAME).
     capabilities: tuple[str, ...] = (
         "claude", "broker_shell", "picker", "netwait", "client_caps",
-        "i18n")
+        "i18n", "multi_cli")
 
     # screen_snapshot aggregation window, seconds (broker overflow pattern)
     snapshot_interval: float = 0.08
@@ -238,6 +238,8 @@ class Config:
         tmp = self.auth_config_file.with_suffix(".json.tmp")
         write_secret_file(tmp, json.dumps(data, ensure_ascii=False))  # 0o600 без окна
         tmp.replace(self.auth_config_file)
+        from .core.secrets_redact import invalidate   # ленивый импорт: без цикла
+        invalidate()
 
     def clear_auth_config(self) -> None:
         """Сбросить альт-авторизацию (logout) → возврат к OAuth."""
@@ -245,6 +247,8 @@ class Config:
             self.auth_config_file.unlink(missing_ok=True)
         except OSError:
             pass
+        from .core.secrets_redact import invalidate
+        invalidate()
 
     # --- §image: генерация картинок (per-server) -----------------------------
     # Настройки генератора картинок живут в data/image.json (по одному на сервер,

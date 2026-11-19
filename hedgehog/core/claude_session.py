@@ -30,11 +30,9 @@ from __future__ import annotations
 
 import asyncio
 import json
-import mimetypes
 import os
 import re
 import secrets
-import shutil
 import time
 from collections import deque
 from pathlib import Path
@@ -58,14 +56,13 @@ from claude_agent_sdk import (
 )
 
 from ..config import Config
-from ..fileserver import _safe_name
 from ..i18n import Msg
 from ..ids import new_ulid
 from ..protocol import Err, make_error
 from ..store.chats import ChatMeta
-from ..store import views_registry
-from ..store import handlers_registry
-from .session_base import PublishFn
+from .permissions import AUTO_ALLOW
+from .session_base import PublishFn, SessionClosed
+from .tool_host import HedgehogToolHost
 from . import ctl_server
 # NekoProxy импортируем ЛЕНИВО (в _ensure_client, только если в чате есть neko) —
 # его зависимость `mcp` может отсутствовать/иметь другую версию на боксе без
@@ -331,7 +328,7 @@ def build_auth_env(config: Config) -> tuple[dict[str, str], str | None]:
     return env, model_override
 
 
-class ClaudeSession:
+class ClaudeSession(HedgehogToolHost):
     def __init__(self, meta: ChatMeta, publish: PublishFn,
                  send_chat_error, config: Config,
                  mcp_servers: dict[str, dict] | None = None,
@@ -464,13 +461,23 @@ class ClaudeSession:
             self._worker = asyncio.create_task(self._run(), name=f"claude:{self.meta.chatId}")
 
     async def stop(self):
-        if self._worker:
-            self._worker.cancel()
+        worker, self._worker = self._worker, None
+        # H1: stop() из собственного воркера — await самого себя повис бы;
+        # чистим ресурсы и отменяем воркер в самом конце.
+        own = worker is not None and worker is asyncio.current_task()
+        if worker is not None and not own:
+            worker.cancel()
             try:
-                await self._worker
+                await worker
             except (asyncio.CancelledError, Exception):
                 pass
-            self._worker = None
+        try:
+            await self._stop_resources()
+        finally:
+            if own:
+                worker.cancel()
+
+    async def _stop_resources(self):
         await self._disconnect()
         # §ctl: снимаем регистрацию «ручки» — токен сессии больше не валиден.
         ctl_server.unregister(self._ctl_token)
@@ -501,39 +508,13 @@ class ClaudeSession:
                 log.info("sdk.disconnect_failed", chat=self.meta.chatId, err=str(e))
             self._client = None
 
-    # ---------- §client-caps: возможности клиента → тул formula_mode ----------
-
-    def set_client_caps(self, caps) -> None:
-        """Обновить ЖИВЫЕ возможности рендера клиента. Зовётся из wss-слоя при
-        client_hello/client_caps_update и при подписке/отписке (hub.caps_for_chat
-        → union подписанных).
-
-        Значение читает тул formula_mode В МОМЕНТ отрисовки формулы — поэтому
-        сессию НЕ пересобираем (прежний rebuild+resume «замораживал» режим на
-        старте, Fable Б1). Просто обновляем поле. Пустой набор (нет подписчиков)
-        НЕ сбрасывает — держим sticky последний непустой (cron-ход без клиентов)."""
-        caps = frozenset(caps)
-        if caps:
-            self._caps_sticky = caps
-            self._client_caps = caps
-        else:
-            self._client_caps = self._caps_sticky or frozenset()
-
-    def formula_mode(self) -> str:
-        """Живой режим рендера формул для тула mcp__hedgehog__formula_mode:
-        latex (клиент типографит $$…$$), webview (ui_open+MathJax), text."""
-        caps = self._client_caps
-        if "math" in caps:
-            return "latex"
-        if "webview" in caps:
-            return "webview"
-        return "text"
-
     # ---------- входящие фреймы ----------
 
     async def handle_user_msg(self, content: str, interrupt: bool = True,
                               on_result=None) -> bool:
         """Поставить сообщение в очередь. Всегда возвращает False.
+        Закрытая сессия (set_cli/stop) → SessionClosed: вызывающий повторит
+        доставку через актуальную сессию чата.
 
         Каждое сообщение — отдельный ход строго по очереди: воркер ждёт
         ResultMessage хода (событие _turn_done от постоянного ридера), затем
@@ -550,6 +531,8 @@ class ClaudeSession:
         сработало по таймеру: если пользователь как раз ведёт диалог, оно должно
         встать в очередь, а не оборвать его ход).
         """
+        if self._intake_closed:
+            raise SessionClosed("claude session is closed")
         await self.start()
         await self._queue.put((content, on_result))
         # A1 (M1): агент занят ходом → просим воркер прервать ТЕКУЩИЙ ход. НЕ зовём
@@ -732,19 +715,6 @@ class ClaudeSession:
         core/hedgehog_mcp.build_hedgehog_mcp (метод был ~590 строк)."""
         return build_hedgehog_mcp(self)
 
-    async def _notify(self, title: str, body: str) -> bool:
-        """§notify: общий путь для MCP-тула notify и текстового протокола
-        (_run_text_tools) — чтобы поведение не расходилось. Триммим+обрезаем,
-        пустое пропускаем. True, если отправлено."""
-        title = str(title or "").strip()[:200]
-        body = str(body or "").strip()[:1000]
-        if not title and not body:
-            return False
-        await self._publish("notification", {"title": title, "body": body})
-        log.info("notify.sent", chat=self.meta.chatId,
-                 title=title[:40], size=len(body))
-        return True
-
     async def _run_text_tools(self, text: str) -> str:
         """§text-tools: исполнить маркеры ```hedgehog {...}``` из текста модели
         (под omniroute). Исполненные вырезаем, битые/неизвестные/сверх
@@ -779,201 +749,6 @@ class ClaudeSession:
                 last = m.end()
         out.append(text[last:])
         return "".join(out)
-
-    # §views: тонкие обёртки над реестром окон (data_dir/views.json). Реестр —
-    # источник правды «какое окно запущено» + история явных закрытий; на нём
-    # держится детерминированный пушер переоткрытия (клиентский ui_reopen) и
-    # интроспекция агентом (ui_current). Ошибки реестра не должны ронять тул.
-    def _view_open(self, *, title: str, html: str, allow_external: bool,
-                   kind: str = "app") -> dict | None:
-        try:
-            return views_registry.record_open(
-                self._config.data_dir, self.meta.chatId,
-                title=title, html=html, persistent=True,
-                allow_external=allow_external, kind=kind)
-        except OSError as e:
-            log.warning("views.open_failed", chat=self.meta.chatId, err=str(e))
-            return None
-
-    def _view_update(self, html: str) -> None:
-        try:
-            views_registry.record_update(
-                self._config.data_dir, self.meta.chatId, html)
-        except OSError as e:
-            log.warning("views.update_failed", chat=self.meta.chatId, err=str(e))
-
-    def _view_close(self) -> None:
-        try:
-            views_registry.record_close(self._config.data_dir, self.meta.chatId)
-        except OSError as e:
-            log.warning("views.close_failed", chat=self.meta.chatId, err=str(e))
-
-    def _view_snapshot(self) -> dict:
-        try:
-            return views_registry.get(self._config.data_dir, self.meta.chatId)
-        except OSError:
-            return {"current": None, "history": []}
-
-    def _view_reopen(self, view_id: str) -> dict | None:
-        try:
-            return views_registry.reopen(
-                self._config.data_dir, self.meta.chatId, view_id)
-        except OSError:
-            return None
-
-    def _view_get(self, view_id: str) -> dict | None:
-        try:
-            return views_registry.get_view(
-                self._config.data_dir, self.meta.chatId, view_id)
-        except OSError:
-            return None
-
-    def _chat_file_path(self, file_id: str) -> str | None:
-        """§draw: fileId → абсолютный путь файла в хранилище чата (для Read)."""
-        if not file_id or not file_id.isalnum():
-            return None
-        files_dir = self._config.chats_dir / self.meta.chatId / "files"
-        try:
-            matches = sorted(files_dir.glob(f"{file_id}__*")) \
-                if files_dir.exists() else []
-        except OSError:
-            return None
-        return str(matches[0]) if matches else None
-
-    # §handlers Ф-2: тонкие обёртки над реестром ручек (data_dir/handlers.json).
-    def _handler_register(self, name: str, script: str,
-                          view_id: str | None) -> dict | None:
-        try:
-            return handlers_registry.register(
-                self._config.data_dir, self.meta.chatId, name, script, view_id)
-        except OSError as e:
-            log.warning("handler.register_failed", chat=self.meta.chatId, err=str(e))
-            return None
-
-    def _handler_list(self) -> list[dict]:
-        try:
-            return handlers_registry.list_(self._config.data_dir, self.meta.chatId)
-        except OSError:
-            return []
-
-    def _handler_get(self, name: str) -> dict | None:
-        try:
-            return handlers_registry.get(
-                self._config.data_dir, self.meta.chatId, name)
-        except OSError:
-            return None
-
-    def _handler_unregister(self, name: str) -> bool:
-        try:
-            return handlers_registry.unregister(
-                self._config.data_dir, self.meta.chatId, name)
-        except OSError:
-            return False
-
-    # §ui Ф-1: общий per-server key-value стор (data_dir/kv.json) — состояние
-    # между окнами и чатами (счётчики и т.п.). Один процесс Ёжика, async
-    # single-thread → read-modify-write без гонок.
-    def _kv_path(self):
-        return self._config.data_dir / "kv.json"
-
-    def _kv_load(self) -> dict:
-        try:
-            data = json.loads(self._kv_path().read_text())
-            return data if isinstance(data, dict) else {}
-        except (OSError, ValueError):
-            return {}
-
-    def _kv_set(self, key: str, value: str) -> None:
-        if not key:
-            return
-        data = self._kv_load()
-        data[key] = value
-        self._config.data_dir.mkdir(parents=True, exist_ok=True)
-        tmp = self._kv_path().with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(data, ensure_ascii=False))
-        tmp.replace(self._kv_path())
-
-    def _kv_get(self, key: str) -> str:
-        return str(self._kv_load().get(key, ""))
-
-    async def handle_ui_event(self, data: str) -> None:
-        """§ui async: действие в постоянном окне (hedgehog.notify) → полноценный
-        ход агента, как обычное сообщение. Claude может делать что угодно."""
-        log.info("ui.event", chat=self.meta.chatId, size=len(data or ""))
-        await self.handle_user_msg(data or "(empty ui event)")
-
-    async def _ask_ui(self, html: str, title: str) -> str:
-        """§ui: показать интерактивный HTML в чате и дождаться ответа юзера.
-        Тем же round-trip, что picker/permission (_pending future).
-
-        S2-M2: окно интерактивное — юзер может думать дольше permission_timeout
-        (300с), поэтому ждём по большому ui_timeout. И перехватываем таймаут: без
-        этого asyncio.TimeoutError вылетал из тела тула (в отличие от permission-
-        пути) → тул падал ошибкой, окно висело с мёртвым related. Теперь тул
-        возвращает человекочитаемый текст, агент продолжает штатно."""
-        try:
-            data = await self.request(
-                "ui_request", {"html": html, "title": title},
-                timeout=self._config.ui_timeout)
-        except asyncio.TimeoutError:
-            log.info("ui.timeout", chat=self.meta.chatId,
-                     after=int(self._config.ui_timeout))
-            return (f"(no answer: the interactive window timed out after "
-                    f"{int(self._config.ui_timeout)}s)")
-        log.info("ui.answered", chat=self.meta.chatId, size=len(data or ""))
-        return data or "(the user closed the window without answering)"
-
-    async def _attach_file_to_chat(self, path: str) -> str:
-        p = Path(path)
-        if not p.is_absolute():
-            p = Path(self.meta.cwd) / path
-        if not p.is_file():
-            return f"file not found: {path}"
-        files_dir = self._config.chats_dir / self.meta.chatId / "files"
-        files_dir.mkdir(parents=True, exist_ok=True)
-        file_id = new_ulid()
-        # Если путь указывает на файл из хранилища чата (<ulid>__имя), отрезаем
-        # служебный ulid-префикс — пользователю показываем чистое имя.
-        display = re.sub(r"^[0-9A-HJKMNP-TV-Z]{26}__", "", p.name)
-        safe = _safe_name(display)
-        dest = files_dir / f"{file_id}__{safe}"
-        try:
-            shutil.copy2(p, dest)
-        except OSError as e:
-            return f"failed to copy file: {e}"
-        size = dest.stat().st_size
-        mime = mimetypes.guess_type(safe)[0] or "application/octet-stream"
-        await self._publish("agent_file", {
-            "fileId": file_id, "name": safe, "mime": mime, "size": size,
-        })
-        log.info("agent.file_sent", chat=self.meta.chatId, file=file_id,
-                 name=safe, size=size)
-        return f"file '{safe}' sent to the user in the chat"
-
-    async def _attach_bytes_to_chat(self, name: str, data: bytes,
-                                    mime: str | None = None) -> str:
-        """§image: доставить СЫРЫЕ байты (сгенерированная картинка) карточкой в
-        чат — тем же путём, что _attach_file_to_chat (agent_file-фрейм), но без
-        файла-источника: пишем сразу в files_dir (без temp и двойного копирования
-        многомегабайтных байтов). `name` — осмысленное имя с расширением."""
-        files_dir = self._config.chats_dir / self.meta.chatId / "files"
-        files_dir.mkdir(parents=True, exist_ok=True)
-        file_id = new_ulid()
-        safe = _safe_name(name) or "image.png"
-        dest = files_dir / f"{file_id}__{safe}"
-        try:
-            dest.write_bytes(data)
-        except OSError as e:
-            return f"failed to write image: {e}"
-        size = dest.stat().st_size
-        if not mime:
-            mime = mimetypes.guess_type(safe)[0] or "application/octet-stream"
-        await self._publish("agent_file", {
-            "fileId": file_id, "name": safe, "mime": mime, "size": size,
-        })
-        log.info("agent.file_sent", chat=self.meta.chatId, file=file_id,
-                 name=safe, size=size, src="bytes")
-        return f"image '{safe}' sent to the user in the chat"
 
     async def _ensure_client(self) -> ClaudeSDKClient:
         # §client-caps: смена режима формул БОЛЬШЕ не требует пересборки клиента —
@@ -1405,9 +1180,10 @@ class ClaudeSession:
             # не видит вариантов (баг «пропадают варианты ответа»).
             if tool_name == "AskUserQuestion":
                 return await self._ask_via_picker(tool_input)
-            # Наш встроенный инструмент отправки файла в чат — безопасен
-            # (копирует файл в files-папку чата), разрешаем без спроса.
-            if tool_name == "mcp__hedgehog__attach_file":
+            # Безопасные встроенные инструменты Ёжика (attach_file, formula_mode,
+            # notify, чтение kv/artifact/schedule… — core/permissions.py
+            # HEDGEHOG_SAFE_TOOLS) — без спроса.
+            if tool_name in AUTO_ALLOW:
                 return PermissionResultAllow()
             if mode == "bypassPermissions":
                 return PermissionResultAllow()      # автономный чат: всё без спроса

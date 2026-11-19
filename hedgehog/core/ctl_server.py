@@ -103,6 +103,59 @@ def _first_line(s) -> str:
     return ""
 
 
+NEKO_SERVER = "neko_browser"
+
+
+def _mcp_tool_name(server: str, tool: str) -> str:
+    """Имя инструмента без префикса сервера (`mcp__srv__x`, `mcp_srv_x`, `srv__x`)."""
+    if server == NEKO_SERVER:
+        return _neko_name(tool)
+    for pre in (f"mcp__{server}__", f"mcp_{server}_", f"{server}__"):
+        if tool.startswith(pre):
+            return tool[len(pre):]
+    return tool
+
+
+async def _mcp_server_op(session, server: str, op: str, tool, args: dict) -> dict:
+    """§H1: MCP-сервер (neko_browser или пользовательский) для CLI без своего гейта
+    идёт через мост `--server NAME`: каталог и вызовы — отсюда, с проверкой прав
+    (ctl_gate) перед каждым tools/call."""
+    ensure = getattr(session, "ensure_mcp_proxy", None)
+    proxy = ensure(server) if ensure is not None else None
+    if proxy is None and server == NEKO_SERVER:
+        proxy = getattr(session, "_neko_proxy", None)
+    if proxy is None:
+        return {"ok": False, "error": f"MCP server {server!r} is not available"}
+    deny = _NEKO_DENY if server == NEKO_SERVER else frozenset()
+    if op == "catalog":
+        try:
+            cat = await proxy.list_tools()
+        except Exception as e:  # noqa: BLE001 — сервер лёг: пустой каталог, не ошибка
+            log.warning("mcp.catalog_failed", server=server, err=repr(e))
+            cat = {}
+        return {"ok": True, "tools": [
+            {"name": n, "description": str(m.get("description") or ""),
+             "input_schema": m.get("input_schema") or {"type": "object"}}
+            for n, m in cat.items() if n not in deny]}
+    if op != "call":
+        return {"ok": False, "error": f"unsupported op for {server}: {op!r}"}
+    name = _mcp_tool_name(server, str(tool or ""))
+    if name in deny:
+        return {"ok": False, "error": f"{name} is managed by hedgehog, not available"}
+    gate = getattr(session, "ctl_gate", None)
+    if gate is not None and not await gate(name, args, server=server):
+        return {"ok": False, "error": f"{name}: denied by user permission"}
+    try:
+        res = await proxy.call(name, args)
+        text = _neko_text(res, session.meta.cwd)
+        if getattr(res, "isError", False):
+            return {"ok": False, "error": text or "tool error"}
+        return {"ok": True, "text": text}
+    except Exception as e:  # noqa: BLE001
+        log.warning("mcp.call_failed", server=server, tool=name, err=repr(e))
+        return {"ok": False, "error": f"{server}: {e!r}"}
+
+
 def _text_of(res) -> str:
     """Склеить текстовые блоки MCP-ответа {"content":[{"type":"text",...}]}."""
     if isinstance(res, dict):
@@ -128,10 +181,13 @@ async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) ->
                 tool = req.get("tool")
                 args = req.get("args") if isinstance(req.get("args"), dict) else {}
                 op = req.get("op") or "call"
+                server = req.get("server")
                 session = _sessions.get(token) if token else None
                 proxy = getattr(session, "_neko_proxy", None) if session else None
                 if session is None:
                     resp = {"ok": False, "error": "unknown or expired session token"}
+                elif server:
+                    resp = await _mcp_server_op(session, str(server), op, tool, args)
                 elif op == "list":
                     # Самоописание: имена + первая строка описания каждого тула.
                     meta = getattr(session, "_ctl_meta", None) or {}
@@ -145,6 +201,15 @@ async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) ->
                         except Exception as e:  # noqa: BLE001 — neko лёг: не рушим список
                             lines.append(f"# browser tools (neko): unavailable ({e!r})")
                     resp = {"ok": True, "text": "\n".join(lines)}
+                elif op == "catalog":
+                    # §multi-cli: машинный каталог для stdio-MCP-моста
+                    # (core/mcp_bridge.py): [{name, description, input_schema}].
+                    meta = getattr(session, "_ctl_meta", None) or {}
+                    resp = {"ok": True, "tools": [
+                        {"name": n, "description": str(m.get("description") or ""),
+                         "input_schema": m.get("input_schema")
+                         or {"type": "object"}}
+                        for n, m in meta.items()]}
                 elif op == "schema":
                     meta = (getattr(session, "_ctl_meta", None) or {}).get(tool)
                     if meta is None and proxy is not None:
@@ -162,7 +227,12 @@ async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) ->
                 else:   # op == "call"
                     fn = (getattr(session, "_ctl_tools", None) or {}).get(tool)
                     nname = _neko_name(tool)
-                    if fn is not None:
+                    gate = getattr(session, "ctl_gate", None)
+                    if fn is not None and gate is not None \
+                            and not await gate(tool, args):
+                        resp = {"ok": False,
+                                "error": f"{tool}: denied by user permission"}
+                    elif fn is not None:
                         try:
                             res = await fn(args)
                             resp = {"ok": True, "text": _text_of(res)}

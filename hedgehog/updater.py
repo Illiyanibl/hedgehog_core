@@ -38,7 +38,9 @@ class UpdateResult:
     new: str = ""
     message: str = ""
     # манифест совместимости: {"sdk_before","sdk_after","sdk_pinned","updated",
-    # "error","broken"}; {} — манифеста нет
+    # "error","broken"}; {} — манифеста нет. §cli-pins: + "clis": {cli:
+    # {"before","after","pinned","updated","error"}} — только установленные CLI
+    # с записью в compat.json (ключа нет, если таких нет)
     cli: dict = field(default_factory=dict)
 
 
@@ -187,6 +189,18 @@ def ensure_compat(root: Path, pkg_dir: Path | None = None,
     return cli
 
 
+def ensure_clis(root: Path, pkg_dir: Path | None = None,
+                deadline: float | None = None) -> dict:
+    """§cli-pins: пины сторонних CLI (compat.json "clis") — только для
+    УСТАНОВЛЕННЫХ; политика HEDGEHOG_CLI_AUTO_UPDATE (1 — пин как минимум,
+    0 — точный). Ошибки не фатальны (в отчёте). {cli: {...}}."""
+    from .core import cli_install
+    try:
+        return cli_install.ensure_pins(deadline=deadline, pkg_dir=pkg_dir)
+    except Exception as e:  # noqa: BLE001 — апдейт кода важнее пинов CLI
+        return {"_error": f"{type(e).__name__}: {e}"[:300]}
+
+
 def repo_root() -> Path | None:
     """Корень git-репозитория, из которого запущен Ёжик (где лежит пакет
     hedgehog). None — если это не git-установка (обновление недоступно)."""
@@ -290,13 +304,25 @@ def pull_latest(process_sha: str = "") -> UpdateResult:
         # SDK не импортируется даже после отката — рестарт в него запрещён
         return UpdateResult(ok=False, old=old, new=new, changed=False,
                             message=f"claude-agent-sdk: {cli.get('error')}", cli=cli)
-    sdk_only = False
+    # §cli-pins: сторонние CLI — после SDK, в общем бюджете; любое реальное
+    # обновление → рестарт (процессы CLI пересоздадутся на новой версии).
+    clis = ensure_clis(root, deadline=deadline)
+    if clis:
+        cli = {**cli, "clis": clis}
+    clis_updated = [f"{name} {r.get('before') or '—'} → {r.get('after') or '—'}"
+                    for name, r in clis.items()
+                    if isinstance(r, dict) and r.get("updated")]
+    sdk_only = clis_only = False
     if cli.get("updated") and not changed:
         changed = sdk_only = True
+    if clis_updated and not changed:
+        changed = clis_only = True
 
     if sdk_only:
         msg = Msg("update.sdk_updated", before=cli.get("sdk_before") or "—",
                   after=cli.get("sdk_after") or "—")
+    elif clis_only:
+        msg = Msg("update.clis_updated", list=", ".join(clis_updated))
     elif changed:
         msg = Msg("update.updated", old=old, new=new)
     else:

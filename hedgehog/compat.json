@@ -1,1 +1,46 @@
-{"claude_agent_sdk": {"version": "0.2.179"}}
+{
+  "claude_agent_sdk": {
+    "version": "0.2.182"
+  },
+  "clis": {
+    "codex": {
+      "version": "0.169.0",
+      "assets": {
+        "linux-x86_64": {
+          "url": "https://github.com/openai/codex/releases/download/rust-v0.169.0/codex-package-x86_64-unknown-linux-musl.tar.gz",
+          "sha256": "3b8ed091149cc63a59046b9f094bcfa21cdb4dda15ede441ce369bcee4a71ba0"
+        },
+        "linux-aarch64": {
+          "url": "https://github.com/openai/codex/releases/download/rust-v0.169.0/codex-package-aarch64-unknown-linux-musl.tar.gz",
+          "sha256": "c8d0b4ab2a97c595b70b10412d36d0d5464dcef1e1d3246b073d48017cdf5a4f"
+        }
+      }
+    },
+    "antigravity": {
+      "version": "1.5.10",
+      "assets": {
+        "linux-x86_64": {
+          "url": "https://storage.googleapis.com/antigravity-public/antigravity-cli/1.5.10-5253791805734912/linux-x64/cli_linux_x64.tar.gz",
+          "sha512": "713ae840845d74736e2d4a96f5d84e3353d614e73a875793ddf500997ccee09595448cebfd8e94fdd90ce2a0fa97707bd1cc29763dcfe01c945d80c92234378f"
+        },
+        "linux-aarch64": {
+          "url": "https://storage.googleapis.com/antigravity-public/antigravity-cli/1.5.10-5253791805734912/linux-arm/cli_linux_arm64.tar.gz",
+          "sha512": "f9f5c7ebc47a8b8de536acca8116b1f5a43dca614cde94008fe5a510517b23535fb281d85416930d76e76478858bf3dc66ea6d1b0c9b6eeadcfabe4d8ef2a807"
+        }
+      }
+    },
+    "grok": {
+      "version": "1.0.88",
+      "assets": {
+        "linux-x86_64": {
+          "url": "https://x.ai/cli/grok-1.0.88-linux-x86_64.gz",
+          "sha256": "886b23dad7e4ee138385834b2f39e084d6cf6dd2d8eaf3bd83f424aa7dadb12f"
+        },
+        "linux-aarch64": {
+          "url": "https://x.ai/cli/grok-1.0.88-linux-aarch64.gz",
+          "sha256": "e46598c245c936eb6983bfcbe9cbd2524db486bb86ce0c8640ff3ee344a7c92b"
+        }
+      }
+    }
+  }
+}

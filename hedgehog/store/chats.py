@@ -74,6 +74,65 @@ class ChatMeta:
     # §cli-types: тип CLI-агента чата (claude сейчас; задел под codex и др.).
     # Для broker_shell не используется. Старые meta.json без поля → "claude".
     cliType: str = "claude"
+    # §multi-cli: состояние КАЖДОГО CLI в этом чате (cliType → запись
+    # {initialized, session_id, model}); активный CLI = cliType. Плоские
+    # claude_session_id/model — зеркала на один релиз (откат сервера без
+    # амнезии чатов, протокол §18.2). Пусто у старых meta.json — мигрирует
+    # лениво на чтении (ChatStore.get).
+    cliSessions: dict[str, dict] = field(default_factory=dict)
+
+
+def new_cli_entry() -> dict:
+    """Пустая запись состояния CLI в чате (§multi-cli)."""
+    return {"initialized": False, "session_id": None, "model": None,
+            "effort": None}
+
+
+def _clean_cli_sessions(raw: object) -> dict[str, dict]:
+    """Нормализовать cliSessions из meta.json: только {str: dict}, каждая запись
+    с полными полями. Битая/ручная правка не должна ронять list_chats всем."""
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, dict] = {}
+    for cli, entry in raw.items():
+        if not isinstance(cli, str) or not isinstance(entry, dict):
+            continue
+        clean = new_cli_entry()
+        clean.update({k: entry[k] for k in clean if k in entry})
+        out[cli] = clean
+    return out
+
+
+def migrate_cli_sessions(meta: ChatMeta) -> None:
+    """Ленивая миграция §multi-cli: старый meta.json (без cliSessions) →
+    запись активного CLI из плоских claude_session_id/model. Идемпотентна;
+    для broker_shell (нет CLI-агента) ничего не делает."""
+    if meta.cliSessions or meta.addressee != "claude":
+        return
+    entry = new_cli_entry()
+    entry["model"] = meta.model
+    if meta.cliType == "claude":
+        entry["session_id"] = meta.claude_session_id
+        entry["initialized"] = bool(meta.claude_session_id)
+    meta.cliSessions = {meta.cliType: entry}
+
+
+def public_meta(meta: ChatMeta, include_cli_sessions: bool = False) -> dict:
+    """Мета чата для клиента (chat_created/chat_updated/chat_list).
+
+    Заменяет прежний vars(meta). По умолчанию wire-формат ИДЕНТИЧЕН
+    доязычному: без cliSessions (§18.3 гейт multi_cli). С include_cli_sessions
+    — cliSessions в публичном виде: БЕЗ session_id (серверная кухня,
+    §18.2)."""
+    out = dict(vars(meta))
+    sessions = out.pop("cliSessions", None)
+    sessions = sessions if isinstance(sessions, dict) else {}
+    if include_cli_sessions:
+        out["cliSessions"] = {
+            cli: {"initialized": bool(e.get("initialized")),
+                  "model": e.get("model"), "effort": e.get("effort")}
+            for cli, e in sessions.items() if isinstance(e, dict)}
+    return out
 
 
 class ChatStore:
@@ -145,7 +204,10 @@ class ChatStore:
             # Отбрасываем неизвестные ключи (forward-compat со старыми/новыми
             # версиями meta.json), недостающие поля добираются дефолтами.
             known = {f.name for f in fields(ChatMeta)}
-            return ChatMeta(**{k: v for k, v in data.items() if k in known})
+            meta = ChatMeta(**{k: v for k, v in data.items() if k in known})
+            meta.cliSessions = _clean_cli_sessions(meta.cliSessions)
+            migrate_cli_sessions(meta)                   # §multi-cli
+            return meta
         except (ValueError, TypeError):
             return None
 
@@ -161,8 +223,64 @@ class ChatStore:
         for k, v in changes.items():
             if hasattr(meta, k):
                 setattr(meta, k, v)
+        self._sync_cli_mirrors(meta, changes)
         self._write_meta(self._chat_dir(chat_id) / "meta.json", meta)
         self._log_limits.pop(chat_id, None)
+        return meta
+
+    @staticmethod
+    def _sync_cli_mirrors(meta: ChatMeta, changes: dict) -> None:
+        """§multi-cli: двойная запись плоских полей в cliSessions.
+        claude_session_id → cliSessions.claude; model → запись АКТИВНОГО CLI.
+        Явная правка самого cliSessions зеркал не трогает (её делают
+        set_active_cli/set_cli_state)."""
+        if "cliSessions" in changes or meta.addressee != "claude":
+            return
+        if "claude_session_id" in changes:
+            e = meta.cliSessions.setdefault("claude", new_cli_entry())
+            e["session_id"] = changes["claude_session_id"]
+            e["initialized"] = bool(changes["claude_session_id"])
+        if "model" in changes:
+            e = meta.cliSessions.setdefault(meta.cliType, new_cli_entry())
+            e["model"] = changes["model"]
+
+    def set_active_cli(self, chat_id: str, cli_type: str
+                       ) -> tuple[ChatMeta, bool] | None:
+        """§multi-cli: сделать cli_type активным. Возвращает (meta, first_init),
+        first_init — у этого CLI ещё не было сессии в чате (initialized=False НА
+        МОМЕНТ переключения). Плоское model следует за моделью нового CLI;
+        claude_session_id остаётся зеркалом именно claude-сессии."""
+        meta = self.get(chat_id)
+        if meta is None:
+            return None
+        entry = meta.cliSessions.setdefault(cli_type, new_cli_entry())
+        first_init = not entry.get("initialized")
+        meta.cliType = cli_type
+        meta.model = entry.get("model")
+        meta.claude_session_id = (
+            meta.cliSessions.get("claude", {}).get("session_id"))
+        self._write_meta(self._chat_dir(chat_id) / "meta.json", meta)
+        return meta, first_init
+
+    def set_cli_state(self, chat_id: str, cli_type: str,
+                      **fields_: object) -> ChatMeta | None:
+        """§multi-cli: правка записи состояния ОДНОГО CLI (initialized/
+        session_id/model). Для claude зеркалит плоские claude_session_id;
+        для активного CLI — плоское model."""
+        meta = self.get(chat_id)
+        if meta is None:
+            return None
+        allowed = {"initialized", "session_id", "model", "effort"}
+        bad = set(fields_) - allowed
+        if bad:
+            raise ValueError(f"unknown cli state fields: {sorted(bad)}")
+        e = meta.cliSessions.setdefault(cli_type, new_cli_entry())
+        e.update(fields_)
+        if cli_type == "claude" and "session_id" in fields_:
+            meta.claude_session_id = fields_["session_id"]
+        if cli_type == meta.cliType and "model" in fields_:
+            meta.model = fields_["model"]
+        self._write_meta(self._chat_dir(chat_id) / "meta.json", meta)
         return meta
 
     def list(self) -> list[ChatMeta]:

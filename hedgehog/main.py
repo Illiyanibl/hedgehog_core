@@ -16,10 +16,17 @@ from . import fileserver
 from . import tls
 
 
+def _redact_processor(_logger, _name, event_dict):
+    """Секреты (ключи API, токены) не попадают в логи."""
+    from .core.secrets_redact import redact
+    return {k: redact(v) if isinstance(v, str) else v for k, v in event_dict.items()}
+
+
 def _setup_logging():
     logging.basicConfig(format="%(message)s", stream=sys.stdout, level=logging.INFO)
     structlog.configure(
         processors=[
+            _redact_processor,
             structlog.processors.TimeStamper(fmt="iso"),
             structlog.processors.add_log_level,
             structlog.processors.KeyValueRenderer(key_order=["timestamp", "level", "event"]),
@@ -29,9 +36,29 @@ def _setup_logging():
     )
 
 
+def harden_process(environ=None) -> bool:
+    """Опционально (HEDGEHOG_NO_DUMPABLE=1, Linux): PR_SET_DUMPABLE=0 — процессы
+    того же uid без CAP_SYS_PTRACE (в т.ч. shell агента) не прочтут
+    /proc/<pid>/environ и память сервера, где может лежать HEDGEHOG_TOKEN.
+    Выключено по умолчанию: клиенты, берущие токен из environ процесса сервера
+    (резервный путь hh_ws.load_token), перестанут его находить — сначала перенесите
+    токен в файл data_dir/auth_token. Побочный эффект: нет core dump."""
+    import os
+    env = os.environ if environ is None else environ
+    if env.get("HEDGEHOG_NO_DUMPABLE") != "1":
+        return False
+    try:
+        import ctypes
+        return ctypes.CDLL(None, use_errno=True).prctl(4, 0, 0, 0, 0) == 0   # PR_SET_DUMPABLE
+    except (OSError, AttributeError):
+        return False
+
+
 async def _amain():
     _setup_logging()
     log = structlog.get_logger("main")
+    if harden_process():
+        log.info("process.not_dumpable")
 
     config = Config()
     from .config import ensure_secure_dir

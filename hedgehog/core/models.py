@@ -32,6 +32,7 @@ from claude_agent_sdk import (
     query,
 )
 
+from . import cli_registry
 from .claude_session import build_auth_env, is_auth_error
 
 log = structlog.get_logger("models")
@@ -44,8 +45,9 @@ _PROBE_TIMEOUT = 60.0
 # Claude; задел под Codex и др. — добавление сюда + ветка пробы в probe_models
 # + (для реальной работы) своя session-реализация в wss-слое. Клиент шлёт
 # cliType в list_models/create_chat; сервер отдаёт данные нужного типа.
-DEFAULT_CLI_TYPE = "claude"
-KNOWN_CLI_TYPES: tuple[str, ...] = ("claude",)
+# §multi-cli: список типов — из реестра core/cli_registry.py (единый источник).
+DEFAULT_CLI_TYPE = cli_registry.DEFAULT_CLI_TYPE
+KNOWN_CLI_TYPES: tuple[str, ...] = cli_registry.known_cli_types()
 
 
 def parse_model_line(text: str) -> dict[str, Any]:
@@ -91,6 +93,14 @@ async def probe_models(config, cwd: str,
     """
     if cli_type not in KNOWN_CLI_TYPES:
         return _unsupported(cli_type)
+    if cli_type == "antigravity":
+        return await probe_antigravity_models()
+    if cli_type == "grok":                       # §21: models из session/new (ACP)
+        from . import grok_rpc
+        return await grok_rpc.probe_models()
+    if cli_type == "codex":                      # §20: model/list через app-server
+        from . import codex_rpc
+        return await codex_rpc.probe_models()
     # §cli-types: пока единственная ветка — claude. Codex/др. добавляются здесь
     # своей командой/парсером.
     if shutil.which("claude") is None:
@@ -150,6 +160,65 @@ async def probe_models(config, cwd: str,
     parsed = parse_model_line(raw)
     return {"cliType": cli_type, "models": parsed["models"],
             "current": parsed["current"], "raw": raw,
+            "auth_state": "OK", "cli_present": True}
+
+
+def parse_agy_models(text: str) -> tuple[list[str], dict[str, str]]:
+    """Вывод `agy models`: строки `<id>\t<Name>` (+ строка-заголовок без TAB)."""
+    ids: list[str] = []
+    names: dict[str, str] = {}
+    for line in text.splitlines():
+        if "\t" not in line:
+            continue
+        mid, _, name = line.partition("\t")
+        mid = mid.strip()
+        if mid and mid not in names:
+            ids.append(mid)
+            names[mid] = name.strip()
+    return ids, names
+
+
+async def probe_antigravity_models() -> dict[str, Any]:
+    """§multi-cli: список моделей Antigravity — `agy models`. Не залогинен →
+    AUTH_REQUIRED без запуска процесса; нет бинарника → NO_CLI."""
+    from . import agy_auth
+    binary = cli_registry.find_binary("antigravity")
+    base = {"cliType": "antigravity", "models": [], "current": None, "raw": ""}
+    if binary is None:
+        return {**base, "auth_state": "NO_CLI", "cli_present": False}
+    if not agy_auth.alt_record() and not agy_auth.is_logged_in():
+        return {**base, "auth_state": "AUTH_REQUIRED", "cli_present": True}
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            binary, "models", stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+            env=cli_registry.spawn_env("antigravity", binary,
+                                       agy_auth.agy_extra_env(with_home=True)))
+    except OSError as e:
+        log.warning("models.agy_probe_failed", err=repr(e))
+        return {**base, "auth_state": "ERROR", "cli_present": True}
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), _PROBE_TIMEOUT)
+    except (asyncio.TimeoutError, asyncio.CancelledError) as e:
+        # M1: зависший `agy models` — убить и дождаться (без зомби/утечки fd)
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        await proc.wait()
+        if isinstance(e, asyncio.CancelledError):
+            raise
+        log.warning("models.agy_probe_failed", err=repr(e))
+        return {**base, "auth_state": "ERROR", "cli_present": True}
+    raw = out.decode(errors="replace").strip()
+    ids, names = parse_agy_models(raw)
+    if proc.returncode != 0 or not ids:
+        low = raw.lower()
+        state = ("AUTH_REQUIRED" if any(m in low for m in (
+            "sign in", "log in", "login", "not eligible", "unauthenticated"))
+                 else "ERROR")
+        return {**base, "raw": raw, "auth_state": state, "cli_present": True}
+    return {**base, "models": ids, "names": names, "raw": raw,
             "auth_state": "OK", "cli_present": True}
 
 

@@ -17,6 +17,7 @@ from typing import Any, Awaitable, Callable
 import structlog
 
 from .. import i18n
+from ..core import secrets_redact
 from ..protocol import make_frame
 from ..store.chats import ChatStore
 
@@ -102,6 +103,13 @@ class Hub:
     def conn_device(self, conn_id: int) -> str | None:
         return self._conn_device.get(conn_id)
 
+    def conn_has_cap(self, conn_id: int, cap: str) -> bool:
+        """§multi-cli гейт: объявило ли соединение возможность cap."""
+        return cap in self._conn_caps.get(conn_id, frozenset())
+
+    def any_conn_has_cap(self, cap: str) -> bool:
+        return any(cap in c for c in self._conn_caps.values())
+
     def conn_subs(self, conn_id: int) -> set[str]:
         """Чаты, на которые подписано соединение (для пересчёта при caps-апдейте)."""
         entry = self._conns.get(conn_id)
@@ -173,11 +181,17 @@ class Hub:
             self._store.append_transcript(chat_id, frame)
 
     async def publish(self, chat_id: str, ftype: str, payload: dict[str, Any],
-                      journal: bool = True) -> dict:
-        """Событие чата: журнал + постоянный транскрипт + рассылка подписчикам."""
+                      journal: bool = True,
+                      require_cap: str | None = None) -> dict:
+        """Событие чата: журнал + постоянный транскрипт + рассылка подписчикам.
+
+        require_cap (§multi-cli): фрейм журналится для всех, но по живым
+        сокетам идёт только соединениям с этой возможностью (остальные получат
+        его на resume — тоже с фильтром, см. сервер)."""
         # §i18n: Msg → английский текст + <f>_key/<f>_args — ключ переживает
         # запись в журнал (локализуется под язык соединения при отправке/resume).
-        frame = make_frame(ftype, i18n.expand_msgs(payload), chat_id)
+        frame = make_frame(
+            ftype, secrets_redact.redact_payload(i18n.expand_msgs(payload)), chat_id)
         # Фреймы, пропускаемые ОБОИМИ журналами (snapshot, ~12/с в shell-чате),
         # не берут lock и не прыгают в поток — у них нет претензии на порядок
         # файлов, иначе они копились бы за идущим _shed_pending (до ~100МБ).
@@ -188,7 +202,7 @@ class Hub:
             # lock. fanout — ПОСЛЕ (инвариант §5.1 «журнал до отправки»).
             async with self._write_lock(chat_id):
                 await asyncio.to_thread(self._journal, chat_id, ftype, frame)
-        delivered = await self._fanout(chat_id, frame)
+        delivered = await self._fanout(chat_id, frame, require_cap)
         # §obs: кадр сгенерён, но подписчиков нет → лёг только в журнал (уедет
         # на resume). Рост таких строк = очередь копится (клиент отвалился/в фоне).
         if journal and delivered == 0 and ftype not in self._TRANSCRIPT_SKIP:
@@ -216,22 +230,53 @@ class Hub:
         """Соединение ещё зарегистрировано (не закрыто)."""
         return conn_id in self._conns
 
-    async def send_global(self, conn_id: int, frame: dict):
-        """Системный фрейм (hello, chat_list, pong, error) одному соединению."""
+    @staticmethod
+    def _redact_frame(frame: dict) -> dict:
+        """§auth: редакция секретов в глобальных кадрах (у publish — своя, до
+        журнала). Копия; оригинал не меняется."""
+        payload = frame.get("payload")
+        if not isinstance(payload, dict):
+            return frame
+        return {**frame, "payload": secrets_redact.redact_payload(payload)}
+
+    async def send_global(self, conn_id: int, frame: dict, *,
+                          redact: bool = True):
+        """Системный фрейм (hello, chat_list, pong, error) одному соединению.
+        redact=False — для кадров-реплеев журнала (resume_response/log_response):
+        события в журнале уже редактированы при publish, а повторный regex по
+        всему хвосту транскрипта стопорил бы event loop."""
         entry = self._conns.get(conn_id)
         if entry:
-            await self._safe_send(conn_id, entry[0], frame)
+            await self._safe_send(conn_id, entry[0],
+                                  self._redact_frame(frame) if redact else frame)
 
-    async def broadcast_global(self, frame: dict):
-        """Системная нотификация всем соединениям (chat_created и т.п.)."""
+    async def broadcast_variants(self, legacy: dict, capable: dict,
+                                 cap: str) -> None:
+        """§multi-cli: глобальная рассылка в двух вариантах — соединениям с cap
+        уходит `capable`, остальным `legacy` (wire как до фичи)."""
         targets = list(self._conns.items())
         if targets:
-            await asyncio.gather(*(self._safe_send(cid, send, frame)
-                                   for cid, (send, _) in targets))
+            legacy, capable = self._redact_frame(legacy), self._redact_frame(capable)
+            await asyncio.gather(*(
+                self._safe_send(cid, send,
+                                capable if self.conn_has_cap(cid, cap) else legacy)
+                for cid, (send, _) in targets))
 
-    async def _fanout(self, chat_id: str, frame: dict) -> int:
+    async def broadcast_global(self, frame: dict, require_cap: str | None = None):
+        """Системная нотификация всем соединениям (chat_created и т.п.)."""
+        targets = [(cid, send) for cid, (send, _) in list(self._conns.items())
+                   if require_cap is None or self.conn_has_cap(cid, require_cap)]
+        if targets:
+            frame = self._redact_frame(frame)
+            await asyncio.gather(*(self._safe_send(cid, send, frame)
+                                   for cid, send in targets))
+
+    async def _fanout(self, chat_id: str, frame: dict,
+                      require_cap: str | None = None) -> int:
         targets = [(cid, send) for cid, (send, subs) in list(self._conns.items())
-                   if chat_id in subs]
+                   if chat_id in subs
+                   and (require_cap is None
+                        or self.conn_has_cap(cid, require_cap))]
         if targets:
             # gather: зависший подписчик не задержит доставку остальным (его send
             # отвалится по таймауту в _safe_send). delivered = число адресатов

@@ -38,6 +38,16 @@ class Err:
     # §netwait: операция сама превысила серверный hard-timeout / прервана клиентом.
     OP_TIMEOUT = "OP_TIMEOUT"
     OP_ABORTED = "OP_ABORTED"
+    # §multi-cli (§18.9): неизвестный тип CLI / CLI не установлен на сервере.
+    CLI_UNKNOWN = "CLI_UNKNOWN"
+    CLI_UNAVAILABLE = "CLI_UNAVAILABLE"
+    # §cli-pins: фоновая установка CLI (set_cli/create_chat на неустановленный) не удалась.
+    CLI_INSTALL_FAILED = "CLI_INSTALL_FAILED"
+    # §auth: способ входа не поддерживается этим CLI / недопустимый base_url.
+    AUTH_METHOD_UNSUPPORTED = "AUTH_METHOD_UNSUPPORTED"
+    BAD_BASE_URL = "BAD_BASE_URL"
+    # §auth: способ входа сменили — текущий ход прерван (отправьте сообщение снова).
+    AUTH_CHANGED = "AUTH_CHANGED"
 
 
 class BadFrame(Exception):
@@ -172,11 +182,20 @@ class SetModePayload(_Payload):
     permission_mode: Literal["default", "acceptEdits", "bypassPermissions"]
 
 
+class SetCliPayload(_Payload):
+    """§multi-cli (§18.5): сделать активным другой CLI в чате. Контекст между
+    CLI не переносится; сессия нового CLI поднимается на следующем user_msg."""
+    cliType: str = Field(min_length=1, max_length=40)
+
+
 class SetModelPayload(_Payload):
     # §models: выбор модели чата. Пустая строка → сброс к дефолту CLI.
     # Значение — алиас (sonnet/opus/…) или полный id; не валидируем против
     # списка (CLI сам принимает и алиасы, и полные имена).
     model: str = Field(default="", max_length=200)
+    # §20: уровень рассуждения (Codex: low…ultra из models_list.efforts) для
+    # активного CLI чата; None — не менять, "" — сбросить к умолчанию модели.
+    effort: str | None = Field(default=None, max_length=20)
 
 
 class ListModelsPayload(_Payload):
@@ -223,6 +242,14 @@ class GetLogPayload(_Payload):
 
 class AuthCodePayload(_Payload):
     code: str = Field(min_length=1)
+    # §multi-cli (§18.7): чей это вход; без поля — claude (как до фичи).
+    cliType: str = Field(default="claude", max_length=40)
+
+
+class CliTypePayload(_Payload):
+    """§multi-cli (§18.7): auth_start / logout / get_limits с необязательным
+    cliType. Старые клиенты шлют пустой payload → claude/активный CLI чата."""
+    cliType: str | None = Field(default=None, max_length=40)
 
 
 class OpAbortPayload(_Payload):
@@ -235,8 +262,10 @@ class AuthApiKeyPayload(_Payload):
     """§altauth: авторизация прямым API-ключом (заголовок x-api-key).
     base_url — опционально (кастомный Anthropic-совместимый endpoint;
     None → api.anthropic.com)."""
-    api_key: str = Field(min_length=1)
-    base_url: str | None = None
+    api_key: str = Field(min_length=1, max_length=4096)
+    base_url: str | None = Field(default=None, max_length=500)
+    # §auth: чей это ключ; без поля — claude (как до фичи)
+    cliType: str = Field(default="claude", max_length=40)
 
 
 class OmniModel(_Payload):
@@ -267,6 +296,25 @@ class AuthOmniRoutePayload(_Payload):
     sonnet_model: str = ""
     haiku_model: str = ""
     default_tier: str = "haiku"
+
+
+class AuthTokenPayload(_Payload):
+    """§auth: готовый долгоживущий токен подписки (Claude: вывод `claude setup-token`,
+    sk-ant-oat…) — вставляется вместо ссылки+кода."""
+    cliType: str = Field(default="claude", max_length=40)
+    token: str = Field(min_length=20, max_length=4096)
+
+
+class AuthGatewayPayload(_Payload):
+    """§auth: шлюз/свой endpoint для любого CLI (обобщение §omni): ключ + base_url
+    + выбранные модели. Для Claude — то же, что auth_omniroute."""
+    cliType: str = Field(default="claude", max_length=40)
+    api_key: str = Field(min_length=1, max_length=4096)
+    base_url: str = Field(min_length=1, max_length=500)
+    models: list[OmniModel] = Field(default_factory=list, max_length=200)
+    active_id: str = Field(default="", max_length=200)
+    small_fast_id: str = Field(default="", max_length=200)
+    api_backend: str = Field(default="", max_length=40)
 
 
 class OmniRouteProbeModelsPayload(_Payload):
@@ -412,6 +460,7 @@ CLIENT_FRAME_TYPES: dict[str, tuple[type[_Payload], bool]] = {
     "create_chat": (CreateChatPayload, False),
     "set_mode": (SetModePayload, True),
     "set_model": (SetModelPayload, True),
+    "set_cli": (SetCliPayload, True),
     "list_models": (ListModelsPayload, False),
     "schedule_message": (ScheduleMessagePayload, True),
     "cancel_scheduled": (CancelScheduledPayload, True),
@@ -429,17 +478,19 @@ CLIENT_FRAME_TYPES: dict[str, tuple[type[_Payload], bool]] = {
     "resume": (ResumePayload, True),
     "ping": (EmptyPayload, False),
     # §13: авторизация Claude на сервере (глобальные, без chatId)
-    "auth_start": (EmptyPayload, False),
+    "auth_start": (CliTypePayload, False),
     "auth_code": (AuthCodePayload, False),
     "auth_apikey": (AuthApiKeyPayload, False),
     "auth_omniroute": (AuthOmniRoutePayload, False),
+    "auth_gateway": (AuthGatewayPayload, False),
+    "auth_token": (AuthTokenPayload, False),
     # §omni: каталог моделей шлюза (шаг 1) + сохранение выбора (шаг 1)
     "omniroute_probe_models": (OmniRouteProbeModelsPayload, False),
     "omniroute_set_models": (OmniRouteSetModelsPayload, False),
     "omniroute_set_key": (OmniRouteSetKeyPayload, False),
     # §netwait: прервать долгую операцию (глобальный, без chatId)
     "op_abort": (OpAbortPayload, False),
-    "logout": (EmptyPayload, False),
+    "logout": (CliTypePayload, False),
     # §14: лог приложения-клиента (глобальный, без chatId)
     "client_log": (ClientLogPayload, False),
     # §push: клиент сообщает notifyKey для APNs-пушей (глобальный, без chatId)
@@ -468,7 +519,7 @@ CLIENT_FRAME_TYPES: dict[str, tuple[type[_Payload], bool]] = {
     "remove_mcp": (RemoveMcpPayload, True),
     # §limits: лимиты подписки (5ч/недельное окна). per-chat — ответ приходит
     # в активный чат карточкой.
-    "get_limits": (EmptyPayload, True),
+    "get_limits": (CliTypePayload, True),
 }
 
 

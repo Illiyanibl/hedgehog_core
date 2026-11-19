@@ -74,10 +74,11 @@ def parse_limits(headers) -> dict:
     }
 
 
-async def fetch_limits(config: Config) -> dict:
+async def fetch_limits(config: Config, token: str | None = None) -> dict:
     """Вернуть лимиты подписки {status, overageStatus, fiveHour, sevenDay}
-    или {'error': ...}. Токен НЕ логируем."""
-    token = config.load_oauth_token()
+    или {'error': ...}. Токен НЕ логируем. token — проверить конкретный токен
+    (вставленный пользователем), а не сохранённый."""
+    token = token or config.load_oauth_token()
     if not token:
         return {"error": "auth", "message": Msg("limits.not_authorized")}
     headers = {
