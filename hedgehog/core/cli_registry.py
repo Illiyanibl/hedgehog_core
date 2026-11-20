@@ -36,6 +36,8 @@ CAP_SKILLS = "skills"                    # скиллы (§3.7a-skills)
 # Antigravity по ACP правки идут без запроса (проверено на agy 1.5.0) — §18.8;
 # у Grok и Codex запрос на правки приходит.
 CAP_EDIT_GATE = "edit_gate"
+# §23: уровень рассуждения выбирается (models_list.efforts, set_model.effort).
+CAP_EFFORT = "effort"
 
 
 # Способы входа (cliStatus.authMethods[].id), docs/cli-auth-methods.md
@@ -99,7 +101,8 @@ CLI_SPECS: dict[str, CliSpec] = {
         title="Claude Code",
         capabilities=(CAP_MODELS, CAP_SET_MODEL, CAP_LIMITS,
                       CAP_PERMISSION_MODES, CAP_MCP, CAP_CLEAR_SESSION,
-                      CAP_INTERRUPT, CAP_RESUME, CAP_SKILLS, CAP_EDIT_GATE),
+                      CAP_INTERRUPT, CAP_RESUME, CAP_SKILLS, CAP_EDIT_GATE,
+                      CAP_EFFORT),
         binary="claude",
         bundled=True,
         auth_methods=(AuthMethod(AUTH_LINK_CODE),
@@ -127,7 +130,7 @@ CLI_SPECS: dict[str, CliSpec] = {
         title="OpenAI Codex",
         capabilities=(CAP_MODELS, CAP_SET_MODEL, CAP_LIMITS,
                       CAP_PERMISSION_MODES, CAP_MCP, CAP_CLEAR_SESSION,
-                      CAP_INTERRUPT, CAP_RESUME, CAP_EDIT_GATE),
+                      CAP_INTERRUPT, CAP_RESUME, CAP_EDIT_GATE, CAP_EFFORT),
         binary="codex",
         legacy_visible=False,
         experimental=True,        # codex app-server у OpenAI — experimental
@@ -143,7 +146,7 @@ CLI_SPECS: dict[str, CliSpec] = {
         # лимитов через ACP нет (`grok usage` — только в TUI) → без CAP_LIMITS
         capabilities=(CAP_MODELS, CAP_SET_MODEL, CAP_PERMISSION_MODES, CAP_MCP,
                       CAP_CLEAR_SESSION, CAP_INTERRUPT, CAP_RESUME,
-                      CAP_EDIT_GATE),
+                      CAP_EDIT_GATE, CAP_EFFORT),
         binary="grok",
         legacy_visible=False,
         experimental=True,        # новый CLI xAI, промо-доступ, ACP может меняться

@@ -36,7 +36,7 @@ import secrets
 import time
 from collections import deque
 from pathlib import Path
-from typing import Any
+from typing import Any, get_args
 
 import structlog
 from claude_agent_sdk import (
@@ -54,6 +54,7 @@ from claude_agent_sdk import (
     ToolUseBlock,
     UserMessage,
 )
+from claude_agent_sdk.types import EffortLevel
 
 from ..config import Config
 from ..i18n import Msg
@@ -326,6 +327,28 @@ def build_auth_env(config: Config) -> tuple[dict[str, str], str | None]:
         if oauth:
             env["CLAUDE_CODE_OAUTH_TOKEN"] = oauth
     return env, model_override
+
+
+def claude_via_gateway(config: Config) -> bool:
+    """§23: Claude ходит НЕ напрямую в Anthropic (omniroute-шлюз или API-ключ с
+    кастомным base_url). Тогда уровень рассуждения не выбирается (efforts []) и
+    opts["effort"] не передаём — шлюз флаг может не понять."""
+    env, _ = build_auth_env(config)
+    return "ANTHROPIC_BASE_URL" in env
+
+
+# §23: допустимые значения opts["effort"] — ровно EffortLevel пина SDK.
+SDK_EFFORT_LEVELS: frozenset[str] = frozenset(get_args(EffortLevel))
+
+
+def claude_effort_opt(meta: ChatMeta, env: dict[str, str]) -> str | None:
+    """Значение opts["effort"] для сессии Claude: сохранённый
+    cliSessions.claude.effort, если он ∈ EffortLevel SDK и Claude не под шлюзом
+    (env из build_auth_env без ANTHROPIC_BASE_URL). Иначе None — флаг не шлём."""
+    if "ANTHROPIC_BASE_URL" in env:
+        return None
+    eff = (meta.cliSessions.get("claude") or {}).get("effort")
+    return eff if isinstance(eff, str) and eff in SDK_EFFORT_LEVELS else None
 
 
 class ClaudeSession(HedgehogToolHost):
@@ -820,6 +843,11 @@ class ClaudeSession(HedgehogToolHost):
             # §models: явно выбранная в чате модель перекрывает дефолт тира.
             if self.meta.model:
                 opts["model"] = self.meta.model
+            # §23: уровень рассуждения (--effort) — только из EffortLevel SDK и
+            # только при прямом Anthropic (под шлюзом/base_url флаг не шлём).
+            eff = claude_effort_opt(self.meta, env)
+            if eff is not None:
+                opts["effort"] = eff
             # §text-tools: под omniroute шлюз может коверкать имена MCP-тулов
             # (`mcp__hedgehog__X` → `mcp_hedgehog_X_<hash>`) — замечено у провайдера
             # antigravity (`agy/*`), ломает нативный tool-use даже для Claude; у

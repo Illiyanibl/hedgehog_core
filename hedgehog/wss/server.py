@@ -41,6 +41,7 @@ from ..core.session_base import AgentSession, SessionClosed
 from ..core.hedgehog_mcp import BUILTIN_MCP_NAME
 from ..core.pty_session import PtySession
 from ..core import models
+from ..core import effort as effort_mod
 from ..core.gateways import omniroute as omniroute_gw
 from ..protocol import (
     Attachment,
@@ -600,7 +601,7 @@ class HedgehogServer:
             sig = json.dumps(omni, sort_keys=True, default=str)
             if sig != self._omni_models_sig:
                 self._omni_models_sig = sig
-                await self.hub.broadcast_global(make_frame("models_list", omni))
+                await self._broadcast_models_list(omni, models.DEFAULT_CLI_TYPE)
             # §multi-cli: другие CLI омни не касается — их модели обновляем.
             if all(t == models.DEFAULT_CLI_TYPE for t in models.KNOWN_CLI_TYPES):
                 return self._MODELS_TTL
@@ -655,11 +656,7 @@ class HedgehogServer:
                          n=len(data["models"]), current=data.get("current"))
                 # §models L1: клиенты на PENDING узнают о готовности.
                 # Типы, скрытые от старых клиентов (§18.3), — только multi_cli.
-                spec = cli_registry.spec_for(cli_type)
-                await self.hub.broadcast_global(
-                    make_frame("models_list", data),
-                    require_cap=(None if spec is None or spec.legacy_visible
-                                 else cli_registry.MULTI_CLI_CAP))
+                await self._broadcast_models_list(data, cli_type)
                 if cli_type in self._cli_token_rejected:   # MED-1: токен снова работает
                     self._cli_token_rejected.discard(cli_type)
                     await self._broadcast_cli_status(cli_type)
@@ -709,11 +706,21 @@ class HedgehogServer:
             if m.addressee == "claude" and m.cliType != models.DEFAULT_CLI_TYPE:
                 # §multi-cli: чат сейчас на другом CLI — сбрасываем только
                 # сохранённую модель Claude, активную (чужого CLI) не трогаем.
-                if (m.cliSessions.get("claude") or {}).get("model"):
-                    self.store.set_cli_state(m.chatId, "claude", model=None)
+                # §23: и уровень — под новым способом входа он мог стать
+                # недоступным (шлюз).
+                st = m.cliSessions.get("claude") or {}
+                if st.get("model") or st.get("effort"):
+                    updated = self.store.set_cli_state(
+                        m.chatId, "claude", model=None, effort=None)
+                    if updated is not None:     # L6: как M4 — клиент видит сброс
+                        await self._broadcast_meta("chat_updated", updated)
                 continue
-            if getattr(m, "model", None):
+            st = m.cliSessions.get("claude") or {}
+            if getattr(m, "model", None) or st.get("effort"):
                 updated = self.store.update_meta(m.chatId, model=None)
+                if updated is not None and st.get("effort"):
+                    updated = self.store.set_cli_state(
+                        m.chatId, "claude", effort=None) or updated
                 if updated is not None:
                     await self._broadcast_meta("chat_updated", updated)
 
@@ -1462,27 +1469,55 @@ class HedgehogServer:
         # §models/§cli-types: отдаём кэш нужного типа CLI МГНОВЕННО (CLI не
         # дёргаем). Неизвестный тип → UNSUPPORTED; нет кэша → PENDING + будим
         # фоновый рефрешер.
-        cli_type = p.cliType
+        data = self._models_data(p.cliType)
+        if data.get("auth_state") == "PENDING":
+            self._models_refresh_now.set()
+        if not self.hub.conn_has_cap(conn_id, cli_registry.MULTI_CLI_CAP):
+            data = effort_mod.strip(data)     # §23: legacy — прежняя форма
+        await self.hub.send_global(
+            conn_id, make_frame("models_list", data))
+        return
+
+    def _models_data(self, cli_type: str) -> dict:
+        """models_list типа CLI в форме §23 (efforts/defaultEfforts/
+        effortsDefault). Неизвестный тип → UNSUPPORTED; нет кэша → PENDING."""
         if cli_type not in models.KNOWN_CLI_TYPES:
             data = {"cliType": cli_type, "models": [], "current": None,
                     "raw": "", "auth_state": "UNSUPPORTED",
                     "cli_present": False, "updated_at": 0}
-        elif (omni := self._omniroute_models_list(cli_type)) is not None:
-            # §omni: при omniroute-авторизации источник — ВЫБРАННЫЕ модели
-            # (шаг 1), а не CLI-проба. Тир-лимит (первые N) применяет клиент.
+        elif (cli_type == models.DEFAULT_CLI_TYPE
+              and (omni := self._omniroute_models_list(cli_type)) is not None):
+            # §omni: при omniroute-авторизации Claude источник — ВЫБРАННЫЕ
+            # модели (шаг 1), а не CLI-проба. Тир-лимит (первые N) применяет
+            # клиент. Других CLI omniroute (вход Claude) не касается.
             data = omni
         elif (gw := self._gateway_models_list(cli_type)) is not None:
             data = gw       # §auth: шлюз другого CLI — выбранные модели
         else:
+            # L7: load_cache уже нормализует — второй раз не гоняем (и auth
+            # не перечитываем ради признака шлюза Claude).
             data = models.load_cache(self.config, cli_type)
-            if data is None:
-                data = {"cliType": cli_type, "models": [], "current": None,
-                        "raw": "", "auth_state": "PENDING",
-                        "cli_present": None, "updated_at": 0}
-                self._models_refresh_now.set()
-        await self.hub.send_global(
-            conn_id, make_frame("models_list", data))
-        return
+            if data is not None:
+                return data
+            data = {"cliType": cli_type, "models": [], "current": None,
+                    "raw": "", "auth_state": "PENDING",
+                    "cli_present": None, "updated_at": 0}
+        return models.normalize(self.config, data, cli_type)
+
+    async def _broadcast_models_list(self, data: dict, cli_type: str) -> None:
+        """§23: рассылка models_list — multi_cli получают форму §23, остальные —
+        прежнюю (без efforts/defaultEfforts/effortsDefault). Типы, скрытые от
+        старых клиентов (§18.3), — только multi_cli."""
+        data = models.normalize(self.config, data, cli_type)
+        spec = cli_registry.spec_for(cli_type)
+        if spec is not None and not spec.legacy_visible:
+            await self.hub.broadcast_global(
+                make_frame("models_list", data),
+                require_cap=cli_registry.MULTI_CLI_CAP)
+            return
+        await self.hub.broadcast_variants(
+            make_frame("models_list", effort_mod.strip(data)),
+            make_frame("models_list", data), cli_registry.MULTI_CLI_CAP)
 
     async def _h_create_chat(self, conn_id, frame, p):
         # cwd задан клиентом → используем его. Иначе, если сервер знает
@@ -1780,17 +1815,40 @@ class HedgehogServer:
         new_model = "".join(
             ch for ch in (p.model or "").strip() if ch.isprintable()
         ) or None
+        # §23: effort валидируем ДО записи — при ошибке мета не меняется вовсе
+        # (ни модель, ни уровень). Отсутствует → не менять (но уровень, не
+        # допустимый для новой модели, сбрасывается); "" → null.
+        req_effort = getattr(p, "effort", None)
+        stored = new_effort = None
+        if meta is not None and meta.addressee == "claude":
+            cli = meta.cliType
+            stored = new_effort = (meta.cliSessions.get(cli) or {}).get("effort")
+            data = self._models_data(cli)
+            if req_effort is not None:
+                # L4: как у model — только непечатаемые и пробелы по краям
+                # (длину ограничивает протокол); '-' и т.п. допустимы.
+                effort = "".join(ch for ch in req_effort
+                                 if ch.isprintable()).strip() or None
+                try:
+                    new_effort = effort_mod.validate(data, new_model, effort,
+                                                     cli)
+                except effort_mod.UnknownEffort:
+                    await self.hub.send_global(conn_id, make_error(
+                        Err.BAD_FRAME, "unknown effort",
+                        chat_id=frame.chatId, related=frame.id))
+                    return
+            else:
+                new_effort = effort_mod.reconcile(data, new_model, stored, cli)
         updated = self.store.update_meta(frame.chatId, model=new_model)
         if updated is None:   # L: чат исчез (конкурентный delete) → vars(None)
             return
-        if p.effort is not None:       # §20: уровень рассуждения активного CLI
-            effort = "".join(ch for ch in p.effort.strip()
-                             if ch.isalnum()) or None
+        if updated.addressee == "claude" and (new_effort != stored
+                                              or req_effort is not None):
             updated = self.store.set_cli_state(
-                frame.chatId, updated.cliType, effort=effort) or updated
+                frame.chatId, updated.cliType, effort=new_effort) or updated
         await self._restart_session(frame.chatId)
         log.info("chat.model_changed", chat=frame.chatId, model=new_model,
-                 effort=p.effort)
+                 effort=new_effort)
         await self._broadcast_meta("chat_updated", updated)
         return
 
@@ -3227,7 +3285,8 @@ class HedgehogServer:
         M4: каждому чату со сброшенной моделью — chat_updated (как у Claude в
         _reset_all_chat_models), клиент не держит протухший выбор."""
         for m in self.store.list():                      # модели прежнего способа
-            if (m.cliSessions.get(cli) or {}).get("model"):
+            st = m.cliSessions.get(cli) or {}
+            if st.get("model") or st.get("effort"):
                 updated = self.store.set_cli_state(m.chatId, cli, model=None,
                                                    effort=None)
                 if updated is not None:
@@ -3561,7 +3620,8 @@ class HedgehogServer:
                                                         auth_store.GATEWAY):
             # CLI с фиксированными моделями (Antigravity) под ключом: каталог API
             return {"cliType": cli_type, "models": list(rec["catalog"]),
-                    "names": {i: i for i in rec["catalog"]}, "current": None,
+                    "names": {i: i for i in rec["catalog"]},
+                    "efforts": {i: [] for i in rec["catalog"]}, "current": None,
                     "source": "api", "raw": "", "auth_state": "OK",
                     "cli_present": True, "updated_at": 0}
         if rec.get("method") != auth_store.GATEWAY or not rec.get("models"):
@@ -3569,13 +3629,17 @@ class HedgehogServer:
         sel = rec["models"]
         return {"cliType": cli_type, "models": [m["id"] for m in sel],
                 "names": {m["id"]: m.get("name") or m["id"] for m in sel},
+                "efforts": {m["id"]: [] for m in sel},   # §23: под шлюзом не выбирается
                 "current": rec.get("active_id"), "source": "gateway", "raw": "",
                 "auth_state": "OK", "cli_present": True, "updated_at": 0}
 
     def _omniroute_models_list(self, cli_type: str) -> dict | None:
         """§omni: models_list из ВЫБРАННЫХ моделей (если активна omniroute-авториз.
         нового вида). Иначе None → обычный источник (CLI-проба). Тир НЕ режем —
-        отдаём всё, первые N покажет клиент."""
+        отдаём всё, первые N покажет клиент. omniroute — способ входа Claude:
+        для других CLI всегда None (их список — свой)."""
+        if cli_type != models.DEFAULT_CLI_TYPE:
+            return None
         auth = self.config.load_auth_config()
         if auth.get("mode") != "omniroute" or not auth.get("active_id"):
             return None
@@ -3590,6 +3654,7 @@ class HedgehogServer:
             "cliType": cli_type,
             "models": [m["id"] for m in sel],                       # compat: id-строки
             "names": {m["id"]: _label(m) for m in sel},             # id→«алиас/имя»
+            "efforts": {m["id"]: [] for m in sel},                  # §23: шлюз
             "current": auth.get("active_id"),
             "source": "omniroute",
             "raw": "", "auth_state": "OK",

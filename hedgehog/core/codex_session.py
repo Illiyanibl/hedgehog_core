@@ -27,7 +27,7 @@ from ..i18n import Msg
 from ..ids import new_ulid
 from ..protocol import Err
 from .acp_client import AcpClient, AcpClosed, AcpRpcError
-from . import codex_auth
+from . import auth_store, codex_auth
 from .acp_common import clip_text, has_http_code
 from .agent_session_base import MCP_BRIDGE, AgentSessionBase
 from .claude_session import HEDGEHOG_FORMULA_APPEND, HEDGEHOG_SYSTEM_APPEND
@@ -408,8 +408,10 @@ class CodexSession(AgentSessionBase):
         params: dict[str, Any] = {
             "threadId": self._thread_id,
             "input": [{"type": "text", "text": prompt}]}
+        # §23 M2: под шлюзом уровень не выбирается (как claude_effort_opt) —
+        # сохранённый effort прежнего способа входа не шлём.
         effort = self._state().get("effort")
-        if effort:
+        if effort and codex_auth.alt_record().get("method") != auth_store.GATEWAY:
             params["effort"] = effort
         res = await client.request("turn/start", params, timeout=60)
         self._turn_id = ((res or {}).get("turn") or {}).get("id")

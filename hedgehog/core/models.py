@@ -32,8 +32,8 @@ from claude_agent_sdk import (
     query,
 )
 
-from . import cli_registry
-from .claude_session import build_auth_env, is_auth_error
+from . import cli_registry, effort
+from .claude_session import build_auth_env, claude_via_gateway, is_auth_error
 
 log = structlog.get_logger("models")
 
@@ -242,12 +242,21 @@ def _valid_cache(data: Any) -> bool:
             and all(isinstance(x, str) for x in data["models"]))
 
 
+def normalize(config, data: dict[str, Any],
+              cli_type: str = DEFAULT_CLI_TYPE) -> dict[str, Any]:
+    """§23: models_list в форме контракта effort (efforts у каждой модели,
+    effortsDefault, по возрастанию). Claude под шлюзом/base_url → []."""
+    gw = cli_type == DEFAULT_CLI_TYPE and claude_via_gateway(config)
+    return effort.normalize(data, cli_type, gateway=gw)
+
+
 def load_cache(config, cli_type: str = DEFAULT_CLI_TYPE) -> dict[str, Any] | None:
     try:
         data = json.loads(cache_path(config, cli_type).read_text())
     except (OSError, ValueError):
         return None
-    return data if _valid_cache(data) else None
+    # §23: старые кэши на диске (без efforts / с убывающим порядком Grok)
+    return normalize(config, data, cli_type) if _valid_cache(data) else None
 
 
 def save_cache(config, data: dict[str, Any],

@@ -4,4 +4,3 @@ structlog>=24.1
 claude-agent-sdk==0.2.182
 aiohttp>=3.10
 cryptography>=42.0
-pytest>=8.0

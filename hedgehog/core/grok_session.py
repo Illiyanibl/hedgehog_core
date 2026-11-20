@@ -27,7 +27,7 @@ from ..protocol import Err
 from .acp_client import AcpClient, AcpRpcError
 from .acp_common import clip_input, has_http_code
 from .acp_session import AcpSessionBase
-from . import grok_auth, grok_rpc
+from . import auth_store, grok_auth, grok_rpc
 from .claude_session import HEDGEHOG_FORMULA_APPEND, HEDGEHOG_SYSTEM_APPEND
 from .tool_names import normalize_tool_name
 
@@ -122,14 +122,16 @@ class GrokSession(AcpSessionBase):
         state = self._state()
         model = state.get("model") or self.meta.model
         rec = grok_auth.alt_record()
-        if rec.get("method") == "gateway":
+        effort = state.get("effort")
+        if rec.get("method") == auth_store.GATEWAY:
+            effort = None        # §23 M2: под шлюзом уровень не выбирается
             ids = {m.get("id") for m in rec.get("models") or []}
             if model not in ids:                     # модель прежнего способа не годится
                 model = rec.get("active_id")
             if model:
                 model = grok_rpc.gateway_key(model)  # запись [model.<key>] из config.toml
         for cfg, value in (("model", model),
-                           ("reasoning_effort", state.get("effort"))):
+                           ("reasoning_effort", effort)):
             if not value:
                 continue
             try:

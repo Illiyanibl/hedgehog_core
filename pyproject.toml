@@ -11,7 +11,3 @@ dependencies = [
     "aiohttp>=3.10",
     "cryptography>=42.0",
 ]
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-asyncio_mode = "auto"
