@@ -104,7 +104,7 @@ class CliAuthService:
         await self.codex_auth.stop()
         await self.grok_auth.stop()
 
-    def _auth_lock(self, cli: str) -> asyncio.Lock:
+    def auth_lock(self, cli: str) -> asyncio.Lock:
         lock = self._auth_locks.get(cli)
         if lock is None:
             lock = self._auth_locks[cli] = asyncio.Lock()
@@ -454,7 +454,7 @@ class CliAuthService:
             await self.auth.stop()
             log.info("auth.quiet_stop_login")
 
-    async def _on_chat_auth_required(self):
+    async def on_chat_auth_required(self):
         """Хук claude-сессии при AUTH_REQUIRED. Для omniroute/apikey НЕ поднимаем
         OAuth-флоу подписки: AUTH_REQUIRED в этих режимах = отказ шлюза/ключа, а
         не повод запускать setup-token, который юзер не завершит → через 600с
@@ -732,7 +732,7 @@ class CliAuthService:
         if mgr is None:
             return await self._cli_auth_err(conn_id, frame, Err.CLI_UNAVAILABLE,
                                             f"{cli!r} has no auth flow")
-        async with self._auth_lock(cli):    # не стартуем вход посреди смены способа
+        async with self.auth_lock(cli):    # не стартуем вход посреди смены способа
             if auth_store.active_method(self.config, cli) != auth_store.SUBSCRIPTION:
                 # активен API-ключ/шлюз: вход по подписке — только после выхода из него
                 await self.hub.send_global(conn_id, make_frame("auth_result", {
@@ -757,7 +757,7 @@ class CliAuthService:
     async def _cli_logout(self, conn_id, cli: str):
         # весь выход (от quiesce до cli_status) — под замком CLI; очередь
         # возобновляем строго после выхода из него
-        async with self._auth_lock(cli):
+        async with self.auth_lock(cli):
             pending = await self._cli_logout_locked(cli)
         await self.host._resume_queued(pending)
 
@@ -793,10 +793,10 @@ class CliAuthService:
         """§auth: активировать API-ключ или шлюз не-Claude CLI. Проверяет ключ
         запросом каталога моделей, пишет auth.<cli>.json (0600), гасит вход по
         подписке, прерывает сессии CLI с ошибкой. Возвращает payload auth_result.
-        Весь процесс — под _auth_lock(cli): две активации подряд исполняются
+        Весь процесс — под auth_lock(cli): две активации подряд исполняются
         строго по очереди (итог = последняя), очередь чатов возобновляется
         после выхода из замка."""
-        async with self._auth_lock(cli):
+        async with self.auth_lock(cli):
             res, pending = await self._activate_cli_alt_locked(
                 cli, method, api_key, base_url, op_id, models_sel=models_sel,
                 active_id=active_id, api_backend=api_backend)
@@ -883,7 +883,7 @@ class CliAuthService:
 
     async def _after_auth_change(self, cli: str) -> None:
         """Способ входа CLI изменился (сессии уже остановлены quiesce): сбросить
-        выбор модели/кэш, оповестить клиентов (cli_status). Под _auth_lock.
+        выбор модели/кэш, оповестить клиентов (cli_status). Под auth_lock.
         M4: каждому чату со сброшенной моделью — chat_updated (как у Claude в
         _reset_all_chat_models), клиент не держит протухший выбор."""
         for m in self.store.list():                      # модели прежнего способа
@@ -913,7 +913,7 @@ class CliAuthService:
             self.host._invalidate_models_cache()
             await self.host._broadcast_cli_status(cli)
 
-    async def _on_cli_auth_required(self, cli: str):
+    async def on_cli_auth_required(self, cli: str):
         """Хук сессии не-Claude CLI при AUTH_REQUIRED (ошибка в чат уже ушла).
         Ключ/шлюз отвергнуты — вход по подписке не поможет, ничего не делаем.
         Токен подписки на месте (CLI всё равно ответил 401) — для codex/grok вход

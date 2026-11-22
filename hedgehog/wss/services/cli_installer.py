@@ -65,7 +65,7 @@ class CliInstallService:
 
     # ---------- §multi-cli ----------
 
-    def _cli_present(self, cli_type: str) -> bool:
+    def cli_present(self, cli_type: str) -> bool:
         spec = cli_registry.spec_for(cli_type)
         if spec is None:
             return False
@@ -73,15 +73,15 @@ class CliInstallService:
             return True
         return cli_registry.find_binary(cli_type) is not None
 
-    def _cli_error(self, cli_type: str, *, allow_install: bool = False
+    def cli_error(self, cli_type: str, *, allow_install: bool = False
                    ) -> tuple[str, str] | None:
         """Валидация типа CLI для create_chat/set_cli: (код, текст) или None.
         allow_install: CLI не установлен, но в compat.json есть валидная запись
         для этой платформы (или установка уже идёт) — не ошибка, вызывающий
-        запустит фоновую установку (_start_cli_install)."""
+        запустит фоновую установку (start_cli_install)."""
         if cli_registry.spec_for(cli_type) is None:
             return Err.CLI_UNKNOWN, f"unknown cliType {cli_type!r}"
-        if not self._cli_present(cli_type):
+        if not self.cli_present(cli_type):
             if allow_install and (self._cli_installing(cli_type)
                                   or cli_install.installable(cli_type)):
                 return None
@@ -94,11 +94,11 @@ class CliInstallService:
         t = self._cli_install_tasks.get(cli)
         return t is not None and not t.done()
 
-    def _start_cli_install(self, cli: str, chat_id: str | None = None) -> None:
+    def start_cli_install(self, cli: str, chat_id: str | None = None) -> None:
         """Запустить фоновую установку CLI (single-flight): CLI не установлен,
         в compat.json есть запись. Ждущие сессии этого CLI (воркер,
         cli_install.wait_pending) стартуют после неё."""
-        if self._cli_present(cli):
+        if self.cli_present(cli):
             return
         if chat_id:
             self._cli_install_chats.setdefault(cli, set()).add(chat_id)
@@ -143,11 +143,11 @@ class CliInstallService:
                     require_cap=cli_registry.MULTI_CLI_CAP)
         await self.host._broadcast_cli_status(cli, install=True)   # present, installing: false
 
-    def _cli_status_snapshot(self) -> dict[str, dict]:
+    def cli_status_snapshot(self) -> dict[str, dict]:
         """hello.cliStatus (§18.3): present/auth_state/cliCapabilities по CLI."""
         out: dict[str, dict] = {}
         for cli_type, spec in cli_registry.CLI_SPECS.items():
-            present = self._cli_present(cli_type)
+            present = self.cli_present(cli_type)
             cache = models.load_cache(self.config, cli_type) if present else None
             if not present:
                 state = "NO_CLI"
@@ -187,13 +187,13 @@ class CliInstallService:
             return {"installable": True}
         return {}
 
-    async def _broadcast_cli_status(self, cli: str, *, install: bool = False) -> None:
+    async def broadcast_cli_status(self, cli: str, *, install: bool = False) -> None:
         """cli_status (§18.7) — глобально, только клиентам multi_cli.
         §cli-pins: поле installing — в кадрах фоновой установки (install=True:
         старт → true, итог → false) и пока она идёт; иначе поля нет (= false)."""
         if not self.hub.any_conn_has_cap(cli_registry.MULTI_CLI_CAP):
             return
-        snap = self._cli_status_snapshot().get(cli)
+        snap = self.cli_status_snapshot().get(cli)
         if snap is None:
             return
         payload = {

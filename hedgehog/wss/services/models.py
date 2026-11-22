@@ -63,7 +63,7 @@ class ModelsRefresher:
 
     async def shutdown(self) -> None:
         probe = self._models_probe_task   # захватываем ДО отмены (её обнулит finally)
-        self._cancel_models_probe()       # осиротевшую пробу тоже гасим
+        self.cancel_models_probe()       # осиротевшую пробу тоже гасим
         if self._models_task is not None:
             self._models_task.cancel()
             # L: gather(return_exceptions) поглощает CancelledError/исключение
@@ -151,7 +151,7 @@ class ModelsRefresher:
             except asyncio.CancelledError:
                 # Различаем отмену САМОГО рефрешера (shutdown отменил
                 # _models_task — у текущей таски есть pending-cancel) от отмены
-                # только пробы (user_msg → _cancel_models_probe отменил лишь
+                # только пробы (user_msg → cancel_models_probe отменил лишь
                 # дочернюю таску). Не полагаемся на флаг: он мог бы «проглотить»
                 # отмену рефрешера.
                 cur = asyncio.current_task()
@@ -179,7 +179,7 @@ class ModelsRefresher:
                          present=data.get("cli_present"))
         return self._MODELS_TTL
 
-    def _cancel_models_probe(self) -> None:
+    def cancel_models_probe(self) -> None:
         """§models M1: отменить фоновую пробу `/model` (пришёл user_msg — не
         держим второй CLI-процесс рядом с ходом). Проба толерантна к отмене;
         _refresh_models_once отличит эту отмену от отмены рефрешера по
@@ -188,11 +188,11 @@ class ModelsRefresher:
         if t is not None and not t.done():
             t.cancel()
 
-    def _invalidate_models_cache(self) -> None:
+    def invalidate_models_cache(self) -> None:
         """Смена авторизации: список моделей мог смениться. Гасим пробу в
         полёте (она под СТАРЫМИ кредами — иначе разослала бы стейл-список) и
         будим рефрешер на свежую пробу."""
-        self._cancel_models_probe()
+        self.cancel_models_probe()
         self._models_refresh_now.set()
 
     # ---------- list_models / models_list (§models, §23) ----------
@@ -201,7 +201,7 @@ class ModelsRefresher:
         # §models/§cli-types: отдаём кэш нужного типа CLI МГНОВЕННО (CLI не
         # дёргаем). Неизвестный тип → UNSUPPORTED; нет кэша → PENDING + будим
         # фоновый рефрешер.
-        data = self._models_data(p.cliType)
+        data = self.models_data(p.cliType)
         if data.get("auth_state") == "PENDING":
             self._models_refresh_now.set()
         if not self.hub.conn_has_cap(conn_id, cli_registry.MULTI_CLI_CAP):
@@ -210,7 +210,7 @@ class ModelsRefresher:
             conn_id, make_frame("models_list", data))
         return
 
-    def _models_data(self, cli_type: str) -> dict:
+    def models_data(self, cli_type: str) -> dict:
         """models_list типа CLI в форме §23 (efforts/defaultEfforts/
         effortsDefault). Неизвестный тип → UNSUPPORTED; нет кэша → PENDING."""
         if cli_type not in models.KNOWN_CLI_TYPES:

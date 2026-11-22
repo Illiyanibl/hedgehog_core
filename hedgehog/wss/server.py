@@ -250,7 +250,7 @@ class HedgehogServer:
         # §models M1: cron/планировщик/roster стартует ход в обход WS-хендлера
         # user_msg — гасим фоновую пробу тут же, иначе рядом с единственной
         # авторизацией окажутся два CLI-процесса.
-        self.models_refresher._cancel_models_probe()
+        self.models_refresher.cancel_models_probe()
         was_running = chat_id in self.sessions
         was_busy = self._chat_status(chat_id)["status"] == "busy"
         session = await self._ensure_session(meta)
@@ -352,7 +352,7 @@ class HedgehogServer:
             return
         echoed = False
         try:
-            self.models_refresher._cancel_models_probe()
+            self.models_refresher.cancel_models_probe()
             atts = [Attachment(fileId=str(a.get("fileId", "")),
                                mime=str(a.get("mime", "")),
                                name=str(a.get("name", "")))
@@ -506,7 +506,7 @@ class HedgehogServer:
 
     def _invalidate_models_cache(self) -> None:
         # Контракт хоста для CliAuthService/CliInstallService: делегируем.
-        self.models_refresher._invalidate_models_cache()
+        self.models_refresher.invalidate_models_cache()
 
     async def _reset_all_chat_models(self) -> None:
         """§models L2: смена режима авторизации → per-chat выбор модели может
@@ -587,7 +587,7 @@ class HedgehogServer:
                 "cliTypes": list(cli_registry.legacy_visible_cli_types()),
                 # §multi-cli (§18.3): присутствие/авторизация/возможности каждого
                 # CLI. Поле добавочное — старый клиент его игнорирует (§9.4).
-                "cliStatus": self.cli_installer._cli_status_snapshot(),
+                "cliStatus": self.cli_installer.cli_status_snapshot(),
             }))
             async for raw in ws:
                 # Кадр, дочитанный из буфера уже ПОСЛЕ закрытия клиентом (цикл
@@ -873,8 +873,8 @@ class HedgehogServer:
         if p.addressee == "claude":
             multi = self.hub.conn_has_cap(conn_id, cli_registry.MULTI_CLI_CAP)
             # §cli-pins: клиенту §18 — неустановленный CLI с пином ставим фоном
-            err = self.cli_installer._cli_error(p.cliType, allow_install=multi)
-            if err is None and not self.cli_installer._cli_present(p.cliType):
+            err = self.cli_installer.cli_error(p.cliType, allow_install=multi)
+            if err is None and not self.cli_installer.cli_present(p.cliType):
                 install_cli = p.cliType
             if err is not None and multi:
                 # §multi-cli (§18.4): клиент §18 выбирает из hello.cliStatus —
@@ -901,7 +901,7 @@ class HedgehogServer:
                  skills=seed_skills or [])
         await self._broadcast_meta("chat_created", meta)
         if install_cli is not None:
-            self.cli_installer._start_cli_install(install_cli, meta.chatId)
+            self.cli_installer.start_cli_install(install_cli, meta.chatId)
         return
 
     async def _h_delete_chat(self, conn_id, frame, p, meta):
@@ -951,7 +951,7 @@ class HedgehogServer:
 
     async def _broadcast_cli_status(self, cli: str, *, install: bool = False) -> None:
         # Контракт хоста для CliAuthService (AuthHost): делегируем в сервис.
-        await self.cli_installer._broadcast_cli_status(cli, install=install)
+        await self.cli_installer.broadcast_cli_status(cli, install=install)
 
     async def _broadcast_meta(self, ftype: str, meta: ChatMeta) -> None:
         """chat_created/chat_updated: клиентам multi_cli — с cliSessions (без
@@ -974,21 +974,21 @@ class HedgehogServer:
                 Err.BAD_FRAME, "set_cli: only for agent chats",
                 chat_id=frame.chatId, related=frame.id))
             return
-        err = self.cli_installer._cli_error(p.cliType, allow_install=True)
+        err = self.cli_installer.cli_error(p.cliType, allow_install=True)
         if err is not None:
             await self.hub.send_global(conn_id, make_error(
                 err[0], err[1], chat_id=frame.chatId, related=frame.id))
             return
-        if not self.cli_installer._cli_present(p.cliType):
+        if not self.cli_installer.cli_present(p.cliType):
             # §cli-pins: CLI нет, но есть пин — переключаем как обычно, ставим фоном
-            self.cli_installer._start_cli_install(p.cliType, frame.chatId)
+            self.cli_installer.start_cli_install(p.cliType, frame.chatId)
         # M3: идёт смена способа входа нового CLI — ждём её, иначе сессия под
         # чатовым замком стартовала бы со старыми кредами (между quiesce и save).
         # Коснуться-и-отпустить ДО _chat_lock: порядок auth→chat (как в
         # _ensure_session), иначе дедлок с активацией. MED-2: между отпусканием
-        # _auth_lock и захватом _chat_lock активация могла снова взять замок —
-        # тогда отпускаем _chat_lock, снова ждём _auth_lock и повторяем.
-        auth_lock = self.cli_auth._auth_lock(p.cliType)
+        # auth_lock и захватом _chat_lock активация могла снова взять замок —
+        # тогда отпускаем _chat_lock, снова ждём auth_lock и повторяем.
+        auth_lock = self.cli_auth.auth_lock(p.cliType)
         while True:
             async with auth_lock:
                 pass
@@ -1038,7 +1038,7 @@ class HedgehogServer:
         if meta is not None and meta.addressee == "claude":
             cli = meta.cliType
             stored = new_effort = (meta.cliSessions.get(cli) or {}).get("effort")
-            data = self.models_refresher._models_data(cli)
+            data = self.models_refresher.models_data(cli)
             if req_effort is not None:
                 # L4: как у model — только непечатаемые и пробелы по краям
                 # (длину ограничивает протокол); '-' и т.п. допустимы.
@@ -1423,7 +1423,7 @@ class HedgehogServer:
     async def _h_user_msg(self, conn_id, frame, p, meta):
         # §models M1: пришёл ход → гасим фоновую пробу /model, чтобы не
         # держать второй CLI-процесс рядом с единственной авторизацией.
-        self.models_refresher._cancel_models_probe()
+        self.models_refresher.cancel_models_probe()
         # Эхо (§4.15): в чат пишут несколько писателей (устройства
         # пользователя, менеджер-агент, cron) — журналим и рассылаем
         # входящее ДО исполнения, чтобы все клиенты видели полную ленту.
@@ -1479,7 +1479,7 @@ class HedgehogServer:
             return
         # §models M1: как в user_msg — гасим фоновую пробу /model, чтобы не
         # держать второй CLI-процесс рядом с единственной авторизацией.
-        self.models_refresher._cancel_models_probe()
+        self.models_refresher.cancel_models_probe()
         # M: поднимаем сессию (после рестарта Ёжика окно ре-пушится клиенту
         # из views_registry, а sessions пуст — с sessions.get нажатие молча
         # терялось бы).
@@ -1873,7 +1873,7 @@ class HedgehogServer:
         # (quiesce берёт chat_lock под auth_lock), обратный порядок дал бы дедлок.
         while True:
             fresh = self.store.get(meta.chatId) or meta
-            auth_lock = (self.cli_auth._auth_lock(fresh.cliType)
+            auth_lock = (self.cli_auth.auth_lock(fresh.cliType)
                          if fresh.addressee == "claude" else None)
             if auth_lock is not None:
                 async with auth_lock:
@@ -1884,7 +1884,7 @@ class HedgehogServer:
                 # «коснуться и отпустить» — тогда quiesce уже мог пройти этот
                 # чат, и сессия поднялась бы со старыми кредами. Перепроверяем
                 # под чатовым замком; занят → выходим из него и ждём снова.
-                lk = (self.cli_auth._auth_lock(fresh.cliType)
+                lk = (self.cli_auth.auth_lock(fresh.cliType)
                       if fresh.addressee == "claude" else None)
                 if lk is None or not lk.locked():
                     return await self._ensure_session_locked(fresh)
@@ -1922,8 +1922,8 @@ class HedgehogServer:
             cli_type = models.DEFAULT_CLI_TYPE
         # §cli-pins: CLI чата пропал/не доустановился (рестарт посреди
         # установки, сбой) — запускаем установку снова; воркер сессии её дождётся.
-        if not self.cli_installer._cli_present(cli_type) and cli_install.installable(cli_type):
-            self.cli_installer._start_cli_install(cli_type, meta.chatId)
+        if not self.cli_installer.cli_present(cli_type) and cli_install.installable(cli_type):
+            self.cli_installer.start_cli_install(cli_type, meta.chatId)
         return await getattr(self, self._AGENT_FACTORIES[cli_type])(meta, publish)
 
     # cliType → имя метода-фабрики (расширяется по мере появления CLI).
@@ -1948,7 +1948,7 @@ class HedgehogServer:
             meta, publish, chat_error, self.config,
             mcp_servers=await self._agent_mcp_servers(meta),
             on_session_id=save_session_id,
-            on_auth_required=functools.partial(self.cli_auth._on_cli_auth_required, cli),
+            on_auth_required=functools.partial(self.cli_auth.on_cli_auth_required, cli),
             on_status=self._chat_status_notifier(meta.chatId),
             scheduler=self.scheduler, roster=self._roster)
 
@@ -2012,7 +2012,7 @@ class HedgehogServer:
 
         session = ClaudeSession(meta, publish, chat_error, self.config,
                                 mcp_servers=mcp_servers,
-                                on_auth_required=self.cli_auth._on_chat_auth_required,
+                                on_auth_required=self.cli_auth.on_chat_auth_required,
                                 on_session_id=save_session_id,
                                 on_status=self._chat_status_notifier(meta.chatId),
                                 scheduler=self.scheduler,
@@ -2094,7 +2094,7 @@ class HedgehogServer:
         """Остановить сессии чатов указанного CLI, сохранив ждущие в очереди
         сообщения. Под _chat_lock каждого чата (не гонимся с ensure/set_cli).
         notify_busy: идущему ходу — error AUTH_CHANGED. Возвращает
-        [(chat_id, queued)] для _resume_queued (вызывать ВНЕ _auth_lock)."""
+        [(chat_id, queued)] для _resume_queued (вызывать ВНЕ auth_lock)."""
         pending = []
         for m in list(self.store.list()):
             if m.addressee != "claude" or m.cliType != cli:
@@ -2115,7 +2115,7 @@ class HedgehogServer:
 
     async def _resume_queued(self, pending: list) -> None:
         """Доставить сохранённую очередь в новые сессии. НЕ вызывать под
-        _auth_lock: _ensure_session ждёт этот же замок."""
+        auth_lock: _ensure_session ждёт этот же замок."""
         for chat_id, queued in pending:
             meta = self.store.get(chat_id)
             if meta is None:
@@ -2131,7 +2131,7 @@ class HedgehogServer:
 
     async def _restart_cli_sessions(self, cli: str) -> None:
         """Уронить сессии CLI → следующий ход поднимет их с новыми кредами;
-        очередь переезжает в новую сессию. Вне _auth_lock."""
+        очередь переезжает в новую сессию. Вне auth_lock."""
         await self._resume_queued(await self._quiesce_cli(cli, notify_busy=False))
 
     # ------------------------- §netwait: долгие операции ----------------------
