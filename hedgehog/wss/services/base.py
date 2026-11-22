@@ -9,6 +9,7 @@ if TYPE_CHECKING:
     from ...config import Config
     from ...store.chats import ChatMeta, ChatStore
     from .cli_auth import CliAuthService
+    from .cli_installer import CliInstallService
 
 
 class AuthHost(Protocol):
@@ -55,6 +56,8 @@ class CliInstallHost(Protocol):
 
     def _invalidate_models_cache(self) -> None: ...
 
+    async def _push_models_list(self, cli: str) -> None: ...
+
     async def _broadcast_cli_status(self, cli: str, *,
                                     install: bool = False) -> None: ...
 
@@ -67,6 +70,7 @@ class ModelsHost(Protocol):
     store: ChatStore
     sessions: dict                    # §models M1: занят ли агент Claude
     cli_auth: CliAuthService          # MED-1: clear_token_rejected()
+    cli_installer: CliInstallService  # list_models: CLI не установлен → NO_CLI
 
     async def _broadcast_cli_status(self, cli: str, *,
                                     install: bool = False) -> None: ...

@@ -508,6 +508,10 @@ class HedgehogServer:
         # Контракт хоста для CliAuthService/CliInstallService: делегируем.
         self.models_refresher.invalidate_models_cache()
 
+    async def _push_models_list(self, cli: str) -> None:
+        # Контракт хоста для CliInstallService: делегируем.
+        await self.models_refresher.push_models_list(cli)
+
     async def _reset_all_chat_models(self) -> None:
         """§models L2: смена режима авторизации → per-chat выбор модели может
         стать невалидным (напр. полный id из oauth не существует в шлюзе).

@@ -195,11 +195,17 @@ class ModelsRefresher:
         self.cancel_models_probe()
         self._models_refresh_now.set()
 
+    async def push_models_list(self, cli_type: str) -> None:
+        """Разослать текущий models_list типа CLI (напр. после фоновой
+        установки: клиенты видели NO_CLI, теперь — PENDING/кэш/шлюз)."""
+        await self._broadcast_models_list(self.models_data(cli_type), cli_type)
+
     # ---------- list_models / models_list (§models, §23) ----------
 
     async def _h_list_models(self, conn_id, frame, p):
         # §models/§cli-types: отдаём кэш нужного типа CLI МГНОВЕННО (CLI не
-        # дёргаем). Неизвестный тип → UNSUPPORTED; нет кэша → PENDING + будим
+        # дёргаем). Неизвестный тип → UNSUPPORTED; CLI не установлен → NO_CLI;
+        # нет кэша → PENDING + будим
         # фоновый рефрешер.
         data = self.models_data(p.cliType)
         if data.get("auth_state") == "PENDING":
@@ -212,10 +218,17 @@ class ModelsRefresher:
 
     def models_data(self, cli_type: str) -> dict:
         """models_list типа CLI в форме §23 (efforts/defaultEfforts/
-        effortsDefault). Неизвестный тип → UNSUPPORTED; нет кэша → PENDING."""
+        effortsDefault). Неизвестный тип → UNSUPPORTED; CLI не установлен →
+        NO_CLI; нет кэша → PENDING."""
         if cli_type not in models.KNOWN_CLI_TYPES:
             data = {"cliType": cli_type, "models": [], "current": None,
                     "raw": "", "auth_state": "UNSUPPORTED",
+                    "cli_present": False, "updated_at": 0}
+        elif not self.host.cli_installer.cli_present(cli_type):
+            # CLI не установлен (в т.ч. удалён после пробы — кэш устарел):
+            # тот же статус, что в hello.cliStatus, рефрешер не будим.
+            data = {"cliType": cli_type, "models": [], "current": None,
+                    "raw": "", "auth_state": "NO_CLI",
                     "cli_present": False, "updated_at": 0}
         elif (cli_type == models.DEFAULT_CLI_TYPE
               and (omni := self._omniroute_models_list(cli_type)) is not None):

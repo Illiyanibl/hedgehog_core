@@ -130,6 +130,9 @@ class CliInstallService:
                  version=res.get("version"), err=res.get("error"))
         if res.get("ok"):
             self.host._invalidate_models_cache()
+            # Клиенты держат models_list с NO_CLI — сразу шлём актуальный
+            # (PENDING/шлюз); свежий список придёт после пробы рефрешера.
+            await self.host._push_models_list(cli)
         else:
             for chat_id in sorted(chats):
                 if self.store.get(chat_id) is None:
